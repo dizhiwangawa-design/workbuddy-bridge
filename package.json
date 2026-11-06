@@ -22,7 +22,8 @@
     "login": "node bin/wb.js login",
     "install-agents": "node bin/wb.js install",
     "doctor": "node bin/wb.js doctor",
-    "test": "node test/run.mjs"
+    "test": "node test/run.mjs && node test/api/run.mjs",
+    "test:api": "node test/api/run.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",

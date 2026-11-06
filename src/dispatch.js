@@ -1,11 +1,10 @@
 import { runTask } from './runner.js';
 import {
-  beginTask,
-  endTask,
   isQuotaError,
   pickAccount,
   resetCooldown,
   syncPool,
+  withAccountLease,
 } from './pool.js';
 import { debug } from './log.js';
 
@@ -20,22 +19,7 @@ import { debug } from './log.js';
 const RETRYABLE = new Set(['AUTH_REQUIRED', 'COOLDOWN', 'QUOTA_EXCEEDED']);
 
 async function runMeteredTask(account, options) {
-  beginTask(account);
-  let result;
-  try {
-    result = await runTask({ ...options, account });
-    return result;
-  } finally {
-    endTask(
-      account,
-      result || {
-        ok: false,
-        code: 'DISPATCH_ERROR',
-        error: '任务在执行前或执行中抛出异常',
-        durationMs: 0,
-      },
-    );
-  }
+  return withAccountLease(account, () => runTask({ ...options, account }));
 }
 
 export async function dispatchTask(options = {}) {

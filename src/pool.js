@@ -276,6 +276,22 @@ export function endTask(name, result) {
   return e;
 }
 
+export async function withAccountLease(name, fn) {
+  beginTask(name);
+  let result;
+  try {
+    result = await fn();
+    return result;
+  } finally {
+    endTask(name, result || {
+      ok: false,
+      code: 'DISPATCH_ERROR',
+      error: '任务在执行前或执行中抛出异常',
+      durationMs: 0,
+    });
+  }
+}
+
 function applyCooldown(e, now = Date.now()) {
   e.failures = (e.failures || 0) + 1;
   const backoff = Math.min(COOLDOWN_BASE_MS * 2 ** (e.failures - 1), MAX_COOLDOWN_MS);

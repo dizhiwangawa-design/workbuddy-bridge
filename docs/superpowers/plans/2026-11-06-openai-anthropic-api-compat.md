@@ -26,7 +26,8 @@
 当前基线必须保持：
 
 - bridge 位于 `/mnt/windata/awa/workbuddy-bridge`。
-- 当前目录不是 Git 仓库，因此计划以“测试通过 + 变更文件清单”作为每个任务的检查点，不执行虚构的 commit。
+- 2026-11-06 已建立 Git 仓库，`main` 分支保存实施前基线；功能开发在
+  `feature/openai-anthropic-api-compat` 分支进行。
 - 2026-11-06 实际运行 `npm test` 得到 `54/54` 通过。
 - 当前 `src/pool.js` 已把 `inflight` 保存在进程内 Map，磁盘只保存统计；旧摘要中“`loadPool()` 重置并发”的问题已经不是当前缺陷。
 - 当前登录文件位于 `profiles/<account>/home/.../CodeBuddyExtension/Data/Public/auth/*.info`。
@@ -159,7 +160,7 @@ OpenAI chat.completion(.chunk)
 - 一旦向流式客户端写出第一个有效帧，不允许透明换号重放；只能在首帧前重试。
 - 非流式重试可以读完整错误体；流式路径必须在返回 `200` 前确认上游响应成功。
 - 每次修改后至少运行 `node test/run.mjs` 和新增的 `node test/api/run.mjs`。
-- 每个任务结束时记录命令、结果和改动文件；项目没有 Git 时不做 commit。
+- 每个任务结束时记录命令、结果和改动文件；验证通过后提交到功能分支。
 
 ---
 
@@ -176,7 +177,7 @@ OpenAI chat.completion(.chunk)
 - Consumes: `beginTask(name: string): number`, `endTask(name: string, result: object): object`。
 - Produces: `withAccountLease<T>(name: string, fn: () => Promise<T>): Promise<T>`；无论成功、抛错还是取消，租约恰好释放一次。
 
-- [ ] **Step 1: 先写租约失败测试**
+- [x] **Step 1: 先写租约失败测试**
 
 创建 `test/api/pool-runtime.test.mjs`：
 
@@ -238,13 +239,13 @@ for (const file of files) {
 }
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `npm run test:api`
 
 Expected: FAIL，`pool.withAccountLease is not a function`。
 
-- [ ] **Step 3: 写最小租约实现**
+- [x] **Step 3: 写最小租约实现**
 
 在 `src/pool.js` 的 `endTask` 后加入：
 
@@ -274,7 +275,7 @@ async function runMeteredTask(account, options) {
 }
 ```
 
-- [ ] **Step 4: 运行本任务和全量回归**
+- [x] **Step 4: 运行本任务和全量回归**
 
 Run: `node test/api/pool-runtime.test.mjs`
 
