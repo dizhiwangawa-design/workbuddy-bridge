@@ -541,7 +541,7 @@ sanitizeChatBody(body: object): {
 };
 ```
 
-- [ ] **Step 1: 写 request-shape 失败测试**
+- [x] **Step 1: 写 request-shape 失败测试**
 
 `test/api/upstream.test.mjs` 启动本地假上游，断言路径、请求头和清洗结果：
 
@@ -604,13 +604,13 @@ test('developer 折叠为 system，并替换已知通道签名', () => {
 });
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/upstream.test.mjs`
 
 Expected: FAIL，模块不存在。
 
-- [ ] **Step 3: 实现最小直连**
+- [x] **Step 3: 实现最小直连**
 
 发送请求的核心代码：
 
@@ -722,7 +722,7 @@ const sanitized = sanitize
 delete sanitized.body.stream_options;
 ```
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 Run: `node test/api/upstream.test.mjs`
 
@@ -738,7 +738,8 @@ Expected: PASS，旧 CLI 测试不调用新客户端。
 - 请求固定命中 `/v2/chat/completions`。
 - headers 包含 bearer、UID、模型、会话 ID 和 WorkBuddy 客户端标识。
 - 只有已知签名被改写，普通消息逐字保留。
-- `timeoutMs` 覆盖连接和首响应头；`readSse` 的独立 idle timeout 覆盖后续流。
+- `timeoutMs` 覆盖连接和首响应头；`readSse` 的独立 idle timeout 在 Task 5
+  随 SSE 解析器一起交付并验收。
 - 上游超时、外部取消和网络错误均能中止 fetch 或 reader。
 
 ---
