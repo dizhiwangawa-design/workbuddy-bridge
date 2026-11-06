@@ -325,7 +325,7 @@ readAccountCredentials(
 ): AccountCredential | CredentialFailure;
 ```
 
-- [ ] **Step 1: 写凭据测试**
+- [x] **Step 1: 写凭据测试**
 
 创建 `test/api/credentials.test.mjs`，测试真实字段名、秒/毫秒归一、过期判断和 no-secret 输出：
 
@@ -401,13 +401,13 @@ function credAccount(name) {
 }
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/credentials.test.mjs`
 
 Expected: FAIL，`auth.readAccountCredentials` 不存在。
 
-- [ ] **Step 3: 实现最小凭据读取**
+- [x] **Step 3: 实现最小凭据读取**
 
 `src/auth-store.js` 的核心实现：
 
@@ -482,7 +482,7 @@ return cred.ok
   : { loggedIn: false, reason: cred.reason };
 ```
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 Run: `node test/api/credentials.test.mjs`
 

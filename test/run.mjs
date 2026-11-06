@@ -414,11 +414,20 @@ process.env.WB_FAKE_PER_ACCOUNT = '1';
 
 /** 造一个有隔离认证文件的账号：quickAuthCheck 会认为它「已登录」。 */
 function credAccount(name) {
-  accounts.ensureAccount(name);
+  const acc = accounts.ensureAccount(name);
   const dir = accounts.accountAuthDir(name);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'auth_fake.info'), '"internal"');
-  return accounts.getAccount(name);
+  fs.writeFileSync(path.join(dir, 'auth_fake.info'), JSON.stringify({
+    account: { uid: `uid-${name}`, nickname: name },
+    auth: {
+      accessToken: 'fixture-access',
+      refreshToken: 'fixture-refresh',
+      expiresAt: Date.now() + 3600000,
+      refreshExpiresAt: Date.now() + 7200000,
+    },
+    accounts: [],
+  }), { mode: 0o600 });
+  return acc;
 }
 
 await test('未登录的号不参与调度', () => {

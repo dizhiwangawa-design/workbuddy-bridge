@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { accountAuthDir, accountEnv, getAccount, resolveAccountName } from './accounts.js';
+import { accountEnv, getAccount, resolveAccountName } from './accounts.js';
+import { readAccountCredentials } from './auth-store.js';
 import { loadConfig } from './paths.js';
 import { debug } from './log.js';
 
@@ -311,12 +312,10 @@ export function quickAuthCheck(accountName) {
   const dir = acc?.profileDir;
   if (!dir || !fs.existsSync(dir)) return { loggedIn: false, reason: '账号目录不存在' };
   try {
-    const authDir = accountAuthDir(accountName);
-    const entries = fs.existsSync(authDir)
-      ? fs.readdirSync(authDir).filter((file) => file.endsWith('.info'))
-      : [];
-    if (entries.length === 0) return { loggedIn: false, reason: '没有隔离登录凭证' };
-    return { loggedIn: true, reason: '存在隔离登录凭证' };
+    const cred = readAccountCredentials(accountName);
+    return cred.ok
+      ? { loggedIn: true, reason: cred.needsRefresh ? '凭证可刷新' : '登录有效' }
+      : { loggedIn: false, reason: cred.reason };
   } catch (err) {
     return { loggedIn: false, reason: err.message };
   }
