@@ -10,6 +10,7 @@ function requestError(message, code = 'invalid_request') {
 
 function textContent(content, messageIndex) {
   if (typeof content === 'string') return content;
+  if (content === null) return '';
   if (!Array.isArray(content) || content.length === 0) {
     throw requestError(`messages[${messageIndex}].content must be text`);
   }
@@ -31,15 +32,90 @@ function normalizeMessages(messages) {
     if (!['system', 'developer', 'user', 'assistant', 'tool'].includes(message.role)) {
       throw requestError(`messages[${index}].role is not supported`);
     }
-    return {
+    if (message.role === 'tool') {
+      const id = String(message.tool_call_id || '').trim();
+      if (!id) throw requestError(`messages[${index}].tool_call_id is required`);
+      const knownIds = new Set();
+      for (let previous = index - 1; previous >= 0; previous -= 1) {
+        const prior = messages[previous];
+        if (prior?.role === 'assistant') {
+          for (const call of prior.tool_calls || []) knownIds.add(call?.id);
+          break;
+        }
+      }
+      if (!knownIds.has(id)) {
+        throw requestError(`messages[${index}].tool_call_id references unknown tool_call: ${id}`);
+      }
+    }
+    const normalized = {
       role: message.role,
       content: textContent(message.content, index),
     };
+    if (message.role === 'tool') normalized.tool_call_id = message.tool_call_id;
+    if (message.role === 'assistant' && message.tool_calls !== undefined) {
+      if (!Array.isArray(message.tool_calls)) {
+        throw requestError(`messages[${index}].tool_calls must be an array`);
+      }
+      const ids = new Set();
+      normalized.tool_calls = message.tool_calls.map((call, callIndex) => {
+        const id = String(call?.id || '').trim();
+        const name = String(call?.function?.name || '').trim();
+        if (!id || !name) throw requestError(`messages[${index}].tool_calls[${callIndex}] requires id and name`);
+        if (ids.has(id)) throw requestError(`duplicate assistant tool_call id: ${id}`);
+        ids.add(id);
+        return {
+          id,
+          type: 'function',
+          function: {
+            name,
+            arguments: typeof call.function.arguments === 'string'
+              ? call.function.arguments
+              : JSON.stringify(call.function.arguments ?? {}),
+          },
+        };
+      });
+    }
+    return normalized;
   });
+}
+
+function toolDeclaration(tool, index) {
+  if (tool?.type !== 'function') throw requestError(`tools[${index}] must have type function`);
+  const name = String(tool.function?.name || '').trim();
+  if (!name) throw requestError(`tools[${index}].function.name is required`);
+  const parameters = tool.function.parameters ?? {
+    type: 'object',
+    properties: {},
+  };
+  if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)) {
+    throw requestError(`tools[${index}].function.parameters must be an object`);
+  }
+  return {
+    type: 'function',
+    function: {
+      name,
+      description: typeof tool.function.description === 'string' ? tool.function.description : '',
+      parameters,
+    },
+  };
+}
+
+function normalizeToolChoice(choice, tools) {
+  if (choice === undefined) return undefined;
+  if (choice === 'auto' || choice === 'none' || choice === 'required') return choice;
+  if (choice?.type !== 'function' || !String(choice.function?.name || '').trim()) {
+    throw requestError('tool_choice must be auto, none, required or a named function');
+  }
+  const name = String(choice.function.name).trim();
+  if (!tools.some((tool) => tool.function.name === name)) {
+    throw requestError(`tool_choice references unknown function: ${name}`);
+  }
+  return { type: 'function', function: { name } };
 }
 
 export function prepareOpenAIRequest(body, {
   defaultModel = 'deepseek-v4-flash',
+  toolsEnabled = true,
 } = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw requestError('request body must be a JSON object');
@@ -56,27 +132,41 @@ export function prepareOpenAIRequest(body, {
   if (body.n !== undefined && body.n !== 1) {
     throw requestError('only n=1 is supported');
   }
-  if (Array.isArray(body.tools) && body.tools.length) {
-    throw requestError(
-      'tool calls are not supported by the current minimal OpenAI adapter',
-      'tools_not_supported',
-    );
-  }
-  if (Array.isArray(body.functions) && body.functions.length) {
+  if (
+    body.functions !== undefined
+    || body.function_call !== undefined
+    || body.parallel_tool_calls !== undefined
+  ) {
     throw requestError(
       'legacy functions are not supported by the current minimal OpenAI adapter',
       'tools_not_supported',
     );
   }
-  if (body.function_call !== undefined || body.tool_choice !== undefined) {
+  if (body.tools !== undefined && !Array.isArray(body.tools)) {
+    throw requestError('tools must be an array');
+  }
+  if (body.tools?.length && !toolsEnabled) {
     throw requestError(
-      'tool calls are not supported by the current minimal OpenAI adapter',
-      'tools_not_supported',
+      'tool support is disabled',
+      'tools_disabled',
     );
   }
 
   const model = String(body.model || defaultModel || '').trim();
   if (!model) throw requestError('model must not be empty');
+
+  const tools = (body.tools || []).map(toolDeclaration);
+  const names = new Set();
+  for (const tool of tools) {
+    if (names.has(tool.function.name)) {
+      throw requestError(`duplicate tool name: ${tool.function.name}`);
+    }
+    names.add(tool.function.name);
+  }
+  const toolChoice = normalizeToolChoice(body.tool_choice, tools);
+  if (toolChoice !== undefined && !tools.length) {
+    throw requestError('tool_choice requires at least one tool');
+  }
 
   const outbound = structuredClone(body);
   outbound.model = model;
@@ -84,8 +174,21 @@ export function prepareOpenAIRequest(body, {
   outbound.stream = true;
   delete outbound.stream_options;
   delete outbound.n;
-  if (Array.isArray(outbound.tools) && outbound.tools.length === 0) delete outbound.tools;
-  return { body: outbound, model };
+  delete outbound.parallel_tool_calls;
+  if (tools.length) {
+    outbound.tools = tools;
+    if (toolChoice !== undefined) outbound.tool_choice = toolChoice;
+  } else {
+    delete outbound.tools;
+    delete outbound.tool_choice;
+  }
+  return {
+    body: outbound,
+    model,
+    toolsDeclared: tools.length > 0,
+    toolChoice: toolChoice || 'auto',
+    toolNames: names,
+  };
 }
 
 function eventUsage(usage) {
@@ -188,16 +291,27 @@ function conservativeTokens(value) {
 }
 
 export function toOpenAIResponse(aggregate, model, { now = Date.now } = {}) {
-  if (aggregate.toolCalls?.size) {
-    throw new ApiError(502, 'upstream returned tool calls that were not requested', {
-      type: 'api_error',
-      code: 'tool_calls_not_supported',
+  const toolCalls = [...(aggregate.toolCalls?.values() || [])]
+    .filter((call) => call.name)
+    .map((call) => {
+      let args = call.arguments || '{}';
+      try {
+        args = JSON.stringify(JSON.parse(args));
+      } catch {
+        // The strict assembler reports malformed calls before this encoder.
+      }
+      return {
+        id: call.id || `call_${randomUUID().replaceAll('-', '')}`,
+        type: 'function',
+        function: { name: call.name, arguments: args },
+      };
     });
-  }
+  const hasTools = toolCalls.length > 0;
   const message = {
     role: 'assistant',
-    content: aggregate.content || '',
+    content: hasTools && !aggregate.content ? null : aggregate.content || '',
   };
+  if (hasTools) message.tool_calls = toolCalls;
   if (aggregate.reasoning) message.reasoning_content = aggregate.reasoning;
   if (aggregate.refusal) message.refusal = aggregate.refusal;
 
@@ -205,7 +319,7 @@ export function toOpenAIResponse(aggregate, model, { now = Date.now } = {}) {
     length: 'length',
     content_filter: 'content_filter',
     refusal: 'content_filter',
-  }[aggregate.finishReason] || 'stop';
+  }[aggregate.finishReason] || (hasTools && aggregate.finishReason !== 'length' ? 'tool_calls' : 'stop');
 
   const used = aggregate.usage || {};
   const promptTokens = Number(used.prompt_tokens ?? used.input_tokens);

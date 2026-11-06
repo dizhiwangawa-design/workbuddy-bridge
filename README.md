@@ -192,7 +192,7 @@ if (toolUse) {
 
 | 方法与路径 | 当前范围 |
 |:--|:--|
-| `POST /v1/chat/completions` | 非流式文本，`system` / `developer` / `user` / `assistant` |
+| `POST /v1/chat/completions` | 非流式文本、函数工具调用与多轮 `tool` 续传 |
 | `GET /v1/models` | 优先读取 WorkBuddy 模型目录；不可用时返回带 `wb_source:"fallback"` 的稳定列表 |
 | `GET /v1/models/:id` | 查询目录中的单个模型；未找到返回 `404 model_not_found` |
 
@@ -213,19 +213,61 @@ const response = await client.chat.completions.create({
 console.log(response.choices[0].message.content);
 ```
 
+OpenAI 工具由客户端自行执行。把响应中的 assistant 消息和带相同 `tool_call_id`
+的 `role:"tool"` 结果加入历史，再发起下一轮：
+
+```js
+const tools = [{
+  type: 'function',
+  function: {
+    name: 'read_file',
+    description: '读取一个文本文件',
+    parameters: {
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: ['path'],
+    },
+  },
+}];
+const messages = [{ role: 'user', content: '读取 README.md' }];
+const first = await client.chat.completions.create({
+  model: 'deepseek-v4-flash',
+  messages,
+  tools,
+});
+const message = first.choices[0].message;
+const call = message.tool_calls?.[0];
+if (call) {
+  messages.push(message);
+  messages.push({
+    role: 'tool',
+    tool_call_id: call.id,
+    content: '客户端执行工具后的文本结果',
+  });
+  await client.chat.completions.create({
+    model: 'deepseek-v4-flash',
+    messages,
+    tools,
+  });
+}
+```
+
 这个最小实现具有以下明确约束（管理页 OpenAI 开关默认关闭，开启后生效）：
 
 - `stream: true` 返回 `400 stream_not_supported`；当前不支持 OpenAI SSE。
-- `tools`、`tool_choice`、旧版 `functions` / `function_call` 返回
-  `400 tools_not_supported`；当前不支持 OpenAI 工具调用。
+- `tools` 支持 OpenAI function 工具；`tool_choice` 支持 `auto` / `none` /
+  `required` / 指定函数。历史 assistant `tool_calls` 与 `role:"tool"` 的
+  `tool_call_id` 可续传。关闭 API 配置中的工具开关时返回
+  `400 tools_disabled`；旧版 `functions` / `function_call` 与
+  `parallel_tool_calls` 仍返回 `400 tools_not_supported`。
+- 工具声明优先使用上游结构化 `tool_calls`；仅在结构调用无效时使用已有 DSML
+  扫描器恢复文本形调用。未声明 tools 时清洗 DSML，不向客户端泄漏标记。
 - 图片等非文本 content part 返回 `400 invalid_request`；当前只接受文本和文本
   content part。
 - OpenAI 思考型提示返回纯文本时，上游的 `reasoning_content` 会原样透传；这不等同于
   Responses API 的 reasoning item。当前未开放 OpenAI 的声明式推理配置。
 - 上游给出 `finish_reason` 前的无完成原因断流会失败关闭并返回
   `502 UPSTREAM_TRUNCATED`，不把半截回答伪装成正常完成。
-- 工具结果消息（`role:"tool"`、`tool_call_id`）会作为普通文本拼接给上游；由于
-  OpenAI tools 尚未开放，当前不会建立新的工具调用往返。
 - `n` 只能为 `1`；`/v1/responses`、Embeddings、Audio、Batch 和 Fine-tuning
   不在本次范围。
 - 客户端 Key、协议开关、错误形状沿用共享的 API 兼容层；远程访问仍需配置 Key。
@@ -604,11 +646,13 @@ hy4 是旗舰模型，单价高、排队久，拿它跑测试既费额度又拖�
 ```bash
 npm run test:live:openai
 node test/live/openai-live.mjs --thinking
+node test/live/openai-live.mjs --tools
 ```
 
-前者验证普通文本，后者用需要分步算术分析的提示验证思考型提示返回；两者均故意将
-`WB_COMMAND` 指向不存在的路径，确认请求不依赖 CLI。这些冒烟测试只覆盖非流式文本，
-不代表 OpenAI 工具调用或 Responses API 可用。
+第一条验证普通文本，第二条用需要分步算术分析的提示验证思考型提示返回，第三条
+用官方 SDK 验证真实上游的 `tool_calls` 与下一轮 `tool` 续传。它们均故意将
+`WB_COMMAND` 指向不存在的路径，确认请求不依赖 CLI。离线测试还包含三轮 SDK
+往返和 DSML 恢复；这些能力不包含 OpenAI SSE、Responses API 或 CLI 自身的工具执行。
 
 ```
 src/

@@ -755,7 +755,7 @@ export function createOpenAIRuntime({
     let upstreamCreated = null;
     let upstreamUsage = null;
     let sawDone = false;
-    let structuredTools = false;
+    let structured = createStructuredToolAssembler();
     let dsmlCalls = [];
     let visibleText = '';
     let reasoningText = '';
@@ -873,12 +873,7 @@ export function createOpenAIRuntime({
         reasoningText += payload.reasoning_content;
       }
       if (typeof payload.refusal === 'string') refusalText += payload.refusal;
-      if (
-        (Array.isArray(payload.tool_calls) && payload.tool_calls.length)
-        || (Array.isArray(choice.message?.tool_calls) && choice.message.tool_calls.length)
-      ) {
-        structuredTools = true;
-      }
+      if (Array.isArray(payload.tool_calls)) structured.push(payload.tool_calls);
       feedContent(payload.content);
     }
 
@@ -971,26 +966,46 @@ export function createOpenAIRuntime({
           : new TimeoutFailure(timeoutKind, `upstream ${timeoutKind} timeout`);
       }
       if (!finishReason) {
-        throw new RuntimeFailure('upstream ended without a finish reason', {
-          code: 'UPSTREAM_TRUNCATED',
-        });
+        const completedTool = structured.hasPending() || dsmlCalls.length > 0;
+        if (!completedTool) {
+          throw new RuntimeFailure('upstream ended without a finish reason', {
+            code: 'UPSTREAM_TRUNCATED',
+          });
+        }
       }
       const scannedEnd = scanner.finish();
       if (scannedEnd.error) scannerError(scannedEnd.error);
       dsmlCalls.push(...scannedEnd.calls);
       visibleText += scannedEnd.visibleText;
-      if (structuredTools || dsmlCalls.length > 0) {
-        throw new RuntimeFailure('tool calls are not supported by the current minimal OpenAI adapter', {
-          status: 400,
-          type: 'invalid_request_error',
-          code: 'tool_calls_not_supported',
-        });
+      const structuredEnd = structured.finish();
+      if (
+        structuredEnd.invalid.length > 0
+        && (structuredEnd.calls.length > 0 || dsmlCalls.length === 0)
+      ) throw scannerError({
+        code: 'UPSTREAM_INVALID_TOOL_CALL',
+        message: 'upstream returned an invalid structured tool call',
+      });
+      const arbitration = arbitrateToolCalls({
+        structured: structuredEnd,
+        dsml: dsmlCalls,
+        toolsDeclared: body.toolsDeclared,
+        toolChoice: body.toolChoice,
+        model: body.model,
+        requestId: upstreamId || `chatcmpl-${randomUUID()}`,
+        account,
+        allowedToolNames: body.toolNames,
+      });
+      if (arbitration.warning) {
+        warn(`duplicate tool formats: ${JSON.stringify(arbitration.warning)}`);
       }
 
       const usage = openAIUsage(
         upstreamUsage,
         inputEstimate,
-        conservativeTokenEstimate(visibleText),
+        conservativeTokenEstimate({
+          text: visibleText,
+          tools: arbitration.calls.map((call) => call.input),
+        }),
       );
       const responseBody = toOpenAIResponse({
         id: upstreamId,
@@ -998,7 +1013,14 @@ export function createOpenAIRuntime({
         content: visibleText,
         reasoning: reasoningText,
         refusal: refusalText,
-        toolCalls: new Map(),
+        toolCalls: new Map(arbitration.calls.map((call, index) => [
+          index,
+          {
+            id: call.id,
+            name: call.name,
+            arguments: JSON.stringify(call.input),
+          },
+        ])),
         finishReason,
         usage,
       }, body.model, { now });
@@ -1050,6 +1072,7 @@ export function createOpenAIRuntime({
   async function chat({ req, res, body, config }) {
     const normalized = prepareOpenAIRequest(body, {
       defaultModel: config.defaultModel,
+      toolsEnabled: config.tools,
     });
     const pool = poolLoader();
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));

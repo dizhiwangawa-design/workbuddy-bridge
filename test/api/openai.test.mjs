@@ -54,7 +54,7 @@ async function startFixture(t, upstreamHandler) {
     openai: true,
     anthropic: false,
     streaming: false,
-    tools: false,
+    tools: true,
     requireApiKey: false,
     remoteRequireKey: false,
     trustProxy: false,
@@ -115,23 +115,42 @@ test('OpenAI 请求转换为上游流式请求并保留文本消息', () => {
   assert.deepEqual(input, before);
 });
 
-test('历史 tool 文本可续传，但 tools 仍按当前范围拒绝', () => {
+test('OpenAI tools、tool_choice 与历史 tool 往返可转换为上游格式', () => {
+  const tool = {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read a file.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+      },
+    },
+  };
   const prepared = prepareOpenAIRequest({
     messages: [
-      { role: 'assistant', content: '使用工具', tool_calls: [{
+      { role: 'user', content: '读取 README' },
+      { role: 'assistant', content: null, tool_calls: [{
         id: 'call_previous',
         type: 'function',
-        function: { name: 'read_file', arguments: '{}' },
+        function: { name: 'read_file', arguments: '{"path":"README.md"}' },
       }] },
       { role: 'tool', tool_call_id: 'call_previous', content: '文件内容' },
       { role: 'user', content: '继续' },
     ],
+    tools: [tool],
+    tool_choice: { type: 'function', function: { name: 'read_file' } },
   });
-  assert.equal(prepared.body.messages[1].role, 'tool');
-  assert.equal(prepared.body.messages[1].content, '文件内容');
+  assert.equal(prepared.body.messages[1].tool_calls[0].id, 'call_previous');
+  assert.equal(prepared.body.messages[2].role, 'tool');
+  assert.equal(prepared.body.messages[2].tool_call_id, 'call_previous');
+  assert.equal(prepared.body.tools[0].function.name, 'read_file');
+  assert.equal(prepared.body.tool_choice.function.name, 'read_file');
+  assert.equal(prepared.toolsDeclared, true);
 });
 
-test('OpenAI 最小适配明确拒绝流式、tools 和非文本内容', () => {
+test('OpenAI 最小适配明确拒绝流式、关闭的工具开关和非文本内容', () => {
   assert.throws(() => prepareOpenAIRequest({
     messages: [{ role: 'user', content: 'ping' }],
     stream: true,
@@ -140,7 +159,28 @@ test('OpenAI 最小适配明确拒绝流式、tools 和非文本内容', () => {
   assert.throws(() => prepareOpenAIRequest({
     messages: [{ role: 'user', content: 'ping' }],
     tools: [{ type: 'function', function: { name: 'x', parameters: {} } }],
+  }, { toolsEnabled: false }), (error) => error.status === 400 && error.code === 'tools_disabled');
+
+  assert.throws(() => prepareOpenAIRequest({
+    messages: [{ role: 'user', content: 'ping' }],
+    function_call: 'auto',
   }), (error) => error.status === 400 && error.code === 'tools_not_supported');
+
+  const invalidTools = [
+    [{ type: 'custom', function: { name: 'x', parameters: {} } }],
+    [{ type: 'function', function: { name: '', parameters: {} } }],
+    [{ type: 'function', function: { name: 'x', parameters: [] } }],
+    [
+      { type: 'function', function: { name: 'x', parameters: {} } },
+      { type: 'function', function: { name: 'x', parameters: {} } },
+    ],
+  ];
+  for (const tools of invalidTools) {
+    assert.throws(() => prepareOpenAIRequest({
+      messages: [{ role: 'user', content: 'ping' }],
+      tools,
+    }), (error) => error.status === 400 && error.code === 'invalid_request');
+  }
 
   assert.throws(() => prepareOpenAIRequest({
     messages: [{
@@ -325,6 +365,26 @@ test('OpenAI 不支持项使用 OpenAI 错误形状', async (t) => {
   assert.match(body.error.message, /streaming/i);
 });
 
+test('OpenAI 工具结果引用缺失或工具开关关闭时返回明确错误', () => {
+  assert.throws(() => prepareOpenAIRequest({
+    messages: [{ role: 'tool', content: 'result' }],
+  }), (error) => error.status === 400 && /tool_call_id/.test(error.message));
+
+  assert.throws(() => prepareOpenAIRequest({
+    messages: [{
+      role: 'tool',
+      tool_call_id: 'call_1',
+      content: 'result',
+    }],
+  }), (error) => error.status === 400 && error.code === 'invalid_request');
+
+  assert.throws(() => prepareOpenAIRequest({
+    messages: [{ role: 'user', content: 'ping' }],
+    tools: [{ type: 'function', function: { name: 'x', parameters: {} } }],
+    tool_choice: 'required',
+  }, { toolsEnabled: false }), (error) => error.code === 'tools_disabled');
+});
+
 test('管理页提供独立的 OpenAI 开关和接口地址', async (t) => {
   const { baseUrl } = await startFixture(t, async (_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -344,7 +404,7 @@ test('管理页提供独立的 OpenAI 开关和接口地址', async (t) => {
   assert.equal(config.anthropic, false);
 });
 
-test('OpenAI 文本响应会失败关闭 WorkBuddy DSML', async (t) => {
+test('未声明 tools 时清洗 WorkBuddy DSML，不泄漏工具调用', async (t) => {
   const BAR = '\u{FF5C}\u{FF5C}';
   const dsml = [
     `先读取文件。<${BAR}DSML${BAR} calls>`,
@@ -369,9 +429,11 @@ test('OpenAI 文本响应会失败关闭 WorkBuddy DSML', async (t) => {
       messages: [{ role: 'user', content: '读取 README' }],
     }),
   });
-  assert.equal(response.status, 400);
+  assert.equal(response.status, 200);
   const body = await response.json();
-  assert.equal(body.error.code, 'tool_calls_not_supported');
+  assert.equal(body.choices[0].finish_reason, 'stop');
+  assert.equal(body.choices[0].message.content, '先读取文件。');
+  assert.equal(JSON.stringify(body).includes('DSML'), false);
   assert.equal(inflight('openai-a'), 0);
 });
 
@@ -393,4 +455,102 @@ test('OpenAI 上游未给出完成原因时拒绝返回不完整文本', async (
   const body = await response.json();
   assert.equal(body.error.code, 'UPSTREAM_TRUNCATED');
   assert.equal(inflight('openai-a'), 0);
+});
+
+test('OpenAI 缺少 finish_reason 但工具片段完整时可恢复调用', async (t) => {
+  const { baseUrl } = await startFixture(t, async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_clean_eof",'
+      + '"function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}]}}]}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: '读取 README' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'read_file',
+          parameters: {
+            type: 'object',
+            properties: { path: { type: 'string' } },
+          },
+        },
+      }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.deepEqual(
+    JSON.parse(body.choices[0].message.tool_calls[0].function.arguments),
+    { path: 'README.md' },
+  );
+  assert.equal(inflight('openai-a'), 0);
+});
+
+test('OpenAI 工具响应聚合为 tool_calls，未声明 tools 时失败关闭', async (t) => {
+  let requestCount = 0;
+  const { baseUrl } = await startFixture(t, async (_req, res) => {
+    requestCount += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(
+      'data: {"id":"tool-round-1","choices":[{"delta":{"tool_calls":[{"index":0,'
+      + '"id":"call_read","function":{"name":"read_file","arguments":"{\\"path\\":\\"READ"}}]}}]}\n\n',
+    );
+    res.end(
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+      + '"function":{"arguments":"ME.md\\"}"}}]},"finish_reason":"tool_calls"}],'
+      + '"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+  const payload = {
+    model: 'deepseek-v4-flash',
+    messages: [{ role: 'user', content: '读取 README' }],
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read_file',
+        parameters: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+      },
+    }],
+  };
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.choices[0].finish_reason, 'tool_calls');
+  assert.equal(body.choices[0].message.content, null);
+  assert.equal(body.choices[0].message.tool_calls[0].id, 'call_read');
+  assert.deepEqual(
+    JSON.parse(body.choices[0].message.tool_calls[0].function.arguments),
+    { path: 'README.md' },
+  );
+  assert.equal(inflight('openai-a'), 0);
+
+  delete payload.tools;
+  const unrequested = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(unrequested.status, 200);
+  const plain = await unrequested.json();
+  assert.equal(plain.choices[0].finish_reason, 'stop');
+  assert.equal(JSON.stringify(plain).includes('tool_calls'), false);
+  assert.equal(inflight('openai-a'), 0);
+  assert.equal(requestCount, 2);
 });
