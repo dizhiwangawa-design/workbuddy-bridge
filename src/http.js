@@ -10,6 +10,7 @@ import { buildStats, RANGES } from './stats.js';
 import { BRIDGE_HOME } from './paths.js';
 import { ensureAccount, removeAccount } from './accounts.js';
 import { info, warn } from './log.js';
+import { handleApiRequest, handleApiSettingsApi } from './api-server.js';
 
 /** 登录页：手机上打开就能看到二维码，扫完自动跳状态。 */
 function page(sessionId, initial, embed = false) {
@@ -150,6 +151,23 @@ export async function startHttpServer({ port = 7666, host = '127.0.0.1', mcp = f
     try {
       if (mcp && p === '/mcp') {
         await handleMcp(req, res, transports);
+        return;
+      }
+
+      if (p === '/health' && req.method === 'GET') {
+        return json(res, 200, { status: 'ok' });
+      }
+
+      if (p.startsWith('/v1/')) {
+        await handleApiRequest({ req, res, url });
+        return;
+      }
+
+      if (p === '/api/api-compat' || p.startsWith('/api/api-compat/')) {
+        if (!adminAllowed(req, url)) {
+          return json(res, 401, { ok: false, error: '需要管理令牌' });
+        }
+        await handleApiSettingsApi(req, res, url);
         return;
       }
 

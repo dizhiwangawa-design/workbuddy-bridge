@@ -793,7 +793,7 @@ sendApiError(res, error: ApiError, protocol: 'openai' | 'anthropic'): void;
 
 同时产生 `handleApiRequest({ req, res, url }) => Promise<boolean>`，返回 `false` 表示不是 `/v1/*` 请求。
 
-- [ ] **Step 1: 写默认关闭与 API Key 测试**
+- [x] **Step 1: 写默认关闭与 API Key 测试**
 
 ```js
 import test from 'node:test';
@@ -827,13 +827,13 @@ test('API Key 只返回一次明文，配置只保存摘要', () => {
 });
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/settings.test.mjs`
 
 Expected: FAIL，模块不存在且 `/v1/models` 当前返回 `Not Found` 文本。
 
-- [ ] **Step 3: 实现配置和门禁**
+- [x] **Step 3: 实现配置和门禁**
 
 `src/paths.js` 的默认配置增加：
 
@@ -987,7 +987,7 @@ DELETE /api/api-compat/keys/:id     -> 删除 key
 已知 `/v1/*` 之外的未知路径返回协议匹配的 404；即使是已知 chat 路径，缺失
 method 也返回 405，不回退到管理页或 MCP。
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 Run: `node test/api/settings.test.mjs`
 

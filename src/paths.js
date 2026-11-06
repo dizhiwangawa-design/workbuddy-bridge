@@ -59,6 +59,20 @@ export function defaultConfig() {
     },
     // 桥接自己启动的登录页端口（0 = 随机空闲端口）
     loginPagePort: 7666,
+    apiCompat: {
+      version: 1,
+      enabled: false,
+      openai: false,
+      anthropic: false,
+      streaming: false,
+      tools: false,
+      channelSanitize: true,
+      requireApiKey: true,
+      upstreamBaseUrl: 'https://copilot.tencent.com',
+      defaultModel: 'deepseek-v4-flash',
+      timeoutMs: 900000,
+      keys: [],
+    },
     // 是否允许任务写入账号目录之外的路径，仅用于 doctor 提示
     createdAt: new Date().toISOString(),
   };
@@ -92,6 +106,11 @@ export function loadConfig() {
     ...base,
     ...saved,
     defaults: { ...base.defaults, ...(saved.defaults || {}) },
+    apiCompat: {
+      ...base.apiCompat,
+      ...(saved.apiCompat || {}),
+      keys: Array.isArray(saved.apiCompat?.keys) ? saved.apiCompat.keys : base.apiCompat.keys,
+    },
   };
 }
 
