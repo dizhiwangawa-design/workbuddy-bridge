@@ -1,0 +1,40 @@
+{
+  "name": "workbuddy-bridge",
+  "version": "0.3.1",
+  "description": "把 WorkBuddy（codebuddy CLI）桥接成任意编程 Agent 可调用的 MCP 子 Agent，支持扫码登录与多账号",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "workbuddy-bridge": "bin/wb.js",
+    "wb": "bin/wb.js"
+  },
+  "main": "src/server.js",
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/wb.js serve",
+    "login": "node bin/wb.js login",
+    "install-agents": "node bin/wb.js install",
+    "doctor": "node bin/wb.js doctor",
+    "test": "node test/run.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "qrcode": "^1.5.4"
+  },
+  "keywords": [
+    "mcp",
+    "workbuddy",
+    "codebuddy",
+    "claude-code",
+    "cursor",
+    "codex",
+    "opencode"
+  ]
+}
