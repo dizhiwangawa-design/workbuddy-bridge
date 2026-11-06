@@ -220,6 +220,8 @@ console.log(response.choices[0].message.content);
   `400 tools_not_supported`；当前不支持 OpenAI 工具调用。
 - 图片等非文本 content part 返回 `400 invalid_request`；当前只接受文本和文本
   content part。
+- 工具结果消息（`role:"tool"`、`tool_call_id`）会作为普通文本拼接给上游；由于
+  OpenAI tools 尚未开放，当前不会建立新的工具调用往返。
 - `n` 只能为 `1`；`/v1/responses`、Embeddings、Audio、Batch 和 Fine-tuning
   不在本次范围。
 - 客户端 Key、协议开关、错误形状沿用共享的 API 兼容层；远程访问仍需配置 Key。

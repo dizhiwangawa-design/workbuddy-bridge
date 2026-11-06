@@ -28,7 +28,7 @@ function normalizeMessages(messages) {
     if (!message || typeof message !== 'object' || Array.isArray(message)) {
       throw requestError(`messages[${index}] must be an object`);
     }
-    if (!['system', 'developer', 'user', 'assistant'].includes(message.role)) {
+    if (!['system', 'developer', 'user', 'assistant', 'tool'].includes(message.role)) {
       throw requestError(`messages[${index}].role is not supported`);
     }
     return {

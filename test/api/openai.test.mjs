@@ -115,6 +115,22 @@ test('OpenAI 请求转换为上游流式请求并保留文本消息', () => {
   assert.deepEqual(input, before);
 });
 
+test('历史 tool 文本可续传，但 tools 仍按当前范围拒绝', () => {
+  const prepared = prepareOpenAIRequest({
+    messages: [
+      { role: 'assistant', content: '使用工具', tool_calls: [{
+        id: 'call_previous',
+        type: 'function',
+        function: { name: 'read_file', arguments: '{}' },
+      }] },
+      { role: 'tool', tool_call_id: 'call_previous', content: '文件内容' },
+      { role: 'user', content: '继续' },
+    ],
+  });
+  assert.equal(prepared.body.messages[1].role, 'tool');
+  assert.equal(prepared.body.messages[1].content, '文件内容');
+});
+
 test('OpenAI 最小适配明确拒绝流式、tools 和非文本内容', () => {
   assert.throws(() => prepareOpenAIRequest({
     messages: [{ role: 'user', content: 'ping' }],
