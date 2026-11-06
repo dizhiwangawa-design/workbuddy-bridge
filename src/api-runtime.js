@@ -403,10 +403,6 @@ export function createAnthropicRuntime({
           finishReason = choice.finish_reason;
           armFinishGrace();
         }
-      } else if (document.choices === undefined && document.data?.error) {
-        throw new RuntimeFailure('WorkBuddy upstream returned an error', {
-          code: 'UPSTREAM_ERROR',
-        });
       }
     }
 
@@ -760,7 +756,10 @@ export function createOpenAIRuntime({
     let upstreamUsage = null;
     let sawDone = false;
     let structuredTools = false;
+    let dsmlCalls = [];
     let visibleText = '';
+    let reasoningText = '';
+    let refusalText = '';
     const scanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
     let leaseResult = {
       ok: false,
@@ -844,6 +843,7 @@ export function createOpenAIRuntime({
       if (!text) return;
       const scanned = scanner.push(text);
       if (scanned.error) scannerError(scanned.error);
+      dsmlCalls.push(...scanned.calls);
       visibleText += scanned.visibleText;
     }
 
@@ -869,6 +869,10 @@ export function createOpenAIRuntime({
       if (!choice) return;
       finishReason = choice.finish_reason || finishReason;
       const payload = choice.delta || choice.message || {};
+      if (typeof payload.reasoning_content === 'string') {
+        reasoningText += payload.reasoning_content;
+      }
+      if (typeof payload.refusal === 'string') refusalText += payload.refusal;
       if (
         (Array.isArray(payload.tool_calls) && payload.tool_calls.length)
         || (Array.isArray(choice.message?.tool_calls) && choice.message.tool_calls.length)
@@ -966,11 +970,19 @@ export function createOpenAIRuntime({
           ? controller.signal.reason
           : new TimeoutFailure(timeoutKind, `upstream ${timeoutKind} timeout`);
       }
+      if (!finishReason) {
+        throw new RuntimeFailure('upstream ended without a finish reason', {
+          code: 'UPSTREAM_TRUNCATED',
+        });
+      }
       const scannedEnd = scanner.finish();
       if (scannedEnd.error) scannerError(scannedEnd.error);
+      dsmlCalls.push(...scannedEnd.calls);
       visibleText += scannedEnd.visibleText;
-      if (structuredTools) {
-        throw new RuntimeFailure('upstream returned tool calls that were not requested', {
+      if (structuredTools || dsmlCalls.length > 0) {
+        throw new RuntimeFailure('tool calls are not supported by the current minimal OpenAI adapter', {
+          status: 400,
+          type: 'invalid_request_error',
           code: 'tool_calls_not_supported',
         });
       }
@@ -984,7 +996,8 @@ export function createOpenAIRuntime({
         id: upstreamId,
         created: upstreamCreated,
         content: visibleText,
-        reasoning: '',
+        reasoning: reasoningText,
+        refusal: refusalText,
         toolCalls: new Map(),
         finishReason,
         usage,

@@ -179,6 +179,22 @@ test('OpenAI SSE 聚合生成标准非流式响应', async () => {
   });
 });
 
+test('OpenAI 响应保留 length 与 refusal 完成原因', async () => {
+  const truncated = toOpenAIResponse({
+    content: 'partial',
+    finishReason: 'length',
+  }, 'deepseek-v4-flash');
+  assert.equal(truncated.choices[0].finish_reason, 'length');
+
+  const refused = toOpenAIResponse({
+    content: '',
+    refusal: '无法处理',
+    finishReason: 'content_filter',
+  }, 'deepseek-v4-flash');
+  assert.equal(refused.choices[0].message.refusal, '无法处理');
+  assert.equal(refused.choices[0].finish_reason, 'content_filter');
+});
+
 test('模型目录映射成功结果并生成稳定 fallback', () => {
   const mapped = mapModelCatalogue({
     data: {
@@ -227,7 +243,7 @@ test('POST /v1/chat/completions 返回文本、usage 并释放号池租约', asy
     received = JSON.parse(raw);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('data: {"id":"cmb-1","created":1,"choices":[{"delta":{"content":"po"}}]}\n\n');
-    res.write('data: {"choices":[{"delta":{"content":"ng"}}]}\n\n');
+    res.write('data: {"choices":[{"delta":{"content":"ng","reasoning_content":"think"}}]}\n\n');
     res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}\n\n');
     res.end('data: [DONE]\n\n');
   });
@@ -250,6 +266,7 @@ test('POST /v1/chat/completions 返回文本、usage 并释放号池租约', asy
   assert.equal(json.model, 'deepseek-v4-flash');
   assert.equal(json.choices[0].message.role, 'assistant');
   assert.equal(json.choices[0].message.content, 'pong');
+  assert.equal(json.choices[0].message.reasoning_content, 'think');
   assert.equal(json.choices[0].finish_reason, 'stop');
   assert.deepEqual(json.usage, {
     prompt_tokens: 3,
@@ -325,4 +342,55 @@ test('管理页提供独立的 OpenAI 开关和接口地址', async (t) => {
   const config = await updated.json();
   assert.equal(config.openai, false);
   assert.equal(config.anthropic, false);
+});
+
+test('OpenAI 文本响应会失败关闭 WorkBuddy DSML', async (t) => {
+  const BAR = '\u{FF5C}\u{FF5C}';
+  const dsml = [
+    `先读取文件。<${BAR}DSML${BAR} calls>`,
+    `<${BAR}DSML${BAR} invoke name="read_file">`,
+    `<${BAR}DSML${BAR} parameter name="path" string="true">README.md</${BAR}DSML${BAR} parameter>`,
+    `</${BAR}DSML${BAR} invoke>`,
+    `</${BAR}DSML${BAR} calls>`,
+  ].join('\n');
+  const { baseUrl } = await startFixture(t, async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    for (const chunk of [dsml.slice(0, 23), dsml.slice(23)]) {
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: chunk } }] })}\n\n`);
+    }
+    res.end('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n');
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: '读取 README' }],
+    }),
+  });
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.equal(body.error.code, 'tool_calls_not_supported');
+  assert.equal(inflight('openai-a'), 0);
+});
+
+test('OpenAI 上游未给出完成原因时拒绝返回不完整文本', async (t) => {
+  const { baseUrl } = await startFixture(t, async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: 'ping' }],
+    }),
+  });
+  assert.equal(response.status, 502);
+  const body = await response.json();
+  assert.equal(body.error.code, 'UPSTREAM_TRUNCATED');
+  assert.equal(inflight('openai-a'), 0);
 });

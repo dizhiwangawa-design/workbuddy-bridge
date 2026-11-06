@@ -199,6 +199,13 @@ export function toOpenAIResponse(aggregate, model, { now = Date.now } = {}) {
     content: aggregate.content || '',
   };
   if (aggregate.reasoning) message.reasoning_content = aggregate.reasoning;
+  if (aggregate.refusal) message.refusal = aggregate.refusal;
+
+  const finishReason = {
+    length: 'length',
+    content_filter: 'content_filter',
+    refusal: 'content_filter',
+  }[aggregate.finishReason] || 'stop';
 
   const used = aggregate.usage || {};
   const promptTokens = Number(used.prompt_tokens ?? used.input_tokens);
@@ -222,7 +229,7 @@ export function toOpenAIResponse(aggregate, model, { now = Date.now } = {}) {
       index: 0,
       message,
       logprobs: null,
-      finish_reason: aggregate.finishReason || 'stop',
+      finish_reason: finishReason,
     }],
     usage: {
       prompt_tokens: prompt,

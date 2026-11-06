@@ -220,6 +220,10 @@ console.log(response.choices[0].message.content);
   `400 tools_not_supported`；当前不支持 OpenAI 工具调用。
 - 图片等非文本 content part 返回 `400 invalid_request`；当前只接受文本和文本
   content part。
+- OpenAI 思考型提示返回纯文本时，上游的 `reasoning_content` 会原样透传；这不等同于
+  Responses API 的 reasoning item。当前未开放 OpenAI 的声明式推理配置。
+- 上游给出 `finish_reason` 前的无完成原因断流会失败关闭并返回
+  `502 UPSTREAM_TRUNCATED`，不把半截回答伪装成正常完成。
 - 工具结果消息（`role:"tool"`、`tool_call_id`）会作为普通文本拼接给上游；由于
   OpenAI tools 尚未开放，当前不会建立新的工具调用往返。
 - `n` 只能为 `1`；`/v1/responses`、Embeddings、Audio、Batch 和 Fine-tuning
@@ -594,6 +598,17 @@ npm run test:live
 hy4 是旗舰模型，单价高、排队久，拿它跑测试既费额度又拖慢反馈。功能联调用 flash 足够；要看复杂推理表现时再手动单独跑，但不要写进测试脚本或 CI。
 
 默认 `npm test` 为离线测试，不联网、不消耗模型额度。旧 bridge 的 54 项和 API 相关测试全部保留；新增覆盖 DSML 字符 / UTF-8 字节切分、2 MiB 熔断、结构化与 DSML 仲裁、Anthropic 请求转换、OpenAI 非流式文本与模型目录、协议错误边界、SSE 双重 JSON 转义、官方 SDK 三轮 `tool_use/tool_result`、401 刷新、429 换号、并发上限、客户端断连、干净 EOF、TCP 中断和四层超时。管理页已做桌面端验收，不包含移动端验收。
+
+真实链路冒烟测试使用官方 OpenAI SDK，并由脚本自动临时开启 OpenAI 开关，结束后恢复原设置：
+
+```bash
+npm run test:live:openai
+node test/live/openai-live.mjs --thinking
+```
+
+前者验证普通文本，后者用需要分步算术分析的提示验证思考型提示返回；两者均故意将
+`WB_COMMAND` 指向不存在的路径，确认请求不依赖 CLI。这些冒烟测试只覆盖非流式文本，
+不代表 OpenAI 工具调用或 Responses API 可用。
 
 ```
 src/

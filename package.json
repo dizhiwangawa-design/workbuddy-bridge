@@ -24,7 +24,8 @@
     "doctor": "node bin/wb.js doctor",
     "test": "node test/run.mjs && node test/api/run.mjs",
     "test:api": "node test/api/run.mjs",
-    "test:live": "node test/live/anthropic-live.mjs"
+    "test:live": "node test/live/anthropic-live.mjs",
+    "test:live:openai": "node test/live/openai-live.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
@@ -42,6 +43,7 @@
     "opencode"
   ],
   "devDependencies": {
-    "@anthropic-ai/sdk": "^1.6.0"
+    "@anthropic-ai/sdk": "^1.6.0",
+    "openai": "^7.53.0"
   }
 }
