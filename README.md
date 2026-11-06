@@ -1,6 +1,7 @@
 # workbuddy-bridge
 
-> 把 WorkBuddy 接成两种标准接口：**MCP 子 Agent** 与 **Anthropic Messages API**。
+> 把 WorkBuddy 接成三种标准入口：**MCP 子 Agent**、**Anthropic Messages API** 与
+> **OpenAI Chat Completions API**。
 >
 > Claude Code / DeepSeek Harness / Codex / Cursor / OpenCode / Windsurf / Gemini CLI / Cline 通用。
 >
@@ -16,12 +17,15 @@ WorkBuddy 能力很强，但它是「一个 App」。你在 Claude Code 里写�
 
 Windsurf、Cursor 这些客户端各有各的 MCP 生态，官方没有提供「反向 MCP」让它们把 WorkBuddy 当子 Agent 调。
 
-本项目提供两条入口：
+本项目提供三条入口：
 
 1. **MCP**：任意 MCP 客户端通过 `workbuddy_task` 把任务交给 WorkBuddy；这条路径仍用 `codebuddy -p` 执行文件类长任务。
 2. **Anthropic Messages API**：标准 Anthropic SDK / 客户端直接请求 `/v1/messages`，支持真实流式文本、`tool_use` / `tool_result` 和 `count_tokens`；这条路径直接请求 WorkBuddy 上游，不启动 CLI。
+3. **OpenAI Chat Completions API**：OpenAI 兼容客户端请求 `/v1/chat/completions`
+   和 `/v1/models`；当前最小版支持非流式文本和模型目录，并直接请求 WorkBuddy
+   上游，不启动 CLI。流式、tools 与 Responses API 尚未开放。
 
-两条路径共享扫码凭证、多账号隔离、号池调度、并发限制、用量统计和管理界面：
+三个入口共享扫码凭证、多账号隔离、号池调度、并发限制、用量统计和管理界面：
 
 - **扫码登录**：不用先手工登录一次，Agent 或管理页里直接出二维码；
 - **多账号隔离**：一个账号一个独立配置目录和 HOME，公司号 / 个人号互不污染；
@@ -32,9 +36,9 @@ Windsurf、Cursor 这些客户端各有各的 MCP 生态，官方没有提供「
 
 ```
   Claude Code / DeepSeek Harness / Codex / Cursor / OpenCode / Windsurf …
-        │                                           Anthropic SDK / 兼容客户端
+        │                                 Anthropic / OpenAI SDK 与兼容客户端
         │ MCP (stdio / HTTP)                                   │ HTTP
-        │ workbuddy_task / workbuddy_login / …                 │ /v1/messages
+        │ workbuddy_task / workbuddy_login / …          │ /v1/messages  /v1/chat/completions
         ▼                                                      ▼
   workbuddy-bridge            ← 本项目
         ├── 账号与凭证：~/.workbuddy-bridge/profiles/<name>
@@ -42,7 +46,7 @@ Windsurf、Cursor 这些客户端各有各的 MCP 生态，官方没有提供「
         ├── 共享号池：鉴权 / 权重 / 并发 / 冷却 / 记账
         ├── 管理页：账号、用量、API 开关、客户端 Key
         ├── MCP 执行：codebuddy -p --output-format stream-json
-        └── API 执行：Anthropic 请求转换 → 上游 SSE → 归一化 → Anthropic SSE
+        └── API 执行：协议转换 → 上游 SSE → DSML 清洗 → 标准协议响应
                  │                                      │
                  ▼                                      ▼
        codebuddy CLI（仅 MCP / CLI）        WorkBuddy /v2/chat/completions
@@ -72,7 +76,7 @@ wb install
 # 5. 有多个号？再登一次
 wb login --account alice
 
-# 6. 启动管理页与 Anthropic API
+# 6. 启动管理页、Anthropic API 与可选 OpenAI API
 wb http --port 7666
 # 浏览器打开 http://127.0.0.1:7666/admin
 ```
@@ -104,7 +108,7 @@ wb http --port 7666
 |:--|:--|
 | `POST /v1/messages` | 支持流式 / 非流式文本、图片输入、`tool_use` 和 `tool_result` |
 | `POST /v1/messages/count_tokens` | 本地保守估算，响应带 `estimated:true` 与 `estimator:"wb-conservative-v1"` |
-| `GET /admin` | 开关 Anthropic API、生成 / 删除客户端 Key、查看超时与缓冲上限 |
+| `GET /admin` | 独立开关 Anthropic / OpenAI API、生成 / 删除客户端 Key、查看超时与缓冲上限 |
 
 官方 SDK 示例：
 
@@ -181,11 +185,51 @@ if (toolUse) {
 
 `count_tokens` 是确定性本地估算，不是 Anthropic 官方 tokenizer。中英文混合和长上下文可能有明显误差，**不得用于精确计费或裁剪刚好达到上下文上限的请求**；实际请求仍应处理上游的 `context_length_exceeded`。
 
-当前第一阶段只开放 Anthropic 路由，OpenAI `/v1/chat/completions` 保持关闭。暂不支持 thinking、文档附件、图片形式的 `tool_result` 和流式响应中的工具块原位交错；遇到不支持的 content block 返回 400。
+## OpenAI Chat Completions API（最小适配）
+
+管理页的 **OpenAI 协议** 开关只控制 OpenAI 路由；默认保持关闭，开启后可通过
+同一端口使用以下接口：
+
+| 方法与路径 | 当前范围 |
+|:--|:--|
+| `POST /v1/chat/completions` | 非流式文本，`system` / `developer` / `user` / `assistant` |
+| `GET /v1/models` | 优先读取 WorkBuddy 模型目录；不可用时返回带 `wb_source:"fallback"` 的稳定列表 |
+| `GET /v1/models/:id` | 查询目录中的单个模型；未找到返回 `404 model_not_found` |
+
+```js
+import OpenAI from 'openai';
+
+const client = new OpenAI({
+  apiKey: process.env.WB_API_KEY || 'loopback',
+  baseURL: 'http://127.0.0.1:7666/v1',
+});
+
+const response = await client.chat.completions.create({
+  model: 'deepseek-v4-flash',
+  stream: false,
+  messages: [{ role: 'user', content: '只回答两个字：收到' }],
+});
+
+console.log(response.choices[0].message.content);
+```
+
+这个最小实现具有以下明确约束（管理页 OpenAI 开关默认关闭，开启后生效）：
+
+- `stream: true` 返回 `400 stream_not_supported`；当前不支持 OpenAI SSE。
+- `tools`、`tool_choice`、旧版 `functions` / `function_call` 返回
+  `400 tools_not_supported`；当前不支持 OpenAI 工具调用。
+- 图片等非文本 content part 返回 `400 invalid_request`；当前只接受文本和文本
+  content part。
+- `n` 只能为 `1`；`/v1/responses`、Embeddings、Audio、Batch 和 Fine-tuning
+  不在本次范围。
+- 客户端 Key、协议开关、错误形状沿用共享的 API 兼容层；远程访问仍需配置 Key。
+
+Anthropic 的 thinking、文档附件、图片形式的 `tool_result` 和流式响应中的工具块
+原位交错暂不支持；遇到不支持的 content block 返回 400。
 
 ## 号池：多账号 + 自动分配负载
 
-v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调度的池子。`workbuddy_task` 不指定 `account` 时默认 `auto`，由调度器挑号；某个号挂了会自动换下一个。v0.3 补了完整用量看板；v0.4 加入 Anthropic API、DSML 安全归一化和共享号池的 API 并发控制。
+v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调度的池子。`workbuddy_task` 不指定 `account` 时默认 `auto`，由调度器挑号；某个号挂了会自动换下一个。v0.3 补了完整用量看板；v0.4 加入 Anthropic API、DSML 安全归一化和共享号池的 API 并发控制；OpenAI Chat Completions 最小适配沿用同一号池与鉴权层。
 
 ![数据看板](assets/pool-dashboard.png)
 
@@ -259,8 +303,8 @@ wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
 
 **API 兼容区**支持：
 
-- Anthropic API 总开关；
-- 当前接口地址与复制；
+- Anthropic API 与 OpenAI Chat Completions 的独立开关；
+- 两个协议的接口地址与复制；
 - 客户端 Key 生成、全部重置、明文一次性查看 / 复制、掩码列表和删除；
 - 鉴权模式、流空闲超时和 DSML 缓冲上限摘要。
 
@@ -416,7 +460,7 @@ wb login --site ioa         # 腾讯内网
 
 | 环境变量 | 默认 | 说明 |
 |:--|:--|:--|
-| `WB_COMMAND` | `codebuddy` | MCP / CLI 任务的命令路径；Anthropic API 不读取该命令 |
+| `WB_COMMAND` | `codebuddy` | MCP / CLI 任务的命令路径；Anthropic / OpenAI API 不读取该命令 |
 | `WB_BRIDGE_HOME` | `~/.workbuddy-bridge` | 桥接数据目录 |
 | `WB_DEBUG` | – | `1` 打调试日志 |
 | `WB_QUOTA_CMD` | – | 可选，外部额度探针命令，输出 JSON 供面板显示 |
@@ -480,7 +524,7 @@ wb login --site ioa         # 腾讯内网
 ## 安全说明
 
 - **默认自动授权（仅 MCP / CLI）**：任务会带 `--dangerously-skip-permissions`，WorkBuddy 请求的文件/网络操作直接执行。要留人工确认，把 `skipPermissions` 设成 `false`。
-- **凭证在本地**：扫码凭证保存在 `~/.workbuddy-bridge/profiles/<name>`。Anthropic API 会读取该凭据直连上游，刷新后的 token 以原子写入和 `0600` 权限回写原文件；日志和测试输出不得打印 access token、refresh token 或客户端 Key 明文。
+- **凭证在本地**：扫码凭证保存在 `~/.workbuddy-bridge/profiles/<name>`。Anthropic / OpenAI API 会读取该凭据直连上游，刷新后的 token 以原子写入和 `0600` 权限回写原文件；日志和测试输出不得打印 access token、refresh token 或客户端 Key 明文。
 - **客户端 Key 只存摘要**：管理页生成后只展示一次明文，配置中只保存 SHA-256 摘要。非回环访问默认强制 Key；不要为了图省事关掉远程鉴权。
 - **DSML 失败关闭**：识别到 DSML envelope 后，畸形、截断或超过 2 MiB 会终止响应，不回退为工具调用，也不把原始标记混入正文。
 - **stdio 不污染**：MCP 的 stdout 是协议通道，桥接所有日志走 stderr 和 `~/.workbuddy-bridge/logs/`。
@@ -490,9 +534,9 @@ wb login --site ioa         # 腾讯内网
 ## 常见问题
 
 **需要 WorkBuddy 桌面端开着吗？**
-不需要。MCP / CLI 任务驱动本机 `codebuddy`，Anthropic API 直接请求 WorkBuddy 上游，二者都能独立运行。
+不需要。MCP / CLI 任务驱动本机 `codebuddy`，Anthropic / OpenAI API 直接请求 WorkBuddy 上游，二者都能独立运行。
 
-**没有 `codebuddy` 命令，Anthropic API 还能用吗？**
+**没有 `codebuddy` 命令，Anthropic / OpenAI API 还能用吗？**
 能。只要账号目录里已有可用扫码凭证，API 不启动 CLI。MCP、`wb task` 和扫码登录流程仍需要 CLI。
 
 **Agent 里看不到我让它生成的文件？**
@@ -511,7 +555,7 @@ npm i -g node-pty
 **任务被客户端掐断？**
 多数 MCP 客户端对单次工具调用有超时上限。把 `timeoutMs` 设小一点先拿中间结果，或改用 `wb http --mcp` 走 HTTP 传输。
 
-**Anthropic SDK 报 401？**
+**Anthropic / OpenAI SDK 报 401？**
 回环地址默认免 Key；如果配置了 `requireApiKey=true`、从非回环地址访问，或经过可信反向代理，就需要在 `/admin` 生成 Key，并通过 `x-api-key` / `Authorization: Bearer` 发送。
 
 **流式响应为什么只看到文本，工具块最后才出现？**
@@ -547,16 +591,17 @@ npm run test:live
 
 hy4 是旗舰模型，单价高、排队久，拿它跑测试既费额度又拖慢反馈。功能联调用 flash 足够；要看复杂推理表现时再手动单独跑，但不要写进测试脚本或 CI。
 
-默认 `npm test` 为离线测试，不联网、不消耗模型额度。旧 bridge 的 54 项和 API 相关测试全部保留；新增覆盖 DSML 字符 / UTF-8 字节切分、2 MiB 熔断、结构化与 DSML 仲裁、Anthropic 请求转换、SSE 双重 JSON 转义、官方 SDK 三轮 `tool_use/tool_result`、401 刷新、429 换号、并发上限、客户端断连、干净 EOF、TCP 中断和四层超时。管理页已做桌面端验收，不包含移动端验收。
+默认 `npm test` 为离线测试，不联网、不消耗模型额度。旧 bridge 的 54 项和 API 相关测试全部保留；新增覆盖 DSML 字符 / UTF-8 字节切分、2 MiB 熔断、结构化与 DSML 仲裁、Anthropic 请求转换、OpenAI 非流式文本与模型目录、协议错误边界、SSE 双重 JSON 转义、官方 SDK 三轮 `tool_use/tool_result`、401 刷新、429 换号、并发上限、客户端断连、干净 EOF、TCP 中断和四层超时。管理页已做桌面端验收，不包含移动端验收。
 
 ```
 src/
   server.js     MCP 工具定义
-  api-server.js Anthropic 路由、鉴权和 API 管理接口
-  api-runtime.js 账号选择、上游流、超时、SSE 和最终仲裁
+  api-server.js Anthropic / OpenAI 路由、鉴权和 API 管理接口
+  api-runtime.js 账号选择、上游流、超时、SSE、协议编码和最终仲裁
   upstream-client.js WorkBuddy 上游请求与 token 刷新
   auth-store.js 隔离凭证读取与 0600 刷新回写
   protocols/anthropic.js Anthropic 请求转换与 SSE encoder
+  protocols/openai.js OpenAI 请求校验、聚合与模型目录映射
   protocols/normalize.js 协议无关工具归一化出口
   tool-calls.js DSML 扫描器、结构化 assembler、最终仲裁
   sse.js 任意分块 UTF-8 SSE parser 与 encoder
@@ -570,7 +615,7 @@ src/
   transfer.js   凭证导出导入
   install.js    各客户端注册（含 dsh 的 YAML patch 与插件版本对齐）
   admin.js      号池管理界面（单文件、零外部依赖）
-  http.js       登录页 + 管理页 + 号池 API + Anthropic API + Streamable HTTP
+  http.js       登录页 + 管理页 + 号池 API + Anthropic / OpenAI API + Streamable HTTP
 ```
 
 ## 参考与致谢

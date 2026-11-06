@@ -206,12 +206,14 @@ test('Bearer 与 x-api-key 共用同一套客户端 Key', async () => {
     const bearer = await fetch(`${baseUrl}/v1/models`, {
       headers: { authorization: `Bearer ${created.key}` },
     });
-    assert.equal(bearer.status, 501);
+    assert.equal(bearer.status, 200);
+    assert.equal((await bearer.json()).object, 'list');
 
     const xApiKey = await fetch(`${baseUrl}/v1/models`, {
       headers: { 'x-api-key': created.key },
     });
-    assert.equal(xApiKey.status, 501);
+    assert.equal(xApiKey.status, 200);
+    assert.equal((await xApiKey.json()).object, 'list');
 
     const anthropicMissing = await fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',

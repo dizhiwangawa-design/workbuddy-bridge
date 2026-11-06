@@ -8,7 +8,7 @@ import {
   resetApiKey,
 } from './api-settings.js';
 import { ApiError, sendApiError } from './api-errors.js';
-import { createAnthropicRuntime } from './api-runtime.js';
+import { createAnthropicRuntime, createOpenAIRuntime } from './api-runtime.js';
 
 function sendJson(res, status, body) {
   res.writeHead(status, {
@@ -157,23 +157,42 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
 
     if (route.operation === 'anthropic.count_tokens') {
       const body = await readBody(req);
-      const runtime = deps.runtime || createAnthropicRuntime(deps);
+      const runtime = deps.anthropicRuntime || deps.runtime || createAnthropicRuntime(deps);
       runtime.countTokens({ res, body, config });
       return true;
     }
 
     if (route.operation === 'anthropic.messages') {
       const body = await readBody(req);
-      const runtime = deps.runtime || createAnthropicRuntime(deps);
+      const runtime = deps.anthropicRuntime || deps.runtime || createAnthropicRuntime(deps);
       await runtime.messages({ req, res, body, config });
       return true;
     }
 
-    sendApiError(res, new ApiError(501, 'API route is not implemented yet', {
+    const runtime = deps.openaiRuntime || createOpenAIRuntime(deps);
+    if (route.operation === 'openai.chat') {
+      const body = await readBody(req);
+      await runtime.chat({ req, res, body, config });
+      return true;
+    }
+    if (route.operation === 'openai.models') {
+      await runtime.models({ req, res, config });
+      return true;
+    }
+    if (route.operation === 'openai.model') {
+      await runtime.model({
+        req,
+        res,
+        config,
+        id: pathname.slice('/v1/models/'.length),
+      });
+      return true;
+    }
+
+    throw new ApiError(501, 'API route is not implemented yet', {
       type: 'api_error',
       code: 'not_implemented',
-    }), protocol);
-    return true;
+    });
   } catch (error) {
     sendApiError(
       res,

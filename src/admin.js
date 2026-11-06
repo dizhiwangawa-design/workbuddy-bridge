@@ -414,7 +414,7 @@ export function adminPage({ home = '', token = '' } = {}) {
         <div class="panel-title">API 兼容</div>
         <div class="panel-sub">直接使用 WorkBuddy 上游与号池，不启动 CLI</div>
       </div>
-      <div class="panel-link">Anthropic Messages API</div>
+      <div class="panel-link">Anthropic / OpenAI API</div>
     </div>
     <div class="api-grid">
       <div class="api-card">
@@ -444,6 +444,22 @@ export function adminPage({ home = '', token = '' } = {}) {
           <button class="ghost" data-act="api-key-create">生成新 Key</button>
         </div>
         <div id="api-keys"></div>
+      </div>
+      <div class="api-card">
+        <div class="api-card-head">
+          <div class="api-icon">O</div>
+          <div class="api-copy">
+            <div class="api-name">OpenAI 协议</div>
+            <div class="api-desc">非流式文本与模型目录（最小实现）</div>
+          </div>
+          <span class="api-state" id="api-openai-state">关闭</span>
+          <button class="switch" id="api-openai-switch" role="switch" aria-checked="false" data-act="api-openai-toggle" title="启用/停用 OpenAI API"></button>
+        </div>
+        <div class="api-endpoint">
+          <code id="api-openai-endpoint"></code>
+          <button class="mini" data-act="api-copy-openai-endpoint" title="复制 OpenAI 接口地址">复制</button>
+        </div>
+        <div class="api-meta" id="api-openai-meta"></div>
       </div>
     </div>
   </section>
@@ -883,6 +899,15 @@ function renderApi(){
   $('api-state').className='api-state'+(enabled?'':' off');
   $('api-switch').setAttribute('aria-checked',enabled?'true':'false');
   $('api-endpoint').textContent=location.origin+'/v1/messages';
+  var openaiEnabled=!!(s.enabled&&s.openai);
+  $('api-openai-state').textContent=openaiEnabled?'已启用':'已关闭';
+  $('api-openai-state').className='api-state'+(openaiEnabled?'':' off');
+  $('api-openai-switch').setAttribute('aria-checked',openaiEnabled?'true':'false');
+  $('api-openai-endpoint').textContent=location.origin+'/v1/chat/completions';
+  $('api-openai-meta').innerHTML=
+    '<span>文本 <b>非流式</b></span>'+
+    '<span>模型目录 <b>/v1/models</b></span>'+
+    '<span>Tools <b>未开放</b></span>';
   var authMode=s.requireApiKey?'所有连接强制 Key':
     !s.remoteRequireKey?'不强制 Key':
     s.trustProxy?'可信代理强制 Key':'回环免 Key · 远程强制 Key';
@@ -1005,6 +1030,13 @@ document.addEventListener('click',function(ev){
         .then(function(){toast(!apiOn?'Anthropic API 已启用':'Anthropic API 已关闭')});
     });
   }
+  if(a==='api-openai-toggle'){
+    var openaiOn=el.getAttribute('aria-checked')==='true';
+    return act(function(){
+      return api('/api/api-compat',{method:'PATCH',body:JSON.stringify({openai:!openaiOn})})
+        .then(function(){toast(!openaiOn?'OpenAI API 已启用':'OpenAI API 已关闭')});
+    });
+  }
   if(a==='api-key-create'){
     el.disabled=true;
     return api('/api/api-compat/keys',{method:'POST',body:JSON.stringify({name:'dashboard'})})
@@ -1029,6 +1061,7 @@ document.addEventListener('click',function(ev){
     });
   }
   if(a==='api-copy-endpoint') return copyText(location.origin+'/v1/messages','接口地址已复制');
+  if(a==='api-copy-openai-endpoint') return copyText(location.origin+'/v1/chat/completions','OpenAI 接口地址已复制');
   if(a==='toggle'){
     var cur=el.getAttribute('aria-checked')==='true';
     return act(function(){return api('/api/pool/'+encodeURIComponent(name),{method:'PATCH',body:JSON.stringify({enabled:!cur})})});

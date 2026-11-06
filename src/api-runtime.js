@@ -6,6 +6,11 @@ import {
   normalizeAnthropicRequest,
 } from './protocols/anthropic.js';
 import {
+  mapModelCatalogue,
+  prepareOpenAIRequest,
+  toOpenAIResponse,
+} from './protocols/openai.js';
+import {
   arbitrateToolCalls,
   createStructuredToolAssembler,
 } from './protocols/normalize.js';
@@ -693,5 +698,454 @@ export function createAnthropicRuntime({
   return {
     messages,
     countTokens,
+  };
+}
+
+function openAIUsage(source, fallbackInput = 0, fallbackOutput = 0) {
+  const prompt = Number(source?.prompt_tokens ?? source?.input_tokens);
+  const completion = Number(source?.completion_tokens ?? source?.output_tokens);
+  const total = Number(source?.total_tokens);
+  const promptTokens = Number.isFinite(prompt) ? prompt : fallbackInput;
+  const completionTokens = Number.isFinite(completion) ? completion : fallbackOutput;
+  return {
+    prompt_tokens: Math.max(0, promptTokens),
+    completion_tokens: Math.max(0, completionTokens),
+    total_tokens: Number.isFinite(total)
+      ? Math.max(0, total)
+      : Math.max(0, promptTokens + completionTokens),
+  };
+}
+
+export function createOpenAIRuntime({
+  upstreamClient = createUpstreamClient(),
+  readCredentials = readAccountCredentials,
+  saveCredentials = saveRefreshedCredentials,
+  pick = pickAccount,
+  begin = beginTask,
+  end = endTask,
+  poolLoader = loadPool,
+  now = Date.now,
+} = {}) {
+  async function refreshCredentials(credentials) {
+    if (!credentials.refreshToken) return credentials;
+    try {
+      const refreshed = await upstreamClient.refresh(credentials);
+      return saveCredentials(credentials, refreshed, { now: now() });
+    } catch (error) {
+      debug(`OpenAI credential refresh failed: ${error.message}`);
+      return credentials;
+    }
+  }
+
+  async function executeAttempt({
+    req,
+    res,
+    body,
+    config,
+    account,
+  }) {
+    const startedAt = now();
+    const inputEstimate = conservativeTokenEstimate(body.body);
+    const controller = new AbortController();
+    const pendingWrites = [];
+    let reader = null;
+    let readerDone = false;
+    let firstByteTimer = null;
+    let idleTimer = null;
+    let totalTimer = null;
+    let timeoutKind = null;
+    let finishReason = null;
+    let upstreamId = null;
+    let upstreamCreated = null;
+    let upstreamUsage = null;
+    let sawDone = false;
+    let structuredTools = false;
+    let visibleText = '';
+    const scanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
+    let leaseResult = {
+      ok: false,
+      code: 'ABORTED',
+      error: 'client disconnected',
+      durationMs: 0,
+    };
+
+    function terminate(kind, error) {
+      if (timeoutKind) return;
+      timeoutKind = kind;
+      const reason = error || new TimeoutFailure(
+        kind,
+        kind === 'first_byte'
+          ? 'upstream first byte timed out'
+          : kind === 'idle'
+            ? 'upstream stream became idle'
+            : 'upstream request exceeded the total timeout',
+      );
+      if (reader) pendingWrites.push(Promise.resolve(reader.cancel(reason)).catch(() => {}));
+      controller.abort(reason);
+    }
+
+    function onClientDisconnect() {
+      if (!res.writableEnded) {
+        terminate('client', new RuntimeFailure('client disconnected', {
+          code: 'ABORTED',
+          retryable: false,
+        }));
+      }
+    }
+
+    function onAborted() {
+      onClientDisconnect();
+    }
+
+    function stopTimers() {
+      clearTimeout(firstByteTimer);
+      clearTimeout(idleTimer);
+      clearTimeout(totalTimer);
+    }
+
+    function resetIdle() {
+      clearTimeout(idleTimer);
+      if (!config.idleTimeoutMs) return;
+      idleTimer = setTimeout(() => terminate(
+        'idle',
+        new TimeoutFailure('idle', 'upstream stream became idle'),
+      ), config.idleTimeoutMs);
+      idleTimer.unref?.();
+    }
+
+    function armFirstByte() {
+      if (!config.firstByteTimeoutMs) return;
+      firstByteTimer = setTimeout(() => terminate(
+        'first_byte',
+        new TimeoutFailure('first_byte', 'upstream first byte timed out'),
+      ), config.firstByteTimeoutMs);
+      firstByteTimer.unref?.();
+    }
+
+    function armTotal() {
+      if (!config.totalTimeoutMs) return;
+      totalTimer = setTimeout(() => terminate(
+        'total',
+        new TimeoutFailure('total', 'upstream request exceeded the total timeout'),
+      ), config.totalTimeoutMs);
+      totalTimer.unref?.();
+    }
+
+    function scannerError(error) {
+      throw new RuntimeFailure(`DSML normalization failed: ${error.message}`, {
+        status: 502,
+        type: 'api_error',
+        code: error.code,
+      });
+    }
+
+    function feedContent(content) {
+      const text = textDelta(content);
+      if (!text) return;
+      const scanned = scanner.push(text);
+      if (scanned.error) scannerError(scanned.error);
+      visibleText += scanned.visibleText;
+    }
+
+    function processDocument(document) {
+      if (!document || typeof document !== 'object' || Array.isArray(document)) {
+        throw new RuntimeFailure('upstream returned an invalid OpenAI SSE document', {
+          code: 'UPSTREAM_PROTOCOL_ERROR',
+        });
+      }
+      if (document.error) {
+        throw new RuntimeFailure(
+          String(document.error.message || 'WorkBuddy upstream error').slice(0, 300),
+          { code: 'UPSTREAM_ERROR' },
+        );
+      }
+      upstreamId ||= document.id;
+      if (upstreamCreated === null && Number.isFinite(Number(document.created))) {
+        upstreamCreated = Number(document.created);
+      }
+      if (document.usage) upstreamUsage = document.usage;
+
+      const choice = Array.isArray(document.choices) ? document.choices[0] : null;
+      if (!choice) return;
+      finishReason = choice.finish_reason || finishReason;
+      const payload = choice.delta || choice.message || {};
+      if (
+        (Array.isArray(payload.tool_calls) && payload.tool_calls.length)
+        || (Array.isArray(choice.message?.tool_calls) && choice.message.tool_calls.length)
+      ) {
+        structuredTools = true;
+      }
+      feedContent(payload.content);
+    }
+
+    async function requestUpstream(credentials) {
+      return upstreamClient.chat({
+        accountId: account,
+        credentials,
+        model: body.model,
+        body: body.body,
+        sanitize: config.channelSanitize,
+        signal: controller.signal,
+      });
+    }
+
+    req.once('aborted', onAborted);
+    res.once('close', onClientDisconnect);
+
+    try {
+      let credentials = readCredentials(account, { now: now() });
+      if (!credentials?.ok) {
+        throw new RuntimeFailure('WorkBuddy account has no usable credentials', {
+          status: 401,
+          type: 'authentication_error',
+          code: 'AUTH_REQUIRED',
+          retryable: true,
+        });
+      }
+      if (credentials.needsRefresh) credentials = await refreshCredentials(credentials);
+
+      armTotal();
+      armFirstByte();
+      let response = await requestUpstream(credentials);
+      if (response.status === 401 && credentials.refreshToken) {
+        credentials = await refreshCredentials(credentials);
+        response = await requestUpstream(credentials);
+      }
+      if (!response.ok) {
+        throw upstreamError(response.status, await upstreamErrorDetail(response));
+      }
+
+      const contentType = String(response.headers.get('content-type') || '');
+      if (!contentType.includes('text/event-stream')) {
+        clearTimeout(firstByteTimer);
+        let payload;
+        try {
+          payload = await response.json();
+        } catch {
+          throw new RuntimeFailure('upstream returned a non-JSON completion', {
+            code: 'UPSTREAM_PROTOCOL_ERROR',
+          });
+        }
+        processDocument(payload);
+      } else {
+        if (!response.body) throw new RuntimeFailure('upstream response has no body');
+        reader = response.body.getReader();
+        resetIdle();
+        const parser = createSseParser();
+        while (!sawDone) {
+          const read = await reader.read();
+          if (read.done) {
+            readerDone = true;
+            for (const event of parser.finished()) processDocument(event.data);
+            break;
+          }
+          clearTimeout(firstByteTimer);
+          resetIdle();
+          for (const event of parser.feed(read.value)) {
+            if (event.data === '[DONE]') {
+              sawDone = true;
+              continue;
+            }
+            let document = event.data;
+            if (typeof document === 'string') {
+              try {
+                document = JSON.parse(document);
+              } catch {
+                throw new RuntimeFailure('upstream returned malformed OpenAI SSE JSON', {
+                  code: 'UPSTREAM_PROTOCOL_ERROR',
+                });
+              }
+            }
+            processDocument(document);
+          }
+        }
+      }
+
+      if (timeoutKind) {
+        throw controller.signal.reason instanceof RuntimeFailure
+          ? controller.signal.reason
+          : new TimeoutFailure(timeoutKind, `upstream ${timeoutKind} timeout`);
+      }
+      const scannedEnd = scanner.finish();
+      if (scannedEnd.error) scannerError(scannedEnd.error);
+      visibleText += scannedEnd.visibleText;
+      if (structuredTools) {
+        throw new RuntimeFailure('upstream returned tool calls that were not requested', {
+          code: 'tool_calls_not_supported',
+        });
+      }
+
+      const usage = openAIUsage(
+        upstreamUsage,
+        inputEstimate,
+        conservativeTokenEstimate(visibleText),
+      );
+      const responseBody = toOpenAIResponse({
+        id: upstreamId,
+        created: upstreamCreated,
+        content: visibleText,
+        reasoning: '',
+        toolCalls: new Map(),
+        finishReason,
+        usage,
+      }, body.model, { now });
+      sendJson(res, 200, responseBody);
+
+      leaseResult = {
+        ok: true,
+        code: 'OK',
+        durationMs: now() - startedAt,
+        meta: {
+          model: body.model,
+          usage: {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+          },
+        },
+      };
+      return { ok: true };
+    } catch (error) {
+      const failure = error instanceof RuntimeFailure
+        ? error
+        : new RuntimeFailure(error.message || 'internal error', {
+            code: 'INTERNAL_ERROR',
+          });
+      leaseResult = {
+        ok: false,
+        code: failure.code,
+        error: `${failure.message} ${failure.code}`,
+        durationMs: now() - startedAt,
+        meta: { model: body.model, usage: {} },
+      };
+      return { ok: false, started: false, error: failure };
+    } finally {
+      stopTimers();
+      req.off('aborted', onAborted);
+      res.off('close', onClientDisconnect);
+      if (reader && !readerDone) {
+        try {
+          await reader.cancel(controller.signal.reason || 'request finished');
+        } catch {
+          // Best effort.
+        }
+      }
+      await Promise.allSettled(pendingWrites);
+      end(account, leaseResult);
+    }
+  }
+
+  async function chat({ req, res, body, config }) {
+    const normalized = prepareOpenAIRequest(body, {
+      defaultModel: config.defaultModel,
+    });
+    const pool = poolLoader();
+    const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
+    const tried = [];
+    let lastFailure = null;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const picked = pick({ exclude: tried });
+      if (!picked.name) {
+        if (!tried.length) {
+          throw new ApiError(503, `号池里没有可用账号（${picked.reason}）`, {
+            type: 'service_unavailable',
+            code: 'POOL_EMPTY',
+          });
+        }
+        break;
+      }
+      tried.push(picked.name);
+      debug(`openai api → ${picked.name}（第 ${attempt + 1} 次）`);
+      begin(picked.name);
+      const result = await executeAttempt({
+        req,
+        res,
+        body: normalized,
+        config,
+        account: picked.name,
+      });
+      if (result.ok) return result;
+      lastFailure = result.error;
+      if (!result.error?.retryable) break;
+    }
+
+    const failure = lastFailure || new RuntimeFailure('all account attempts failed');
+    if (!res.headersSent && !res.writableEnded) sendApiError(res, failure, 'openai');
+    return { ok: false, error: failure };
+  }
+
+  async function catalogue(config) {
+    const pool = poolLoader();
+    const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
+    const tried = [];
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const picked = pick({ exclude: tried });
+      if (!picked.name) break;
+      tried.push(picked.name);
+      begin(picked.name);
+      const startedAt = now();
+      try {
+        let credentials = readCredentials(picked.name, { now: now() });
+        if (!credentials?.ok) throw new Error('no credentials');
+        if (credentials.needsRefresh) credentials = await refreshCredentials(credentials);
+        const payload = await upstreamClient.models(credentials);
+        const models = mapModelCatalogue(payload, {
+          defaultModel: config.defaultModel,
+        });
+        end(picked.name, {
+          ok: true,
+          code: 'OK',
+          durationMs: now() - startedAt,
+          meta: { model: '', usage: {} },
+        });
+        return { models, source: models.some((model) => model.wb_source === 'fallback')
+          ? 'fallback'
+          : 'upstream' };
+      } catch (error) {
+        debug(`OpenAI model catalogue from ${picked.name} failed: ${error.message}`);
+        end(picked.name, {
+          ok: false,
+          code: 'UPSTREAM_ERROR',
+          error: error.message,
+          durationMs: now() - startedAt,
+          meta: { model: '', usage: {} },
+        });
+      }
+    }
+
+    return {
+      models: mapModelCatalogue(null, { defaultModel: config.defaultModel }),
+      source: 'fallback',
+    };
+  }
+
+  async function models({ res, config }) {
+    const result = await catalogue(config);
+    sendJson(res, 200, {
+      object: 'list',
+      data: result.models,
+    }, {
+      'x-wb-model-source': result.source,
+    });
+  }
+
+  async function model({ res, config, id }) {
+    const result = await catalogue(config);
+    const modelId = decodeURIComponent(String(id || ''));
+    const found = result.models.find((item) => item.id === modelId);
+    if (!found) {
+      throw new ApiError(404, `model not found: ${modelId}`, {
+        type: 'invalid_request_error',
+        code: 'model_not_found',
+      });
+    }
+    sendJson(res, 200, found);
+  }
+
+  return {
+    chat,
+    models,
+    model,
   };
 }

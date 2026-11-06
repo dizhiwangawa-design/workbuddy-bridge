@@ -1047,7 +1047,7 @@ toOpenAIResponse(aggregate: object, model: string): object;
 `retryable: true` 的 `ApiError` 时，runtime 可以换号；commit 之后的任何失败只按
 当前协议发送错误并结束。
 
-- [ ] **Step 1: 写非流式文本测试**
+- [x] **Step 1: 写非流式文本测试**
 
 测试启用 `openai: true, streaming: false, tools: false`，向 bridge 发：
 
@@ -1093,13 +1093,13 @@ res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prom
 res.end('data: [DONE]\n\n');
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/openai.test.mjs`
 
 Expected: FAIL，`/v1/chat/completions` 尚无实现或返回空文本。
 
-- [ ] **Step 3: 实现最小运行时和聚合**
+- [x] **Step 3: 实现最小运行时和聚合**
 
 请求规范化：
 
@@ -1279,7 +1279,7 @@ function mapModelCatalogue(payload) {
 }
 ```
 
-- [ ] **Step 4: 运行本任务和回归**
+- [x] **Step 4: 运行本任务和回归**
 
 Run: `node test/api/openai.test.mjs`
 
@@ -1296,6 +1296,11 @@ Expected: PASS。
 - 默认模型、显式模型和 usage 都出现在正确字段。
 - 空 messages、`n>1` 和关闭 tools 时的 tools 请求返回 OpenAI 形状的 400。
 - API 处理过程中没有任何 CLI 子进程。
+
+**2026-11-06 最小实现范围更新：** 本次只开放非流式文本、文本 content part、
+模型目录、模型 fallback 和管理页独立 OpenAI 开关。按用户要求先落实最小实现，
+`stream:true`、tools、图片、Responses API 在后续阶段实现；请求这些能力时返回明确的
+OpenAI 400/404，不得误报为已支持。
 
 ---
 
