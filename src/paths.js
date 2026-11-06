@@ -61,13 +61,21 @@ export function defaultConfig() {
     loginPagePort: 7666,
     apiCompat: {
       version: 1,
-      enabled: false,
+      enabled: true,
       openai: false,
-      anthropic: false,
-      streaming: false,
-      tools: false,
+      anthropic: true,
+      anthropicEnabled: true,
+      streaming: true,
+      tools: true,
       channelSanitize: true,
-      requireApiKey: true,
+      requireApiKey: false,
+      remoteRequireKey: true,
+      trustProxy: false,
+      dsmlMaxBufferBytes: 2 * 1024 * 1024,
+      firstByteTimeoutMs: 60000,
+      idleTimeoutMs: 120000,
+      finishGraceMs: 2000,
+      totalTimeoutMs: 600000,
       upstreamBaseUrl: 'https://copilot.tencent.com',
       defaultModel: 'deepseek-v4-flash',
       timeoutMs: 900000,
@@ -102,15 +110,20 @@ export function loadConfig() {
   const base = defaultConfig();
   const saved = readJson(BRIDGE_CONFIG, null);
   if (!saved) return base;
+  const savedApi = saved.apiCompat || {};
+  const apiCompat = {
+    ...base.apiCompat,
+    ...savedApi,
+    keys: Array.isArray(savedApi.keys) ? savedApi.keys : base.apiCompat.keys,
+  };
+  if (Object.hasOwn(savedApi, 'anthropic') && !Object.hasOwn(savedApi, 'anthropicEnabled')) {
+    apiCompat.anthropicEnabled = savedApi.anthropic;
+  }
   return {
     ...base,
     ...saved,
     defaults: { ...base.defaults, ...(saved.defaults || {}) },
-    apiCompat: {
-      ...base.apiCompat,
-      ...(saved.apiCompat || {}),
-      keys: Array.isArray(saved.apiCompat?.keys) ? saved.apiCompat.keys : base.apiCompat.keys,
-    },
+    apiCompat,
   };
 }
 

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { accountAuthDir, getAccount } from './accounts.js';
+import { writeJson } from './paths.js';
 
 const SECONDS_CUTOFF = 100_000_000_000;
 
@@ -65,4 +66,39 @@ export function readAccountCredentials(accountName, {
 
   candidates.sort((a, b) => (b.expiresAt || 0) - (a.expiresAt || 0));
   return candidates[0] || { ok: false, reason: '没有可用登录凭证' };
+}
+
+export function saveRefreshedCredentials(credentials, refreshed, {
+  now = Date.now(),
+} = {}) {
+  if (!credentials?.filePath) throw new Error('missing credential file path');
+  if (typeof refreshed?.accessToken !== 'string' || !refreshed.accessToken) {
+    throw new Error('refreshed access token is missing');
+  }
+
+  const current = JSON.parse(fs.readFileSync(credentials.filePath, 'utf8'));
+  const auth = current.auth && typeof current.auth === 'object' ? current.auth : {};
+  auth.accessToken = refreshed.accessToken;
+  if (typeof refreshed.refreshToken === 'string' && refreshed.refreshToken) {
+    auth.refreshToken = refreshed.refreshToken;
+  }
+
+  const expiresIn = Number(refreshed.expiresIn);
+  if (Number.isFinite(expiresIn) && expiresIn > 0) {
+    auth.expiresAt = now + expiresIn * 1000;
+  }
+  const refreshExpiresIn = Number(refreshed.refreshExpiresIn);
+  if (Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0) {
+    auth.refreshExpiresAt = now + refreshExpiresIn * 1000;
+  }
+  current.auth = auth;
+  writeJson(credentials.filePath, current, 0o600);
+  return {
+    ...credentials,
+    accessToken: auth.accessToken,
+    refreshToken: auth.refreshToken || credentials.refreshToken,
+    expiresAt: normalizeEpochMs(auth.expiresAt),
+    refreshExpiresAt: normalizeEpochMs(auth.refreshExpiresAt),
+    needsRefresh: false,
+  };
 }

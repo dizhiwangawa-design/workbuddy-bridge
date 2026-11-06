@@ -102,6 +102,16 @@ function baseHeaders(credentials) {
   return headers;
 }
 
+function workbuddyToolChoice(choice) {
+  if (!choice || typeof choice !== 'object' || Array.isArray(choice)) return choice;
+  if (choice.type === 'function' && choice.function?.name) {
+    return String(choice.function.name);
+  }
+  if (choice.type === 'auto' || choice.type === 'none') return choice.type;
+  if (choice.type === 'any' || choice.type === 'required') return 'required';
+  return choice;
+}
+
 async function readJsonResponse(response, operation) {
   if (!response.ok) {
     throw Object.assign(
@@ -137,6 +147,7 @@ export function createUpstreamClient({
     }) {
       const outbound = { ...body, model, stream: true };
       delete outbound.stream_options;
+      outbound.tool_choice = workbuddyToolChoice(outbound.tool_choice);
       const prepared = sanitize
         ? sanitizeChatBody(outbound).body
         : outbound;

@@ -98,3 +98,32 @@ test('同一账号存在多个凭据时选择到期时间最晚的文件', () =>
   assert.equal(got.expiresAt, 2000000400000);
   assert.equal(got.filePath, latest);
 });
+
+test('刷新结果以 0600 安全回写原凭据文件并保留其他字段', () => {
+  const file = writeCredential('cred-refresh-write', {
+    accessToken: 'old-access-secret',
+    refreshToken: 'old-refresh-secret',
+    expiresAt: 2000000100,
+    refreshExpiresAt: 2100000000,
+    domain: 'keep.example',
+  });
+  const before = auth.readAccountCredentials('cred-refresh-write', {
+    now: 2000000000000,
+  });
+
+  auth.saveRefreshedCredentials(before, {
+    accessToken: 'new-access-secret',
+    refreshToken: 'new-refresh-secret',
+    expiresIn: 3600,
+    refreshExpiresIn: 7200,
+  }, { now: 2000000000000 });
+
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(saved.auth.accessToken, 'new-access-secret');
+  assert.equal(saved.auth.refreshToken, 'new-refresh-secret');
+  assert.equal(saved.auth.domain, 'keep.example');
+  assert.equal(saved.account.uid, 'uid-cred-refresh-write');
+  assert.equal(saved.auth.expiresAt, 2000003600000);
+  assert.equal(saved.auth.refreshExpiresAt, 2000007200000);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+});

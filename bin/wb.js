@@ -18,7 +18,7 @@ import {
 } from '../src/accounts.js';
 import { loadConfig, saveConfig, BRIDGE_HOME, ensureBridgeDirs } from '../src/paths.js';
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 
 const C = {
   dim: (s) => `\x1b[2m${s}\x1b[0m`,
@@ -31,7 +31,7 @@ const C = {
 
 function help() {
   console.log(`
-${C.bold('workbuddy-bridge')} ${C.dim('v' + VERSION)} — 把 WorkBuddy 接成任意编程 Agent 的子 Agent
+${C.bold('workbuddy-bridge')} ${C.dim('v' + VERSION)} — WorkBuddy MCP 子 Agent + Anthropic Messages API
 
 ${C.bold('用法')}
   wb login  [--account <名字>] [--site cn|intl|enterprise|ioa] [--port 7666] [--no-qr]
@@ -47,7 +47,9 @@ ${C.bold('用法')}
       以 stdio MCP 方式运行（Agent 内部调用，一般不手动执行）。
 
   wb http [--port 7666] [--mcp] [--host 0.0.0.0]
-      起 HTTP 服务：/login 登录页；加 --mcp 同时暴露 Streamable HTTP MCP。
+      起 HTTP 服务：/login 登录页、/admin 管理页、/v1/messages Anthropic API。
+      API 直接请求 WorkBuddy 上游并复用现有账号池，不启动 codebuddy CLI。
+      加 --mcp 同时暴露 Streamable HTTP MCP。
 
   wb task "<任务>" [--cwd <目录>] [--model <模型>] [--account <名字>]
       直接在终端委托一个任务给 WorkBuddy。默认 --account auto，由号池挑负载最轻的号。
@@ -64,7 +66,8 @@ ${C.bold('用法')}
   wb pool test <名字>                发一条最小请求，确认这个号真的能用
 
   wb admin [--port 7667] [--host 0.0.0.0]
-      打开可视化管理界面（账号卡片、额度、负载、扫码登录都能在上面做）。
+      打开可视化管理界面（账号卡片、额度、负载、扫码登录、Anthropic 开关和
+      客户端 Key 都能在上面管理）。
 
   wb accounts [list|use <名字>|remove <名字>]
       管理多账号。
@@ -79,8 +82,27 @@ ${C.bold('用法')}
   wb doctor
       检查环境。
 
+${C.bold('Anthropic API')}
+  Base URL     http://127.0.0.1:7666
+  POST         /v1/messages
+  POST         /v1/messages/count_tokens   （保守估算，不用于精确计费）
+
+  TypeScript / JavaScript：
+    const client = new Anthropic({
+      apiKey: '<在 /admin 生成的客户端 Key>',
+      baseURL: 'http://127.0.0.1:7666',
+    });
+    await client.messages.create({
+      model: 'deepseek-v4-flash',
+      max_tokens: 256,
+      messages: [{ role: 'user', content: '你好' }],
+    });
+
+  回环地址默认免 Key；非回环连接或 trustProxy=true 时必须提供 x-api-key
+  或 Authorization: Bearer。功能开关、Key 生成 / 删除和超时摘要都在 /admin。
+
 ${C.bold('环境变量')}
-  WB_COMMAND      codebuddy 可执行文件（默认 codebuddy）
+  WB_COMMAND      codebuddy 可执行文件（仅 MCP / CLI 任务使用；API 不依赖它）
   WB_BRIDGE_HOME  桥接数据目录（默认 ~/.workbuddy-bridge）
   WB_DEBUG        1 打开调试日志
 `);
@@ -419,15 +441,23 @@ async function cmdDoctor() {
   const cfg = loadConfig();
   const acc = resolveAccountName();
   const chk = quickAuthCheck(acc);
+  const hasCli = cliExists();
+  const api = cfg.apiCompat || {};
+  const anthropicOn = Boolean(api.enabled && (api.anthropicEnabled ?? api.anthropic));
+  const apiAuth = api.requireApiKey
+    ? '所有连接强制 Key'
+    : '回环免 Key · 远程强制 Key';
   const rows = [
     ['Node.js', process.version, true],
     ['平台', `${process.platform}/${process.arch}`, true],
-    ['codebuddy', cliExists() ? cliCommand() : '未找到', cliExists()],
+    ['codebuddy', hasCli ? cliCommand() : '未找到（仅影响 MCP / CLI 任务）', hasCli],
     ['桥接目录', BRIDGE_HOME, true],
     ['默认账号', `${acc} · ${chk.loggedIn ? '已登录' : '未登录（' + chk.reason + '）'}`, chk.loggedIn],
     ['默认模型', cfg.defaults.model || 'auto', true],
     ['权限模式', cfg.defaults.skipPermissions ? '自动授权(-y)' : '交互确认', true],
     ['登录页端口', String(cfg.loginPagePort), true],
+    ['Anthropic API', anthropicOn ? '已开启 · /v1/messages' : '已关闭', anthropicOn],
+    ['API 鉴权', apiAuth, true],
   ];
   console.log(C.bold('\n环境检查\n'));
   for (const [k, v, ok] of rows) {
@@ -438,6 +468,9 @@ async function cmdDoctor() {
     if (c.detected) console.log(`  ${C.green('●')} ${c.label.padEnd(14)} ${C.dim(c.file)}`);
   }
   console.log('');
+  if (!hasCli) {
+    console.log(C.yellow('未找到 codebuddy：MCP / CLI 任务不可用；Anthropic API 直接走上游，不依赖该命令。\n'));
+  }
   if (!chk.loggedIn) {
     console.log(C.yellow('账号未登录 → 执行 wb login 扫码，或在 Agent 里调用 workbuddy_login。\n'));
   }

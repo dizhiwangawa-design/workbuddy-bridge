@@ -141,7 +141,12 @@ function adminAllowed(req, url) {
  *  - /api/qr/:id       → 二维码 PNG
  *  - /mcp              → （可选）Streamable HTTP MCP 入口
  */
-export async function startHttpServer({ port = 7666, host = '127.0.0.1', mcp = false } = {}) {
+export async function startHttpServer({
+  port = 7666,
+  host = '127.0.0.1',
+  mcp = false,
+  apiDeps = {},
+} = {}) {
   const transports = new Map();
 
   const server = http.createServer(async (req, res) => {
@@ -159,7 +164,7 @@ export async function startHttpServer({ port = 7666, host = '127.0.0.1', mcp = f
       }
 
       if (p.startsWith('/v1/')) {
-        await handleApiRequest({ req, res, url });
+        await handleApiRequest({ req, res, url, deps: apiDeps });
         return;
       }
 

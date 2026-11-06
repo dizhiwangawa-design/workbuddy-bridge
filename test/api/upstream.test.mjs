@@ -62,6 +62,34 @@ test('直连 /v2/chat/completions 并发送 WorkBuddy 请求头', async (t) => {
   assert.equal('stream_options' in seen.body, false);
 });
 
+test('WorkBuddy 上游的指定工具选择编码为字符串', async (t) => {
+  let seen;
+  const { server, baseUrl } = await startServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    seen = JSON.parse(raw);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  });
+  t.after(() => server.close());
+
+  const client = createUpstreamClient({ baseUrl });
+  await client.chat({
+    accountId: 'tools',
+    credentials: credentials(),
+    model: 'deepseek-v4-flash',
+    body: {
+      messages: [{ role: 'user', content: 'use tool' }],
+      tool_choice: {
+        type: 'function',
+        function: { name: 'echo_round' },
+      },
+    },
+  });
+
+  assert.equal(seen.tool_choice, 'echo_round');
+});
+
 test('developer 折叠为 system，并替换已知通道签名', () => {
   const result = sanitizeChatBody({
     messages: [

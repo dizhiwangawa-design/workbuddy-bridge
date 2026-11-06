@@ -11,6 +11,7 @@ process.env.WB_ADMIN_TOKEN = 'admin-fixture';
 const settings = await import('../../src/api-settings.js');
 const paths = await import('../../src/paths.js');
 const { startHttpServer } = await import('../../src/http.js');
+const { clientKeyRequired } = await import('../../src/api-server.js');
 
 async function withServer(fn) {
   const server = await startHttpServer({ port: 0, host: '127.0.0.1' });
@@ -21,14 +22,22 @@ async function withServer(fn) {
   }
 }
 
-test('API 兼容默认关闭', async () => {
+test('API 兼容默认开启 Anthropic，并保留 OpenAI 关闭', async () => {
   const config = settings.getApiSettings();
-  assert.equal(config.enabled, false);
+  assert.equal(config.enabled, true);
   assert.equal(config.openai, false);
-  assert.equal(config.anthropic, false);
-  assert.equal(config.streaming, false);
-  assert.equal(config.tools, false);
-  assert.equal(config.requireApiKey, true);
+  assert.equal(config.anthropic, true);
+  assert.equal(config.anthropicEnabled, true);
+  assert.equal(config.streaming, true);
+  assert.equal(config.tools, true);
+  assert.equal(config.requireApiKey, false);
+  assert.equal(config.remoteRequireKey, true);
+  assert.equal(config.trustProxy, false);
+  assert.equal(config.dsmlMaxBufferBytes, 2097152);
+  assert.equal(config.firstByteTimeoutMs, 60000);
+  assert.equal(config.idleTimeoutMs, 120000);
+  assert.equal(config.finishGraceMs, 2000);
+  assert.equal(config.totalTimeoutMs, 600000);
 
   await withServer(async (baseUrl) => {
     const openai = await fetch(`${baseUrl}/v1/models`);
@@ -38,12 +47,40 @@ test('API 兼容默认关闭', async () => {
     assert.match(openaiBody.error.message, /disabled/i);
 
     const anthropic = await fetch(`${baseUrl}/v1/messages`);
-    assert.equal(anthropic.status, 404);
+    assert.equal(anthropic.status, 405);
     const anthropicBody = await anthropic.json();
     assert.equal(anthropicBody.type, 'error');
     assert.equal(anthropicBody.error.type, 'invalid_request_error');
-    assert.match(anthropicBody.error.message, /disabled/i);
   });
+});
+
+test('回环免 Key；非回环或可信代理强制 Key', () => {
+  const config = {
+    requireApiKey: false,
+    remoteRequireKey: true,
+    trustProxy: false,
+  };
+  assert.equal(clientKeyRequired({ remoteAddress: '127.0.0.1' }, config), false);
+  assert.equal(clientKeyRequired({ remoteAddress: '::1' }, config), false);
+  assert.equal(clientKeyRequired({ remoteAddress: '::ffff:127.0.0.1' }, config), false);
+  assert.equal(clientKeyRequired({ remoteAddress: '192.0.2.10' }, config), true);
+  assert.equal(clientKeyRequired(
+    { remoteAddress: '127.0.0.1' },
+    { ...config, trustProxy: true },
+  ), true);
+  assert.equal(clientKeyRequired(
+    { remoteAddress: '127.0.0.1' },
+    { ...config, requireApiKey: true },
+  ), true);
+});
+
+test('从旧版全局关闭状态启用 Anthropic 时恢复 API 总开关', () => {
+  settings.updateApiSettings({ enabled: false, anthropic: false });
+  const enabled = settings.updateApiSettings({ anthropic: true });
+
+  assert.equal(enabled.enabled, true);
+  assert.equal(enabled.anthropic, true);
+  assert.equal(enabled.anthropicEnabled, true);
 });
 
 test('API Key 只返回一次明文，配置只保存摘要', () => {
@@ -58,7 +95,24 @@ test('API Key 只返回一次明文，配置只保存摘要', () => {
   assert.equal(JSON.stringify(saved).includes(created.key), false);
   assert.equal(raw.includes(created.key), false);
   assert.equal(saved.keys[0].hash.length, 64);
-  assert.equal(JSON.stringify(settings.publicApiSettings()).includes('"hash"'), false);
+  const publicSettings = settings.publicApiSettings();
+  assert.equal(JSON.stringify(publicSettings).includes('"hash"'), false);
+  assert.equal(publicSettings.clientKeyConfigured, true);
+});
+
+test('重置客户端 Key 会撤销全部旧 Key 并只保留一份新摘要', () => {
+  const first = settings.createApiKey('before-reset-1');
+  const second = settings.createApiKey('before-reset-2');
+  assert.equal(settings.verifyApiKey(first.key), true);
+  assert.equal(settings.verifyApiKey(second.key), true);
+
+  const reset = settings.resetApiKey('after-reset');
+  assert.equal(settings.verifyApiKey(first.key), false);
+  assert.equal(settings.verifyApiKey(second.key), false);
+  assert.equal(settings.verifyApiKey(reset.key), true);
+  assert.equal(settings.getApiSettings().keys.length, 1);
+  assert.equal(settings.getApiSettings().keys[0].hash.length, 64);
+  assert.equal(JSON.stringify(reset).includes(settings.getApiSettings().keys[0].hash), false);
 });
 
 test('管理 API 校验令牌并按白名单更新配置', async () => {
@@ -77,8 +131,16 @@ test('管理 API 校验令牌并按白名单更新配置', async () => {
         enabled: true,
         openai: true,
         anthropic: true,
+        anthropicEnabled: true,
         streaming: true,
         tools: true,
+        remoteRequireKey: false,
+        trustProxy: true,
+        dsmlMaxBufferBytes: 1048576,
+        firstByteTimeoutMs: 12000,
+        idleTimeoutMs: 34000,
+        finishGraceMs: 1500,
+        totalTimeoutMs: 45000,
         timeoutMs: 12345,
         keys: [{ id: 'injected' }],
         unknownField: 'ignored',
@@ -88,6 +150,14 @@ test('管理 API 校验令牌并按白名单更新配置', async () => {
     const body = await patched.json();
     assert.equal(body.enabled, true);
     assert.equal(body.openai, true);
+    assert.equal(body.anthropicEnabled, true);
+    assert.equal(body.remoteRequireKey, false);
+    assert.equal(body.trustProxy, true);
+    assert.equal(body.dsmlMaxBufferBytes, 1048576);
+    assert.equal(body.firstByteTimeoutMs, 12000);
+    assert.equal(body.idleTimeoutMs, 34000);
+    assert.equal(body.finishGraceMs, 1500);
+    assert.equal(body.totalTimeoutMs, 45000);
     assert.equal(body.timeoutMs, 12345);
     assert.equal(body.keys.some((item) => item.id === 'injected'), false);
 
@@ -106,11 +176,26 @@ test('管理 API 校验令牌并按白名单更新配置', async () => {
     });
     assert.equal(removed.status, 200);
     assert.equal((await removed.json()).deleted, true);
+
+    const reset = await fetch(`${baseUrl}/api/api-compat/keys/reset`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: 'admin-reset' }),
+    });
+    assert.equal(reset.status, 200);
+    const resetBody = await reset.json();
+    assert.match(resetBody.key, /^sk-wb_/);
+    assert.equal(settings.verifyApiKey(resetBody.key), true);
   });
 });
 
 test('Bearer 与 x-api-key 共用同一套客户端 Key', async () => {
-  settings.updateApiSettings({ enabled: true, openai: true, anthropic: true });
+  settings.updateApiSettings({
+    enabled: true,
+    openai: true,
+    anthropic: true,
+    requireApiKey: true,
+  });
   const created = settings.createApiKey('route-check');
 
   await withServer(async (baseUrl) => {
@@ -146,7 +231,8 @@ test('Bearer 与 x-api-key 共用同一套客户端 Key', async () => {
       },
       body: '{}',
     });
-    assert.equal(anthropicAuthorized.status, 501);
+    assert.equal(anthropicAuthorized.status, 400);
+    assert.equal((await anthropicAuthorized.json()).type, 'error');
   });
 });
 

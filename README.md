@@ -1,8 +1,10 @@
 # workbuddy-bridge
 
-> 把 WorkBuddy（`codebuddy` CLI）接成任意编程 Agent 的子 Agent，**扫码即可录入账号**。
+> 把 WorkBuddy 接成两种标准接口：**MCP 子 Agent** 与 **Anthropic Messages API**。
 >
 > Claude Code / DeepSeek Harness / Codex / Cursor / OpenCode / Windsurf / Gemini CLI / Cline 通用。
+>
+> 扫码登录一次，MCP 任务与 API 请求共享同一套账号池；API 直连 WorkBuddy 上游，不启动 CLI。
 
 ![登录页](assets/login-page.png)
 
@@ -14,33 +16,41 @@ WorkBuddy 能力很强，但它是「一个 App」。你在 Claude Code 里写�
 
 Windsurf、Cursor 这些客户端各有各的 MCP 生态，官方没有提供「反向 MCP」让它们把 WorkBuddy 当子 Agent 调。
 
-本项目的做法很简单：**把官方 CLI 包一层标准 MCP**，让任意支持 MCP 的编程 Agent 通过一个工具调用把活派给 WorkBuddy。在此之上补了三件参考实现没有覆盖、但实际用起来最疼的事：
+本项目提供两条入口：
 
-1. **扫码登录**：不用先开终端手动登录一次，Agent 里直接要一张二维码，手机扫完就能用；
-2. **多账号隔离**：一个账号一个独立配置目录和 HOME，公司号 / 个人号随时切，互不污染；
-3. **号池调度**：多个号自动分配负载，限流或掉登录就换号，带一个能看额度与负载的管理界面。
+1. **MCP**：任意 MCP 客户端通过 `workbuddy_task` 把任务交给 WorkBuddy；这条路径仍用 `codebuddy -p` 执行文件类长任务。
+2. **Anthropic Messages API**：标准 Anthropic SDK / 客户端直接请求 `/v1/messages`，支持真实流式文本、`tool_use` / `tool_result` 和 `count_tokens`；这条路径直接请求 WorkBuddy 上游，不启动 CLI。
+
+两条路径共享扫码凭证、多账号隔离、号池调度、并发限制、用量统计和管理界面：
+
+- **扫码登录**：不用先手工登录一次，Agent 或管理页里直接出二维码；
+- **多账号隔离**：一个账号一个独立配置目录和 HOME，公司号 / 个人号互不污染；
+- **号池调度**：按权重、用量、并发和冷却选号；401 刷新、429 冷却、失败换号；
+- **协议归一化**：把结构化 `tool_calls` 与文本里的 DSML 调用隔离解析，最终只输出一组合法 `tool_use`。
 
 ## 架构
 
 ```
   Claude Code / DeepSeek Harness / Codex / Cursor / OpenCode / Windsurf …
-        │   MCP (stdio 或 HTTP)
-        │   工具：workbuddy_task / workbuddy_login / …
-        ▼
+        │                                           Anthropic SDK / 兼容客户端
+        │ MCP (stdio / HTTP)                                   │ HTTP
+        │ workbuddy_task / workbuddy_login / …                 │ /v1/messages
+        ▼                                                      ▼
   workbuddy-bridge            ← 本项目
-        │   ├── 账号管理：~/.workbuddy-bridge/profiles/<name>（配置 + HOME）
-        │   ├── 扫码登录：PTY 驱动 TUI → 抓授权链接 → 二维码
-        │   ├── 号池调度：选号 → 执行 → 记账 → 失败换号
-        │   ├── 数据看板：小时/天桶 → 区间聚合 → 热力图
-        │   └── 任务执行：spawn + stream-json 解析
-        ▼
-  codebuddy -p --output-format stream-json
-        │
-        ▼
-  WorkBuddy 服务（真正干活，文件写到你指定的 cwd）
+        ├── 账号与凭证：~/.workbuddy-bridge/profiles/<name>
+        ├── 扫码登录：PTY 驱动 TUI → 授权链接 → 二维码
+        ├── 共享号池：鉴权 / 权重 / 并发 / 冷却 / 记账
+        ├── 管理页：账号、用量、API 开关、客户端 Key
+        ├── MCP 执行：codebuddy -p --output-format stream-json
+        └── API 执行：Anthropic 请求转换 → 上游 SSE → 归一化 → Anthropic SSE
+                 │                                      │
+                 ▼                                      ▼
+       codebuddy CLI（仅 MCP / CLI）        WorkBuddy /v2/chat/completions
+                 │                                      │
+                 └───────────────► WorkBuddy 服务 ◄─────┘
 ```
 
-关键点：**不碰私有接口，也不逆向协议**。桥接只驱动官方 CLI，登录走官方 OAuth 流程，凭证由 CLI 自己加密落盘。
+MCP 路径继续使用 CLI，因此登录、文件写入和工具执行语义与 WorkBuddy 本体一致。API 路径使用登录后保存在隔离账号目录中的凭据，直接请求 WorkBuddy 上游；只对已知通道签名做兼容清洗，不复用 reverse-proxy 的 GPL 源码。API 与 MCP 的账号并发、成功率和 token 记账进入同一号池。
 
 ## 快速开始
 
@@ -59,9 +69,12 @@ wb login
 # 4. 注册到你已安装的 Agent
 wb install
 
-# 5. 有多个号？再登一次，然后打开管理界面看负载
+# 5. 有多个号？再登一次
 wb login --account alice
-wb admin
+
+# 6. 启动管理页与 Anthropic API
+wb http --port 7666
+# 浏览器打开 http://127.0.0.1:7666/admin
 ```
 
 `wb install` 会自动探测并写入：
@@ -83,9 +96,96 @@ wb admin
 
 > 让 workbuddy 读一下 ./reports 里的 CSV，出一份中文月度总结
 
+## Anthropic Messages API
+
+启动 `wb http` 后，同一个服务同时提供管理页和 Anthropic 兼容入口：
+
+| 方法与路径 | 说明 |
+|:--|:--|
+| `POST /v1/messages` | 支持流式 / 非流式文本、图片输入、`tool_use` 和 `tool_result` |
+| `POST /v1/messages/count_tokens` | 本地保守估算，响应带 `estimated:true` 与 `estimator:"wb-conservative-v1"` |
+| `GET /admin` | 开关 Anthropic API、生成 / 删除客户端 Key、查看超时与缓冲上限 |
+
+官方 SDK 示例：
+
+```js
+import Anthropic from '@anthropic-ai/sdk';
+
+const client = new Anthropic({
+  // 本机回环连接默认免 Key；远程连接必须在 /admin 生成 Key。
+  apiKey: process.env.WB_API_KEY || 'loopback',
+  baseURL: 'http://127.0.0.1:7666',
+});
+
+const response = await client.messages.create({
+  model: 'deepseek-v4-flash',
+  max_tokens: 256,
+  messages: [{ role: 'user', content: '只回答两个字：收到' }],
+});
+
+console.log(response.content);
+```
+
+工具由客户端执行。服务端只返回 Anthropic `tool_use`；客户端执行工具后，用同一个 ID 回传 `tool_result`，下一轮请求即可继续对话：
+
+```js
+const first = await client.messages.create({
+  model: 'deepseek-v4-flash',
+  max_tokens: 512,
+  tools: [{
+    name: 'read_file',
+    description: '读取一个文本文件',
+    input_schema: {
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: ['path'],
+    },
+  }],
+  messages: [{ role: 'user', content: '读取 ./README.md 并总结' }],
+});
+
+const toolUse = first.content.find((block) => block.type === 'tool_use');
+if (toolUse) {
+  const messages = [
+    { role: 'user', content: '读取 ./README.md 并总结' },
+    { role: 'assistant', content: first.content },
+    {
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: '客户端执行工具后得到的文本结果',
+      }],
+    },
+  ];
+  await client.messages.create({
+    model: 'deepseek-v4-flash',
+    max_tokens: 512,
+    tools: [/* 与上一轮相同 */],
+    messages,
+  });
+}
+```
+
+### API 行为与边界
+
+- **共享登录与号池**：读取现有扫码账号的隔离凭证，使用相同的权重、`maxConcurrency`、401 刷新、429 冷却和记账逻辑；不需要单独登录。
+- **不启动 CLI**：`/v1/messages` 直接访问 WorkBuddy 上游。移除本机 `codebuddy` 命令后，API 仍可工作；MCP / `wb task` 才会依赖 CLI。
+- **鉴权**：回环地址默认免客户端 Key；非回环连接、`requireApiKey=true` 或 `trustProxy=true` 时必须提供 `x-api-key` 或 `Authorization: Bearer`。管理页只保存 Key 的 SHA-256 摘要，明文仅展示一次。
+- **真实流式**：可见文本到达即转发。工具调用延后到响应结束统一裁决，随后按 Anthropic 事件格式追加 `tool_use` blocks。
+- **结构优先**：合法结构化 `tool_calls` 优先；只有结构化调用全部无效时才回退到文本 DSML。两者同时有效会记录安全 warning，只包含模型、请求 ID、账号、数量和参数哈希，不记录原始参数。
+- **DSML 上限**：扫描器默认最多缓冲 2 MiB。超限、畸形或截断时失败关闭，不向正文泄漏 DSML，流式错误后不发送 `message_stop`。
+- **四层超时**：首字节 60 秒、流中空闲 120 秒、`finish_reason` 后宽限 2 秒、总时长 600 秒。流开始后无法安全换号，只会终止当前响应；账号 inflight 始终释放。
+- **SSE 保活**：`message_start` 后每 15 秒发送一次 Anthropic `ping`，防止下游代理因短暂无事件而断开。ping 不代表上游出现了新内容。
+- **乱序工具结果**：user message 中排在 text/image 后的 `tool_result` 会自动移到最前，并保持 result 组与剩余块各自的相对顺序；引用未知 `tool_use_id` 的请求返回 400。
+
+`count_tokens` 是确定性本地估算，不是 Anthropic 官方 tokenizer。中英文混合和长上下文可能有明显误差，**不得用于精确计费或裁剪刚好达到上下文上限的请求**；实际请求仍应处理上游的 `context_length_exceeded`。
+
+当前第一阶段只开放 Anthropic 路由，OpenAI `/v1/chat/completions` 保持关闭。暂不支持 thinking、文档附件、图片形式的 `tool_result` 和流式响应中的工具块原位交错；遇到不支持的 content block 返回 400。
+
 ## 号池：多账号 + 自动分配负载
 
-v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调度的池子。`workbuddy_task` 不指定 `account` 时默认 `auto`，由调度器挑号；某个号挂了会自动换下一个。v0.3 补了完整的用量看板：区间曲线、缓存命中率、年度热力图和最近请求流。
+v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调度的池子。`workbuddy_task` 不指定 `account` 时默认 `auto`，由调度器挑号；某个号挂了会自动换下一个。v0.3 补了完整用量看板；v0.4 加入 Anthropic API、DSML 安全归一化和共享号池的 API 并发控制。
 
 ![数据看板](assets/pool-dashboard.png)
 
@@ -111,13 +211,13 @@ v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调
 
 ### 额度怎么算
 
-WorkBuddy CLI 没有公开的额度查询接口（`stream-json` 只给 token 用量），所以这里刻意不编数字：
+WorkBuddy 没有公开的额度查询接口，桥接只使用 CLI 或 API 实际返回的用量，所以这里刻意不编数字：
 
-- **已用**：真实数据。从 `result.usage` 取 `input_tokens` / `output_tokens` / `cache_read_input_tokens`。
+- **已用**：真实数据。MCP 路径从 CLI `result.usage` 取 `input_tokens` / `output_tokens` / `cache_read_input_tokens`；API 路径从上游 `usage.prompt_tokens` / `completion_tokens` 记账。
   实测 CLI 0.2.x 的 `input_tokens` **已经包含**缓存读取部分，所以总输入就是 `input_tokens`，不再二次相加——之前多算一遍会让用量虚高近一倍
 - **剩余**：需要给账号设一个每日预算（`budgetTokens`）。设了才算得出剩余和百分比，并据此停派；不设就只显示用量，不做拦截
 - **缓存命中率** = `cache_read_input_tokens ÷ input_tokens`
-- **费用**：优先用 CLI 返回的 `total_cost_usd`；没有就按 `WB_PRICE_IN` / `WB_PRICE_OUT` 估算；两者都没配时显示「CLI 未上报计价」，不猜
+- **费用**：优先用 CLI 返回的 `total_cost_usd`；没有就按 `WB_PRICE_IN` / `WB_PRICE_OUT` 估算；两者都没配时显示未上报计价，不猜
 
 明细保留：小时桶 16 天、天桶 400 天、最近请求 160 条。够画一整年热力图，又不会让 `pool.json` 无限膨胀。
 
@@ -133,7 +233,8 @@ export WB_QUOTA_CMD='my-quota --account "$WB_ACCOUNT" --json'
 ### 管理界面
 
 ```bash
-wb admin              # 默认 http://127.0.0.1:7667
+wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
+# 或只开管理服务：wb admin（默认 7667）
 ```
 
 ![扫码登录弹窗](assets/pool-login.png)
@@ -156,6 +257,13 @@ wb admin              # 默认 http://127.0.0.1:7667
 - **状态**：可用 / 冷却中（带倒计时）/ 未登录 / 已停用，左侧色条同步
 - **操作**：扫码登录（弹窗直接出二维码）、测试、设预算、重置冷却、调权重、启停、删除
 
+**API 兼容区**支持：
+
+- Anthropic API 总开关；
+- 当前接口地址与复制；
+- 客户端 Key 生成、全部重置、明文一次性查看 / 复制、掩码列表和删除；
+- 鉴权模式、流空闲超时和 DSML 缓冲上限摘要。
+
 顶部汇总可用账号数与状态分布，策略下拉即时生效。看板数据走 `GET /api/stats?range=today|3d|week|month|30d|all`，前端每 5 秒轮询一次。
 
 ### 命令行
@@ -169,7 +277,7 @@ wb pool reset alice            # 清冷却与失败计数
 wb pool test alice             # 发一条最小请求验证
 ```
 
-> 并发计数是进程内运行态，重启后自动归零。同一个 bridge 进程内的任务会遵守账号的 `maxConcurrency`；如果分别启动多个 stdio MCP 进程，各进程会独立计数，需要全局并发限制时应统一连接同一个 HTTP MCP 服务。
+> 并发计数是进程内运行态，重启后自动归零。同一个 bridge 进程内的 MCP 任务和 API 流会共同遵守账号的 `maxConcurrency`；如果分别启动多个 stdio MCP 进程或多个 HTTP 服务，各进程会独立计数，需要全局并发限制时应统一连接同一个 HTTP 服务。
 
 ## 扫码登录怎么工作的
 
@@ -308,11 +416,11 @@ wb login --site ioa         # 腾讯内网
 
 | 环境变量 | 默认 | 说明 |
 |:--|:--|:--|
-| `WB_COMMAND` | `codebuddy` | CLI 路径，找不到时填绝对路径 |
+| `WB_COMMAND` | `codebuddy` | MCP / CLI 任务的命令路径；Anthropic API 不读取该命令 |
 | `WB_BRIDGE_HOME` | `~/.workbuddy-bridge` | 桥接数据目录 |
 | `WB_DEBUG` | – | `1` 打调试日志 |
 | `WB_QUOTA_CMD` | – | 可选，外部额度探针命令，输出 JSON 供面板显示 |
-| `WB_ADMIN_TOKEN` | – | 可选，给 `/admin`、`/api/pool` 与 `/api/stats` 加访问令牌 |
+| `WB_ADMIN_TOKEN` | – | 可选，给 `/admin`、号池、统计和 API 兼容管理接口加访问令牌 |
 | `WB_PRICE_IN` | – | 输入价（元 / 百万 token），用于估算费用 |
 | `WB_PRICE_OUT` | – | 输出价（元 / 百万 token） |
 | `WB_PRICE_CACHE` | 输入价一折 | 缓存读取价（元 / 百万 token） |
@@ -328,9 +436,26 @@ wb login --site ioa         # 腾讯内网
     "fallbackModel": "deepseek-v4-flash",
     "timeoutMs": 900000,
     "skipPermissions": true
+  },
+  "apiCompat": {
+    "enabled": true,
+    "openai": false,
+    "anthropic": true,
+    "anthropicEnabled": true,
+    "requireApiKey": false,
+    "remoteRequireKey": true,
+    "trustProxy": false,
+    "defaultModel": "deepseek-v4-flash",
+    "dsmlMaxBufferBytes": 2097152,
+    "firstByteTimeoutMs": 60000,
+    "idleTimeoutMs": 120000,
+    "finishGraceMs": 2000,
+    "totalTimeoutMs": 600000
   }
 }
 ```
+
+客户端 Key 摘要存放在 `apiCompat.keys`，配置文件权限为 `0600`。一般通过管理页生成和删除，不需要手改。
 
 号池状态单独一份 `~/.workbuddy-bridge/pool.json`：
 
@@ -354,16 +479,21 @@ wb login --site ioa         # 腾讯内网
 
 ## 安全说明
 
-- **默认自动授权**：任务会带 `--dangerously-skip-permissions`，WorkBuddy 请求的文件/网络操作直接执行。个人可信环境没问题；要留人工确认，把 `skipPermissions` 设成 `false`。
-- **凭证在本地**：桥接不接管 token，只是给 CLI 指定配置目录。凭证由 CLI 自己加密存放。
+- **默认自动授权（仅 MCP / CLI）**：任务会带 `--dangerously-skip-permissions`，WorkBuddy 请求的文件/网络操作直接执行。要留人工确认，把 `skipPermissions` 设成 `false`。
+- **凭证在本地**：扫码凭证保存在 `~/.workbuddy-bridge/profiles/<name>`。Anthropic API 会读取该凭据直连上游，刷新后的 token 以原子写入和 `0600` 权限回写原文件；日志和测试输出不得打印 access token、refresh token 或客户端 Key 明文。
+- **客户端 Key 只存摘要**：管理页生成后只展示一次明文，配置中只保存 SHA-256 摘要。非回环访问默认强制 Key；不要为了图省事关掉远程鉴权。
+- **DSML 失败关闭**：识别到 DSML envelope 后，畸形、截断或超过 2 MiB 会终止响应，不回退为工具调用，也不把原始标记混入正文。
 - **stdio 不污染**：MCP 的 stdout 是协议通道，桥接所有日志走 stderr 和 `~/.workbuddy-bridge/logs/`。
 - **导出包敏感**：`wb export` 的 tgz 等同账号权限，自行保管。
-- **管理界面默认只监听 127.0.0.1**：`wb admin --host 0.0.0.0` 会把「删除账号、改权重」暴露给同网段，务必同时设 `WB_ADMIN_TOKEN`。
+- **管理界面默认只监听 127.0.0.1**：`wb http --host 0.0.0.0` 会把账号、Key 和 API 管理能力暴露到网络；务必同时设置 `WB_ADMIN_TOKEN`，并给远程 API 客户端配置独立 Key。
 
 ## 常见问题
 
 **需要 WorkBuddy 桌面端开着吗？**
-不需要。桥接驱动的是 CLI，和桌面端同一套引擎，独立运行。
+不需要。MCP / CLI 任务驱动本机 `codebuddy`，Anthropic API 直接请求 WorkBuddy 上游，二者都能独立运行。
+
+**没有 `codebuddy` 命令，Anthropic API 还能用吗？**
+能。只要账号目录里已有可用扫码凭证，API 不启动 CLI。MCP、`wb task` 和扫码登录流程仍需要 CLI。
 
 **Agent 里看不到我让它生成的文件？**
 文件写在 `cwd`，不会自动进入 Agent 上下文。让它 `cat` 或 `read` 一下就行。
@@ -381,10 +511,17 @@ npm i -g node-pty
 **任务被客户端掐断？**
 多数 MCP 客户端对单次工具调用有超时上限。把 `timeoutMs` 设小一点先拿中间结果，或改用 `wb http --mcp` 走 HTTP 传输。
 
+**Anthropic SDK 报 401？**
+回环地址默认免 Key；如果配置了 `requireApiKey=true`、从非回环地址访问，或经过可信反向代理，就需要在 `/admin` 生成 Key，并通过 `x-api-key` / `Authorization: Bearer` 发送。
+
+**流式响应为什么只看到文本，工具块最后才出现？**
+首版优先保证安全裁决：结构化工具调用和 DSML 都要等到上游结束才能确定最终结果。可见文本仍实时输出，`tool_use` 在响应末尾统一追加。
+
 ## 开发
 
 ```bash
 npm test
+npm run test:live
 ```
 
 ### 测试约定
@@ -392,19 +529,37 @@ npm test
 **测试一律用 deepseek，不用 hy4。**
 
 - 离线测试（`npm test`）不真正调用模型；假 CLI 的回包和断言里的模型名固定为 `deepseek-v4-flash`，日志里不会出现 hy4
-- 需要真实链路验证时显式指定模型：
+- 需要真实链路验证时使用 `test:live`，默认模型固定为 `deepseek-v4-flash`：
 
 ```bash
-wb task "只回答两个字：收到" --model deepseek-v4-flash
+npm run test:live
+```
+
+它会启动回环 HTTP 服务、使用现有账号池请求真实上游，并额外调用 `count_tokens`；脚本故意选择不存在的 `WB_COMMAND`，以验证 API 路径没有启动 CLI。输出只包含模型、字符数、估算标记和成功状态，不打印 token、客户端 Key、access token 或 refresh token。
+
+也可以让脚本连接已经运行的 bridge：
+
+```bash
+WB_LIVE_BASE_URL=http://127.0.0.1:7666 \
+WB_LIVE_API_KEY='<客户端 Key>' \
+npm run test:live
 ```
 
 hy4 是旗舰模型，单价高、排队久，拿它跑测试既费额度又拖慢反馈。功能联调用 flash 足够；要看复杂推理表现时再手动单独跑，但不要写进测试脚本或 CI。
 
-52 项测试，不联网、不消耗模型额度。登录链路用一个假的 `codebuddy` 脚本把 TUI 完整演一遍，覆盖 HOME 隔离、主界面触发登录、日志链接兜底、折行 URL 提取、二维码落盘和状态机流转；dsh 的写入 / 幂等 / 卸载用隔离 HOME 验证；号池用同一个假 CLI 模拟「未登录 / 429 / 正常」三种账号，验证过滤、加权轮询、冷却退避、失败换号与额度计算；统计层验证桶合并、空档补零、区间窗口、周/月环比、缓存命中率、事件过滤和年度热力图；管理页验证令牌透传；发布元数据与 CLI 版本输出也纳入检查。
+默认 `npm test` 为离线测试，不联网、不消耗模型额度。旧 bridge 的 54 项和 API 相关测试全部保留；新增覆盖 DSML 字符 / UTF-8 字节切分、2 MiB 熔断、结构化与 DSML 仲裁、Anthropic 请求转换、SSE 双重 JSON 转义、官方 SDK 三轮 `tool_use/tool_result`、401 刷新、429 换号、并发上限、客户端断连、干净 EOF、TCP 中断和四层超时。管理页已做桌面端验收，不包含移动端验收。
 
 ```
 src/
   server.js     MCP 工具定义
+  api-server.js Anthropic 路由、鉴权和 API 管理接口
+  api-runtime.js 账号选择、上游流、超时、SSE 和最终仲裁
+  upstream-client.js WorkBuddy 上游请求与 token 刷新
+  auth-store.js 隔离凭证读取与 0600 刷新回写
+  protocols/anthropic.js Anthropic 请求转换与 SSE encoder
+  protocols/normalize.js 协议无关工具归一化出口
+  tool-calls.js DSML 扫描器、结构化 assembler、最终仲裁
+  sse.js 任意分块 UTF-8 SSE parser 与 encoder
   login.js      扫码登录状态机
   ansi.js       TUI 输出解析 / URL 提取
   runner.js     codebuddy 进程封装 + stream-json 解析
@@ -415,13 +570,14 @@ src/
   transfer.js   凭证导出导入
   install.js    各客户端注册（含 dsh 的 YAML patch 与插件版本对齐）
   admin.js      号池管理界面（单文件、零外部依赖）
-  http.js       登录页 + 号池 API + Streamable HTTP
+  http.js       登录页 + 管理页 + 号池 API + Anthropic API + Streamable HTTP
 ```
 
 ## 参考与致谢
 
 - [LinHaiJ/workbuddy-mcp](https://github.com/LinHaiJ/workbuddy-mcp)（MIT）——「单工具包装 CLI + 一键注册多客户端」的思路来自这里，本项目的 `run_workbuddy_task` 语义与 `WB_*` 命名与之保持一致，方便迁移。
 - [jav1es/workbuddy-bridge](https://github.com/jav1es/workbuddy-bridge) —— 在其之上做的 MCP 桥接封装，验证了这条链路可行。
+- reverse-proxy 项目仅作为 Anthropic / OpenAI 行为与回归基线；本项目的归一化管线、SSE encoder 和测试为独立实现，未复制其 GPL 源码。
 - 官方 CLI 文档：[codebuddy.cn/docs/cli](https://www.codebuddy.cn/docs/cli/quickstart)
 - 号池调度参考：
   - [yasyf/cc-pool](https://github.com/yasyf/cc-pool) —— 「按余量而非请求数分配、会话开始前就选好号」的思路

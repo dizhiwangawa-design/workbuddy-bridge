@@ -1,4 +1,4 @@
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -219,6 +219,40 @@ export function adminPage({ home = '', token = '' } = {}) {
   .err{color:var(--bad);font-size:10.5px;margin-top:8px;word-break:break-word;line-height:1.4}
   .cd{color:var(--warn);font-size:10.5px;margin-top:8px;font-variant-numeric:tabular-nums}
 
+  /* ------------------------------------------------------------ API 兼容 */
+  .api-section{margin:12px 0;padding-bottom:14px;overflow:hidden}
+  .api-grid{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(0,.92fr);gap:12px;padding:0 14px}
+  .api-card{border:1px solid var(--line);border-radius:12px;padding:13px;background:var(--soft);min-width:0}
+  .api-card-head{display:flex;align-items:center;gap:9px}
+  .api-icon{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;flex:none;
+            background:var(--card);border:1px solid var(--line);color:var(--brand);font-size:15px}
+  .api-copy{min-width:0;flex:1}
+  .api-name{font-size:12.5px;font-weight:650}
+  .api-desc{font-size:10.5px;color:var(--muted);margin-top:1px}
+  .api-state{font-size:10.5px;font-weight:650;color:var(--ok)}
+  .api-state.off{color:var(--muted)}
+  .api-endpoint{display:flex;align-items:center;gap:7px;margin-top:12px;padding:8px 9px;border-radius:8px;
+                background:var(--card);border:1px solid var(--line);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+                font-size:10.5px;min-width:0}
+  .api-endpoint code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .api-meta{display:flex;gap:14px;flex-wrap:wrap;margin-top:9px;font-size:10.5px;color:var(--sub)}
+  .api-meta b{color:var(--fg);font-weight:600}
+  .key-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px dashed var(--line)}
+  .key-row:last-child{border-bottom:0}
+  .key-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 13%,transparent)}
+  .key-main{min-width:0;flex:1}
+  .key-name{font-size:11.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .key-time{font-size:9.5px;color:var(--muted);margin-top:1px}
+  .key-empty{padding:12px 2px;font-size:10.5px;color:var(--muted);line-height:1.6}
+  .api-actions{display:flex;align-items:center;gap:7px;margin-top:8px}
+  .api-actions .grow{flex:1}
+  .key-secret{display:flex;gap:7px;margin-top:10px}
+  .key-secret input{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px}
+  .key-secret button{white-space:nowrap;border:1px solid var(--line);background:var(--card);border-radius:8px;
+                     padding:0 10px;cursor:pointer;font-size:11px}
+  .key-warning{margin-top:9px!important;padding:8px 9px;border-radius:8px;color:var(--warn)!important;
+               background:color-mix(in srgb,var(--warn) 10%,transparent);font-size:10.5px!important}
+
   /* ------------------------------------------------------------ 热力图 */
   .heat-panel{margin-top:12px;padding-bottom:12px}
   .heat-inner{display:flex;gap:22px;padding:2px 16px 4px;align-items:flex-start;flex-wrap:wrap}
@@ -291,6 +325,7 @@ export function adminPage({ home = '', token = '' } = {}) {
     .heat-inner{gap:14px}
     .heat-stats{grid-template-columns:repeat(2,1fr);gap:10px 24px}
     .feed-row .mdl{max-width:36%}
+    .api-grid{grid-template-columns:minmax(0,1fr);padding:0 11px}
   }
 </style></head>
 <body>
@@ -373,6 +408,46 @@ export function adminPage({ home = '', token = '' } = {}) {
     <div id="empty"></div>
   </section>
 
+  <section class="panel api-section" id="api-compat">
+    <div class="panel-head">
+      <div>
+        <div class="panel-title">API 兼容</div>
+        <div class="panel-sub">直接使用 WorkBuddy 上游与号池，不启动 CLI</div>
+      </div>
+      <div class="panel-link">Anthropic Messages API</div>
+    </div>
+    <div class="api-grid">
+      <div class="api-card">
+        <div class="api-card-head">
+          <div class="api-icon">A</div>
+          <div class="api-copy">
+            <div class="api-name">Anthropic 协议</div>
+            <div class="api-desc">支持流式文本、tool_use 与 count_tokens</div>
+          </div>
+          <span class="api-state" id="api-state">关闭</span>
+          <button class="switch" id="api-switch" role="switch" aria-checked="false" data-act="api-toggle" title="启用/停用 Anthropic API"></button>
+        </div>
+        <div class="api-endpoint">
+          <code id="api-endpoint"></code>
+          <button class="mini" data-act="api-copy-endpoint" title="复制接口地址">复制</button>
+        </div>
+        <div class="api-meta" id="api-meta"></div>
+      </div>
+      <div class="api-card">
+        <div class="api-card-head">
+          <div class="api-icon">#</div>
+          <div class="api-copy">
+            <div class="api-name">客户端密钥</div>
+            <div class="api-desc">仅保存 SHA-256 摘要，明文只显示一次</div>
+          </div>
+          <button class="mini danger" data-act="api-key-reset">重置全部</button>
+          <button class="ghost" data-act="api-key-create">生成新 Key</button>
+        </div>
+        <div id="api-keys"></div>
+      </div>
+    </div>
+  </section>
+
   <section class="panel heat-panel">
     <div class="panel-head">
       <div>
@@ -418,7 +493,7 @@ export function adminPage({ home = '', token = '' } = {}) {
 <script>
 var TOKEN=${JSON.stringify(token || '')};
 var $=function(id){return document.getElementById(id)};
-var state={pool:null,stats:null,range:'today',metric:'tokens',hover:false};
+var state={pool:null,stats:null,api:null,range:'today',metric:'tokens',hover:false};
 var timer=null,loginPoll=null,lastEventSeq=0,firstPaint=true;
 
 function api(path,opts){
@@ -481,6 +556,11 @@ function ago(ts){
 function initials(name){
   var s=String(name||'?').trim();
   return (s[0]||'?').toUpperCase();
+}
+function h(s){
+  return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
 }
 function deltaHtml(v){
   if(v===null||v===undefined||!isFinite(v)) return '<span class="kpi-d flat">环比 —</span>';
@@ -794,6 +874,36 @@ function renderPool(){
   $('grid').innerHTML=p.accounts.map(card).join('');
 }
 
+/* ------------------------------------------------------------ API 兼容 */
+function renderApi(){
+  var s=state.api;
+  if(!s) return;
+  var enabled=!!(s.enabled&&s.anthropicEnabled);
+  $('api-state').textContent=enabled?'已启用':'已关闭';
+  $('api-state').className='api-state'+(enabled?'':' off');
+  $('api-switch').setAttribute('aria-checked',enabled?'true':'false');
+  $('api-endpoint').textContent=location.origin+'/v1/messages';
+  var authMode=s.requireApiKey?'所有连接强制 Key':
+    !s.remoteRequireKey?'不强制 Key':
+    s.trustProxy?'可信代理强制 Key':'回环免 Key · 远程强制 Key';
+  $('api-meta').innerHTML=
+    '<span>鉴权 <b>'+authMode+'</b></span>'+
+    '<span>流超时 <b>'+Math.round(s.idleTimeoutMs/1000)+'s</b></span>'+
+    '<span>DSML 上限 <b>'+num(s.dsmlMaxBufferBytes)+' B</b></span>';
+  var keys=Array.isArray(s.keys)?s.keys:[];
+  if(!keys.length){
+    $('api-keys').innerHTML='<div class="key-empty">还没有客户端 Key。回环地址可直接调试；远程调用请先生成 Key。</div>';
+    return;
+  }
+  $('api-keys').innerHTML=keys.map(function(k){
+    var when=k.createdAt?new Date(k.createdAt).toLocaleString('zh-CN'):'';
+    return '<div class="key-row"><span class="key-dot"></span><div class="key-main">'+
+      '<div class="key-name">'+h(k.name||'default')+'</div>'+
+      '<div class="key-time">sk-wb_•••••••• · '+when+'</div></div>'+
+      '<button class="mini danger" data-act="api-key-delete" data-id="'+k.id+'">删除</button></div>';
+  }).join('');
+}
+
 /* ------------------------------------------------------------ 热力图 */
 function renderHeat(){
   var h=state.stats.heatmap;
@@ -837,12 +947,13 @@ function renderHeat(){
 
 /* ------------------------------------------------------------ 总渲染 */
 function render(){
-  if(!state.stats||!state.pool) return;
+  if(!state.stats||!state.pool||!state.api) return;
   renderHead();
   renderKpis();
   renderChart();
   renderFeed();
   renderPool();
+  renderApi();
   renderHeat();
   firstPaint=false;
 }
@@ -851,10 +962,12 @@ function load(){
   var range=state.range;
   return Promise.all([
     api('/api/pool'),
-    api('/api/stats?range='+encodeURIComponent(range))
+    api('/api/stats?range='+encodeURIComponent(range)),
+    api('/api/api-compat')
   ]).then(function(res){
     state.pool=res[0];
     state.stats=res[1];
+    state.api=res[2];
     render();
   }).catch(function(e){
     toast('加载失败：'+e.message,true);
@@ -885,6 +998,37 @@ document.addEventListener('click',function(ev){
   if(!el) return;
   var a=el.getAttribute('data-act'), name=el.getAttribute('data-name');
   if(a==='add') return openAdd();
+  if(a==='api-toggle'){
+    var apiOn=el.getAttribute('aria-checked')==='true';
+    return act(function(){
+      return api('/api/api-compat',{method:'PATCH',body:JSON.stringify({anthropic:!apiOn})})
+        .then(function(){toast(!apiOn?'Anthropic API 已启用':'Anthropic API 已关闭')});
+    });
+  }
+  if(a==='api-key-create'){
+    el.disabled=true;
+    return api('/api/api-compat/keys',{method:'POST',body:JSON.stringify({name:'dashboard'})})
+      .then(function(j){ return load().then(function(){ openApiKey(j.key) }) })
+      .catch(function(e){ toast(e.message,true) })
+      .then(function(){ el.disabled=false });
+  }
+  if(a==='api-key-reset'){
+    if(!confirm('重置全部客户端 Key？现有客户端会立即无法访问 API。')) return;
+    el.disabled=true;
+    return api('/api/api-compat/keys/reset',{method:'POST',body:JSON.stringify({name:'dashboard-reset'})})
+      .then(function(j){ return load().then(function(){ openApiKey(j.key) }) })
+      .catch(function(e){ toast(e.message,true) })
+      .then(function(){ el.disabled=false });
+  }
+  if(a==='api-key-delete'){
+    var keyId=el.getAttribute('data-id');
+    if(!confirm('删除这个客户端 Key？使用它的客户端会立即无法访问 API。')) return;
+    return act(function(){
+      return api('/api/api-compat/keys/'+encodeURIComponent(keyId),{method:'DELETE'})
+        .then(function(){toast('客户端 Key 已删除')});
+    });
+  }
+  if(a==='api-copy-endpoint') return copyText(location.origin+'/v1/messages','接口地址已复制');
   if(a==='toggle'){
     var cur=el.getAttribute('aria-checked')==='true';
     return act(function(){return api('/api/pool/'+encodeURIComponent(name),{method:'PATCH',body:JSON.stringify({enabled:!cur})})});
@@ -953,6 +1097,37 @@ function closeModal(){
   $('mask').className='mask';
   $('modal').innerHTML='';
   clearInterval(loginPoll);
+}
+
+function copyText(text,okMessage){
+  var done=function(){toast(okMessage||'已复制')};
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    return navigator.clipboard.writeText(text).then(done).catch(function(){toast('复制失败，请手动选择',true)});
+  }
+  var input=document.createElement('textarea');
+  input.value=text; input.style.position='fixed'; input.style.opacity='0';
+  document.body.appendChild(input); input.select();
+  var ok=document.execCommand('copy');
+  input.remove();
+  ok?done():toast('复制失败，请手动选择',true);
+}
+
+function openApiKey(key){
+  $('mask').className='mask on';
+  $('modal').innerHTML='<h2>客户端 Key 已生成</h2>'+
+    '<p>用于 Anthropic SDK 的 <code>apiKey</code> 或 <code>Authorization: Bearer</code>。关闭后将无法再次查看明文。</p>'+
+    '<div class="key-secret"><input id="new-api-key" type="password" readonly value="'+String(key).replace(/"/g,'&quot;')+'"/>'+
+    '<button id="toggle-api-key">显示</button><button id="copy-api-key">复制</button></div>'+
+    '<p class="key-warning">请像密码一样保管。服务端只保留摘要，无法帮你找回这个 Key。</p>'+
+    '<div class="row"><button class="primary" data-x="close">我已保存</button></div>';
+  var input=$('new-api-key');
+  $('toggle-api-key').onclick=function(){
+    input.type=input.type==='password'?'text':'password';
+    this.textContent=input.type==='password'?'显示':'隐藏';
+  };
+  $('copy-api-key').onclick=function(){ copyText(input.value,'客户端 Key 已复制') };
+  $('modal').querySelector('[data-x=close]').onclick=closeModal;
+  input.focus(); input.select();
 }
 $('mask').addEventListener('click',function(e){ if(e.target===$('mask')) closeModal() });
 

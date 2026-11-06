@@ -10,11 +10,22 @@ const BOOLEAN_FIELDS = [
   'enabled',
   'openai',
   'anthropic',
+  'anthropicEnabled',
   'streaming',
   'tools',
   'channelSanitize',
   'requireApiKey',
+  'remoteRequireKey',
+  'trustProxy',
 ];
+
+const POSITIVE_INTEGER_FIELDS = {
+  dsmlMaxBufferBytes: 64 * 1024 * 1024,
+  firstByteTimeoutMs: 24 * 60 * 60 * 1000,
+  idleTimeoutMs: 24 * 60 * 60 * 1000,
+  finishGraceMs: 60 * 1000,
+  totalTimeoutMs: 24 * 60 * 60 * 1000,
+};
 
 function publicKey(record) {
   return {
@@ -26,8 +37,13 @@ function publicKey(record) {
 
 export function getApiSettings() {
   const config = loadConfig().apiCompat;
+  const anthropicEnabled = Object.hasOwn(config, 'anthropicEnabled')
+    ? Boolean(config.anthropicEnabled)
+    : Boolean(config.anthropic);
   return {
     ...config,
+    anthropic: anthropicEnabled,
+    anthropicEnabled,
     keys: Array.isArray(config.keys) ? config.keys : [],
   };
 }
@@ -40,6 +56,15 @@ export function updateApiSettings(patch = {}) {
     if (Object.hasOwn(patch, field)) {
       if (typeof patch[field] !== 'boolean') throw new Error(`${field} must be boolean`);
       next[field] = patch[field];
+      if (field === 'anthropic') next.anthropicEnabled = patch[field];
+      if (field === 'anthropicEnabled') next.anthropic = patch[field];
+      if (
+        (field === 'anthropic' || field === 'anthropicEnabled')
+        && patch[field]
+        && !Object.hasOwn(patch, 'enabled')
+      ) {
+        next.enabled = true;
+      }
     }
   }
 
@@ -71,6 +96,15 @@ export function updateApiSettings(patch = {}) {
     next.timeoutMs = Math.round(timeoutMs);
   }
 
+  for (const [field, maximum] of Object.entries(POSITIVE_INTEGER_FIELDS)) {
+    if (!Object.hasOwn(patch, field)) continue;
+    const value = Number(patch[field]);
+    if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+      throw new Error(`${field} must be an integer between 1 and ${maximum}`);
+    }
+    next[field] = value;
+  }
+
   config.apiCompat = next;
   saveConfig(config);
   return getApiSettings();
@@ -80,12 +114,26 @@ export function publicApiSettings() {
   const config = getApiSettings();
   return {
     ...config,
+    clientKeyConfigured: config.keys.length > 0,
     keys: config.keys.map(publicKey),
   };
 }
 
 export function createApiKey(name) {
   const config = loadConfig();
+  const created = makeApiKey(name);
+  config.apiCompat = {
+    ...getApiSettings(),
+    keys: [...getApiSettings().keys, created.record],
+  };
+  saveConfig(config);
+  return {
+    key: created.key,
+    record: publicKey(created.record),
+  };
+}
+
+function makeApiKey(name) {
   const key = `sk-wb_${randomBytes(24).toString('base64url')}`;
   const record = {
     id: randomUUID(),
@@ -93,12 +141,21 @@ export function createApiKey(name) {
     hash: createHash('sha256').update(key).digest('hex'),
     createdAt: new Date().toISOString(),
   };
+  return { key, record };
+}
+
+export function resetApiKey(name) {
+  const config = loadConfig();
+  const created = makeApiKey(name || 'dashboard');
   config.apiCompat = {
     ...getApiSettings(),
-    keys: [...getApiSettings().keys, record],
+    keys: [created.record],
   };
   saveConfig(config);
-  return { key, record: publicKey(record) };
+  return {
+    key: created.key,
+    record: publicKey(created.record),
+  };
 }
 
 export function deleteApiKey(id) {

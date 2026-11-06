@@ -1,7 +1,7 @@
 {
   "name": "workbuddy-bridge",
-  "version": "0.3.1",
-  "description": "把 WorkBuddy（codebuddy CLI）桥接成任意编程 Agent 可调用的 MCP 子 Agent，支持扫码登录与多账号",
+  "version": "0.4.0",
+  "description": "WorkBuddy 多账号桥接：MCP 子 Agent、Anthropic Messages API、共享号池与扫码登录",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -23,7 +23,8 @@
     "install-agents": "node bin/wb.js install",
     "doctor": "node bin/wb.js doctor",
     "test": "node test/run.mjs && node test/api/run.mjs",
-    "test:api": "node test/api/run.mjs"
+    "test:api": "node test/api/run.mjs",
+    "test:live": "node test/live/anthropic-live.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
@@ -32,10 +33,15 @@
   "keywords": [
     "mcp",
     "workbuddy",
+    "anthropic",
+    "api",
     "codebuddy",
     "claude-code",
     "cursor",
     "codex",
     "opencode"
-  ]
+  ],
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^1.6.0"
+  }
 }

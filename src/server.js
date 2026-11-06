@@ -17,7 +17,7 @@ import { loadConfig, BRIDGE_HOME } from './paths.js';
 import { terminalQr, pngDataUrl } from './qr.js';
 import { info, error } from './log.js';
 
-const VERSION = '0.3.1';
+const VERSION = '0.4.0';
 
 function text(s) {
   return { type: 'text', text: String(s) };
