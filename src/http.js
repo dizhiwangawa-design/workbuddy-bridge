@@ -386,7 +386,17 @@ async function closeServer({ server, sockets, webSockets, graceMs }) {
   await waitForConnections(sockets, (items) => items.length === 0, graceMs);
   for (const socket of sockets) socket.destroy();
   for (const ws of webSockets) ws.terminate();
-  await waitForConnections(sockets, (items) => items.length === 0, Math.min(500, graceMs));
+  const cleared = await waitForConnections(
+    sockets,
+    (items) => items.length === 0,
+    Math.min(500, graceMs),
+  );
+  if (!cleared) {
+    throw Object.assign(
+      new Error(`server connections did not close (${sockets.size} remaining)`),
+      { code: 'SERVER_CLOSE_TIMEOUT' },
+    );
+  }
   if (closeError) throw closeError;
 }
 
