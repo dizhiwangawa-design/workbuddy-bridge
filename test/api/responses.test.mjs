@@ -576,6 +576,53 @@ test('Responses 持久化关闭时无状态 HTTP 可用，续接明确拒绝', a
   assert.equal((await continued.json()).error.code, 'persistence_disabled');
 });
 
+test('Responses store:false 不保存正文且取消片段不重复拼接', async (t) => {
+  const store = createResponsesStore({
+    directory: path.join(tmp, `responses-nostore-${Date.now()}-${Math.random()}`),
+  });
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'partial' } }],
+    }));
+    res.flushHeaders();
+  }, { store, keepaliveMs: 500 });
+  const controller = new AbortController();
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: false,
+      input: 'no-store',
+    }),
+    signal: controller.signal,
+  });
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let raw = '';
+  while (!raw.includes('partial')) {
+    const read = await reader.read();
+    if (read.done) break;
+    raw += read.value;
+  }
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.deepEqual(store.memoryView(), []);
+});
+
+test('mergePartialOutput 对已完成 message 幂等', async () => {
+  const { mergePartialOutput } = await import('../../src/responses-store.js');
+  const base = [{
+    id: 'msg_1',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'output_text', text: 'secret partial', annotations: [] }],
+  }];
+  const merged = mergePartialOutput(base, { content: 'secret partial' });
+  assert.equal(merged[0].content[0].text, 'secret partial');
+});
+
 test('Responses 支持 URL 图片、parallel_tool_calls=false 和 allowed_tools', async (t) => {
   let received;
   const { baseUrl } = await fixture(t, async (req, res) => {

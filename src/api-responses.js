@@ -570,7 +570,9 @@ export function createResponsesRuntime(options = {}) {
     }
 
     async function persistFinal(finalBody, result, canceled = false) {
-      if (!config.responsesPersistence) return { ok: false, skipped: true };
+      if (!config.responsesPersistence || body.store === false) {
+        return { ok: false, skipped: true };
+      }
       const saveOptions = {
         timeoutMs: persistTimeoutMs,
         marker: body.input,

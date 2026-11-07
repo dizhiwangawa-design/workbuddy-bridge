@@ -110,14 +110,19 @@ export function mergePartialOutput(base, partial) {
   const text = typeof partial?.content === 'string' ? partial.content : '';
   const calls = Array.isArray(partial?.toolCalls) ? partial.toolCalls : [];
   const output = [];
+  let matchedMessage = false;
   for (const item of Array.isArray(base) ? base : []) {
     if (item?.type === 'message') {
       const original = item.content?.map((part) => part.text || '').join('') || '';
+      const mergedText = !matchedMessage && text && !original.includes(text)
+        ? `${original}${text}`
+        : original;
+      matchedMessage = true;
       output.push({
         ...item,
         content: [{
           type: 'output_text',
-          text: `${original}${text}`,
+          text: mergedText,
           annotations: [],
         }],
       });
