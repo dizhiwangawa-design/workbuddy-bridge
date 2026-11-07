@@ -62,6 +62,35 @@ test('写入竞态中的 WRITE_AFTER_END 被吸收且不泄漏原始异常', () 
   assert.equal(writer.writeData('{}'), false);
 });
 
+test('异步 EPIPE 与 ECONNRESET 被 writer 吸收且不产生未处理异常', async () => {
+  const unhandled = [];
+  const capture = (error) => unhandled.push(error);
+  process.on('uncaughtException', capture);
+  process.on('unhandledRejection', capture);
+  try {
+    for (const code of ['EPIPE', 'ECONNRESET']) {
+      const res = fakeResponse();
+      res.write = function write() {
+        const error = Object.assign(new Error(code), { code });
+        setImmediate(() => this.emit('error', error));
+        return true;
+      };
+      const writer = createHttpEventWriter(res);
+      assert.equal(writer.writeData('{}'), true);
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(writer.failed.code, code);
+      assert.equal(writer.stats().failedCode, code);
+      assert.equal(writer.writeData('{}'), false);
+      res.emit('close');
+    }
+  } finally {
+    process.off('uncaughtException', capture);
+    process.off('unhandledRejection', capture);
+  }
+  assert.deepEqual(unhandled, []);
+});
+
 test('流写入超过硬阈值触发背压并且不无限缓存在 writer 中', () => {
   let overflow = null;
   const res = fakeResponse();

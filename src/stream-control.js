@@ -49,6 +49,18 @@ export function createHttpEventWriter(res, {
   let overflowReported = false;
   let timer = null;
 
+  function onStreamError(error) {
+    if (!isWriteError(error)) warn(`${protocol} stream write failed: ${error.message}`);
+    failed ||= error;
+    ended = true;
+    stopTimer();
+  }
+
+  res.on?.('error', onStreamError);
+  res.once?.('close', () => {
+    res.off?.('error', onStreamError);
+  });
+
   function observe(force = false) {
     const queued = Number(res.writableLength || 0);
     peakWritableLength = Math.max(peakWritableLength, queued);
@@ -108,6 +120,7 @@ export function createHttpEventWriter(res, {
           slowSince = 0;
         }
       });
+      if (failed) return false;
       if (accepted === false) {
         normalSince = 0;
         backpressureSeen = true;
@@ -208,7 +221,7 @@ export function createHttpEventWriter(res, {
     ended = true;
     try {
       res.end();
-      return true;
+      return !failed;
     } catch (error) {
       failed ||= error;
       return false;
