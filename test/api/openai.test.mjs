@@ -918,3 +918,154 @@ test('OpenAI chatWithCancellation 接收显式 Signal 并保留合法收尾', as
   assert.equal(store.memoryView()[0].body.output[0].content[0].text, 'visible partial');
   assert.equal((await store.get(store.memoryView()[0].id))?.status, 'incomplete');
 });
+
+test('OpenAI 取消顺序为停止上游、释放租约、持久化、合法收尾', async () => {
+  const events = [];
+  let releaseLease;
+  const leaseReleased = new Promise((resolve) => {
+    releaseLease = resolve;
+  });
+  let markSave;
+  const saveStarted = new Promise((resolve) => {
+    markSave = resolve;
+  });
+  const store = {
+    async save() {
+      events.push(`save:${inflight('openai-a')}`);
+      markSave();
+      await leaseReleased;
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const upstreamClient = {
+    chat: async ({ signal }) => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"id":"chat-order","choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+          ));
+          signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+        },
+      }),
+    }),
+  };
+  const runtime = createOpenAIRuntime({ upstreamClient, cancelPersistence: store });
+  createAccount('openai-a');
+  const controller = new AbortController();
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const run = runtime.chatWithCancellation({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'cancel ordering' }],
+    },
+    config: settings.getApiSettings(),
+    interruptSignal: controller.signal,
+  });
+  const abort = setInterval(() => {
+    if (writes.join('').includes('visible partial')) {
+      clearInterval(abort);
+      controller.abort('ordering test');
+    }
+  }, 5);
+  await saveStarted;
+  assert.equal(inflight('openai-a'), 0);
+  assert.equal(writes.join('').includes('finish_reason":"stop'), false);
+  releaseLease();
+  const result = await run;
+  assert.equal(result.canceled, true);
+  const raw = writes.join('');
+  assert.equal((raw.match(/data: \[DONE\]/g) || []).length, 1);
+  assert.match(raw, /"finish_reason":"stop"/);
+});
+
+test('OpenAI 取消片段持久化失败时不发送成功收尾', async () => {
+  const store = {
+    async save() {
+      return {
+        ok: false,
+        error: Object.assign(new Error('injected database failure'), { code: 'DB_FAILED' }),
+        deadLetterWritten: true,
+      };
+    },
+  };
+  const upstreamClient = {
+    chat: async ({ signal }) => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"id":"chat-failed-cancel","choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+          ));
+          signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+        },
+      }),
+    }),
+  };
+  const runtime = createOpenAIRuntime({ upstreamClient, cancelPersistence: store });
+  createAccount('openai-a');
+  const controller = new AbortController();
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const run = runtime.chatWithCancellation({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'failed cancel persistence' }],
+    },
+    config: settings.getApiSettings(),
+    interruptSignal: controller.signal,
+  });
+  const abort = setInterval(() => {
+    if (writes.join('').includes('visible partial')) {
+      clearInterval(abort);
+      controller.abort('ordering test');
+    }
+  }, 5);
+  const result = await run;
+  assert.equal(result.canceled, true);
+  assert.equal(result.persistence.ok, false);
+  const raw = writes.join('');
+  assert.doesNotMatch(raw, /"finish_reason":"stop"/);
+  assert.doesNotMatch(raw, /data: \[DONE\]/);
+});

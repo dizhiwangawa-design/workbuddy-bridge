@@ -1469,8 +1469,9 @@ export function createOpenAIRuntime({
           partial: { content: visibleText },
         });
         cancelPersisted = true;
+        cancelPersistenceResult = persisted;
         if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
-        if (body.stream) {
+        if (body.stream && persisted.ok) {
           ensureStreamStarted();
           emit(encoder.finalize({ finishReason, canceled: true }));
           if (cancelKind === 'backpressure') {
@@ -1479,6 +1480,12 @@ export function createOpenAIRuntime({
           if (!responseEnded && cancelKind !== 'backpressure') {
             responseEnded = true;
             writer.end();
+          }
+        } else if (body.stream) {
+          writer?.fail(persisted.error);
+          if (!responseEnded) {
+            responseEnded = true;
+            writer?.end();
           }
         }
         leaseResult = {
@@ -1493,6 +1500,7 @@ export function createOpenAIRuntime({
           started: true,
           canceled: true,
           kind: cancelReason || cancelKind,
+          persistence: persisted,
         };
       }
       if (timeoutKind) {
