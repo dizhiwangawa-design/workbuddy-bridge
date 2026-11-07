@@ -3,7 +3,7 @@
  * 零依赖测试：不联网、不真调用模型。
  * 用一个假的 codebuddy 脚本把登录 TUI 完整演一遍。
  *
- * 约定：测试数据里的模型名统一用 deepseek-v4.1-flash，不要写 hy4。
+ * 约定：测试数据里的模型名统一用 deepseek-v4.1-flash。
  * 真实验证也走 deepseek，旗舰模型只用于手动抽查。
  */
 import { spawn } from 'node:child_process';
@@ -497,7 +497,7 @@ await test('旧账号级冷却记录迁移为全模型冷却', () => {
   const loaded = poolMod.loadPool().accounts.limitedcli;
   assert(loaded.cooldowns['*'].until > Date.now(), '旧冷却应迁移到所有模型');
   assertEqual(
-    poolMod.pickAccount({ model: 'deepseek-v4-flash' }).name,
+    poolMod.pickAccount({ model: 'deepseek-v4.1-flash' }).name,
     null,
     '迁移后的旧冷却仍应阻断请求',
   );

@@ -481,7 +481,7 @@ export function mapModelCatalogue(payload, {
     });
   }
 
-  const ids = ['auto', defaultModel || 'deepseek-v4.1-flash', 'hy3'];
+  const ids = ['auto', defaultModel || 'deepseek-v4.1-flash'];
   return [...new Set(ids)].map((id) => ({
     id,
     object: 'model',

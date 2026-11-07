@@ -522,7 +522,7 @@ pnpm add @deepseek-ai/dsh-mcp-client@$(dsh --version)
 {
   "prompt": "整理 ./data 下的销售数据，输出 xlsx 和一段结论",  // 必填
   "cwd": "/path/to/project",   // WorkBuddy 读写文件的位置
-  "model": "auto",             // auto / hy3 / deepseek-v4-pro …
+  "model": "deepseek-v4.1-flash", // 默认模型
   "fallbackModel": "deepseek-v4.1-flash",  // 主模型限流时自动回退
   "timeoutMs": 900000,
   "account": "auto"   // 默认 auto = 号池自动挑；填具体名字则强制用该号，不做故障切换
@@ -683,9 +683,9 @@ npm run test:live
 
 ### 测试约定
 
-**测试一律用 deepseek，不用 hy4。**
+**测试统一使用 `deepseek-v4.1-flash`。**
 
-- 离线测试（`npm test`）不真正调用模型；假 CLI 的回包和断言里的模型名固定为 `deepseek-v4.1-flash`，日志里不会出现 hy4
+- 离线测试（`npm test`）不真正调用模型；假 CLI 的回包和断言里的模型名固定为 `deepseek-v4.1-flash`，不会引入未使用的旗舰模型名
 - 需要真实链路验证时使用 `test:live`，默认模型固定为 `deepseek-v4.1-flash`：
 
 ```bash
@@ -712,7 +712,8 @@ WB_LIVE_API_KEY='<客户端 Key>' \
 npm run test:live
 ```
 
-hy4 是旗舰模型，单价高、排队久，拿它跑测试既费额度又拖慢反馈。功能联调用 flash 足够；要看复杂推理表现时再手动单独跑，但不要写进测试脚本或 CI。
+复杂推理模型可能单价高、排队久，不建议拿它跑测试；功能联调用
+`deepseek-v4.1-flash` 足够，复杂推理只在人工验收时单独执行。
 
 默认 `npm test` 为离线测试，不联网、不消耗模型额度。覆盖 DSML 字符 / UTF-8
 字节切分、2 MiB 熔断、结构化与 DSML 仲裁、Anthropic 请求转换、OpenAI Chat
@@ -791,8 +792,8 @@ Responses 兼容层只接受已声明的 function/custom/namespace/shell/apply_p
 `test:live:account` 固定只启用目标账号，依次验证 Chat 非流式、流式、
 `tool_calls` / `tool` 续轮、真实客户端中断、取消片段持久化、租约 5 秒内归零；
 成功时输出脱敏 JSON。上游 429 时以退出码 `2` 返回 `blocked:true`，不会打印
-上游正文或凭据。需要区分模型级配额与账号故障时，可显式设置
-`WB_LIVE_MODEL=deepseek-v4-flash` 复测同一账号；脚本不会自动切换模型。
+上游正文或凭据。模型默认固定为 `deepseek-v4.1-flash`；如需复测其他已确认
+模型，可显式设置 `WB_LIVE_MODEL`，脚本不会自动切换模型。
 
 ```
 src/

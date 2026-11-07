@@ -339,7 +339,10 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
   const fallback = mapModelCatalogue(null, {
     defaultModel: 'deepseek-v4.1-flash',
   });
-  assert(fallback.some((model) => model.id === 'deepseek-v4.1-flash'));
+  assert.deepEqual(
+    fallback.map((model) => model.id),
+    ['auto', 'deepseek-v4.1-flash'],
+  );
   assert(fallback.every((model) => model.wb_source === 'fallback'));
 });
 

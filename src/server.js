@@ -61,7 +61,7 @@ export function createServer() {
       inputSchema: {
         prompt: z.string().describe('交给 WorkBuddy 的任务描述，可多行，越具体越好'),
         cwd: z.string().optional().describe('工作目录，WorkBuddy 在这里读写文件；默认取桥接配置'),
-        model: z.string().optional().describe('模型 ID，如 auto / hy3 / deepseek-v4-pro'),
+        model: z.string().optional().describe('模型 ID，默认 deepseek-v4.1-flash'),
         fallbackModel: z.string().optional().describe('主模型限流时的回退模型'),
         timeoutMs: z.number().int().min(5000).max(3600000).optional().describe('超时毫秒，默认 900000'),
         account: z

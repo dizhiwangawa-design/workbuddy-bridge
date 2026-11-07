@@ -3038,15 +3038,30 @@ Expected:
   Codex CLI 0.160.0 在隔离临时环境中通过 Responses HTTP 完成多步工具循环，
   创建 `calc.mjs`、`test.mjs`、`README.md`，执行测试通过，多轮请求全部记账且
   `inflight=0`。真实 Codex 客户端不发起 WS 首试，HTTP 路径已验证。
+- [x] 修复 WS 新 `response.create` 在旧响应仍处于 setup 阶段时无法中止旧
+  `AbortController` 的竞态；新请求现在会等待旧命令退出后再获取租约。
+- [x] 统一 WS 终态生命周期：准备阶段取消或上游失败也先发送
+  `response.created` / `response.in_progress`，再发送合法终态，不再出现缺失
+  `response.created` 的孤立 `output_item.*` 事件。
+- [x] 模型目录不可用时只返回 `auto` 与已确认的 `deepseek-v4.1-flash`，
+  不再兜底广告未确认模型。
+- [x] 重新通过真实 `default` 账号冒烟、Responses HTTP/SSE/原生 WS/续接和
+  Codex CLI 多步编码验收。
 - [ ] 在 `deepseek-v4.1-flash` 配额重置后，用 `test:live:account` 对
   `awa` 和 `codex-fresh-mvxgctfk` 各完成一次通过。该步骤只能等待外部配额恢复。
 
 **2026-11-07 CI 稳定版执行记录:**
 
-- 聚焦回归通过：`disconnect-resilience` 15/15、`stream-control` 25/25、
-  `anthropic-http` 33/33、`responses` 37/37、`failover` 11/11、
+- 聚焦回归通过：`disconnect-resilience` 17/17、`stream-control` 25/25、
+  `anthropic-http` 33/33、`responses` 40/40、`failover` 11/11、
   `upstream` 9/9。
-- 全量 `npm test` 通过：基础 55/55，API 222/222，合计 277/277。
+- 全量 `npm test` 通过：基础 55/55，API 227/227，合计 282/282。
+- 独立慢读压测通过：约 1.12 MiB 连续正文触发 `BACKPRESSURE_OVERFLOW`，
+  上游关闭、租约归零，子进程峰值 RSS 约 123 MiB。
+- 2026-11-07 21:12 复跑真实链路：Codex CLI Responses HTTP 3 轮通过；
+  Responses HTTP、SSE、原生 WS 和 `previous_response_id` 续接通过；
+  `default` 的 Chat 文本、SSE、工具续轮、真实中断取消片段持久化通过，
+  `inflight=0`。
 - 已覆盖本次新增证据：WS 关闭 Responses 持久化后仍可无状态完成、普通业务消息
   不能冒充 Pong、三协议模型级 429 隔离、Responses SQLite 32 MiB 淘汰、Codex
   Responses 工具循环、系统签名替换不污染用户原文。
