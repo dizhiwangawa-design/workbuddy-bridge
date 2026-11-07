@@ -692,6 +692,56 @@ test('Responses store:false 不保存正文且取消片段不重复拼接', asyn
   assert.deepEqual(store.memoryView(), []);
 });
 
+test('Responses 取消持久化失败时不发送正常 incomplete 收尾', async (t) => {
+  const store = {
+    async save() {
+      return {
+        ok: false,
+        error: Object.assign(new Error('injected database failure'), { code: 'DB_FAILED' }),
+        deadLetterWritten: true,
+      };
+    },
+  };
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'visible partial' } }],
+    }));
+    res.flushHeaders();
+  }, { store });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: true,
+      input: 'failed cancel persistence',
+    }),
+  });
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let raw = '';
+  while (!raw.includes('visible partial')) {
+    const read = await reader.read();
+    if (read.done) break;
+    raw += read.value;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 2200));
+  try {
+    while (true) {
+      const read = await reader.read();
+      if (read.done) break;
+      raw += read.value;
+    }
+  } catch {
+    // Abort may reset the downstream before the server closes it.
+  }
+  const events = parseSse(raw);
+  assert.equal(events.some((event) => event.type === 'response.incomplete'), false);
+  assert.equal(events.some((event) => event.type === 'response.completed'), false);
+  assert.equal(events.some((event) => event.type === 'response.failed'), true);
+});
+
 test('mergePartialOutput 对已完成 message 幂等', async () => {
   const { mergePartialOutput } = await import('../../src/responses-store.js');
   const base = [{

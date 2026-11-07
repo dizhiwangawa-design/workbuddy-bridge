@@ -605,7 +605,8 @@ export function createResponsesRuntime(options = {}) {
         partial: { content: result.content, toolCalls: result.calls },
       }, saveOptions);
       return canceled ? {
-        persisted: persisted.ok,
+        ok: persisted.ok,
+        ...(persisted.error ? { error: persisted.error } : {}),
         deadLetterWritten: persisted.deadLetterWritten === true,
       } : persisted;
     }
@@ -681,7 +682,12 @@ export function createResponsesRuntime(options = {}) {
       canceling = true;
       cancelKind = kind;
       finishReason = 'cancel';
-      if (forceWriter) writer?.fail(reason);
+      // Network disconnects must stop future writes but a realtime terminal
+      // event is only sent after cancellation persistence succeeds. Other
+      // explicit interrupts keep the writer usable for the same contract.
+      // Abort the upstream first, but keep the writer open until persistence
+      // has produced either a durable incomplete record or a failed terminal.
+      if (forceWriter && kind === 'backpressure') writer?.fail(reason);
       controller.abort(reason);
       clearTimers();
       cancelPromise = (async () => {
@@ -713,8 +719,48 @@ export function createResponsesRuntime(options = {}) {
             canceled: true,
             previousResponseId,
           });
+          cancelBody.reasoning = retained.reasoning || '';
+          cancelBody.calls = retained.calls || [];
           cancelBody.output = mergePartialOutput(cancelBody.output, partial);
           persisted = await persistFinal(cancelBody, retained, true);
+          if (!persisted.ok) {
+            finished = true;
+            const failed = completedResponseBody({
+              id: responseId,
+              model: prepared.model,
+              createdAt,
+              prior,
+              reasoning: retained.reasoning,
+              content: retained.content,
+              calls: retained.callsComplete ? retained.calls : [],
+              registry: prepared.tools,
+              usage: retained.usage,
+              error: {
+                code: 'CANCELLATION_PERSISTENCE_FAILED',
+                message: persisted.error?.message || 'cancellation persistence failed',
+              },
+              previousResponseId,
+            });
+            failed.status = 'failed';
+            if (transport === 'ws') {
+              publishWs(protocolEvents(failed, false));
+            } else if (canWriteHttp(res)) {
+              const failedEvents = protocolEvents(failed, false).slice(2);
+              for (const event of failedEvents) {
+                emit([event]);
+              }
+              writer.end();
+            } else {
+              writer?.end();
+            }
+            return {
+              ok: false,
+              canceled: true,
+              responseId,
+              kind,
+              persistence: persisted,
+            };
+          }
           cancelBody = {
             ...cancelBody,
             store: persisted.ok === true,
