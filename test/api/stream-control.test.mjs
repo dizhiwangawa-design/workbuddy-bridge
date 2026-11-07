@@ -91,6 +91,22 @@ test('异步 EPIPE 与 ECONNRESET 被 writer 吸收且不产生未处理异常',
   assert.deepEqual(unhandled, []);
 });
 
+test('writer.fail 销毁已提交响应的 SSE 连接，避免持久化失败后挂起', () => {
+  const res = fakeResponse();
+  let destroyError = null;
+  res.destroy = function destroy(error) {
+    this.destroyed = true;
+    destroyError = error;
+  };
+  const writer = createHttpEventWriter(res);
+  const failure = Object.assign(new Error('database failed'), { code: 'DB_FAILED' });
+  writer.fail(failure);
+  assert.equal(writer.failed, failure);
+  assert.equal(writer.ended, true);
+  assert.equal(res.destroyed, true);
+  assert.equal(destroyError, failure);
+});
+
 test('流写入超过硬阈值触发背压并且不无限缓存在 writer 中', () => {
   let overflow = null;
   const res = fakeResponse();

@@ -914,9 +914,94 @@ test('OpenAI chatWithCancellation 接收显式 Signal 并保留合法收尾', as
   assert.equal(events.filter((event) => event.choices?.[0]?.finish_reason).length, 1);
   assert.equal(events.find((event) => event.choices?.[0]?.finish_reason)?.choices[0].finish_reason, 'stop');
   assert.equal(raw.match(/data: \[DONE\]/g)?.length, 1);
+  assert.equal(raw.match(/^: bridge-chat-canceled$/gm)?.length, 1);
   assert.equal(store.memoryView().length, 1);
   assert.equal(store.memoryView()[0].body.output[0].content[0].text, 'visible partial');
   assert.equal((await store.get(store.memoryView()[0].id))?.status, 'incomplete');
+});
+
+test('OpenAI Cancellation catch 路径持久化成功后仍发送合法收尾和独立注释', async () => {
+  const saved = [];
+  const store = {
+    async save(entry, options) {
+      saved.push({ entry, options });
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  let pendingReject;
+  let firstRead = true;
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: {
+        getReader() {
+          return {
+            read() {
+              if (firstRead) {
+                firstRead = false;
+                return Promise.resolve({
+                  done: false,
+                  value: new TextEncoder().encode(
+                    'data: {"id":"chat-catch","choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+                  ),
+                });
+              }
+              return new Promise((_, reject) => {
+                pendingReject = reject;
+              });
+            },
+            cancel() {
+              return new Promise((resolve) => setTimeout(resolve, 20));
+            },
+          };
+        },
+      },
+    }),
+  };
+  const runtime = createOpenAIRuntime({ upstreamClient, cancelPersistence: store });
+  createAccount('openai-a');
+  const controller = new AbortController();
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const run = runtime.chatWithCancellation({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'catch-path cancel' }],
+    },
+    config: settings.getApiSettings(),
+    interruptSignal: controller.signal,
+  });
+  await waitFor(() => writes.join('').includes('visible partial'));
+  assert.equal(typeof pendingReject, 'function');
+  controller.abort('catch path interruption');
+  setTimeout(() => pendingReject(new Error('forced read failure after cancellation')), 10);
+  const result = await run;
+  assert.equal(result.canceled, true);
+  assert.equal(saved.length, 1);
+  const raw = writes.join('');
+  assert.equal(raw.match(/^: bridge-chat-canceled$/gm)?.length, 1);
+  assert.equal(raw.match(/"finish_reason":"stop"/g)?.length, 1);
+  assert.equal(raw.match(/data: \[DONE\]/g)?.length, 1);
 });
 
 test('OpenAI 取消顺序为停止上游、释放租约、持久化、合法收尾', async () => {

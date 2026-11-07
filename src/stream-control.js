@@ -242,6 +242,13 @@ export function createHttpEventWriter(res, {
       stopTimer();
       failed ||= error;
       ended = true;
+      if (!res.destroyed && typeof res.destroy === 'function') {
+        try {
+          res.destroy(error);
+        } catch (destroyError) {
+          failed ||= destroyError;
+        }
+      }
     },
     stats() {
       return {

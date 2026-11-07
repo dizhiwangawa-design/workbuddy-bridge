@@ -609,6 +609,7 @@ export function createAnthropicRuntime({
         cancelPersistenceResult = persisted;
         if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
         if (persisted.ok) {
+          writer?.writeComment('bridge-anthropic-canceled');
           write(encoder.cancel({
             outputTokens: conservativeTokenEstimate(visibleText),
           }));
@@ -768,6 +769,7 @@ export function createAnthropicRuntime({
         cancelPersistenceResult = persisted;
         if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
         if (stream && persisted.ok) {
+          writer?.writeComment('bridge-anthropic-canceled');
           write(encoder?.cancel({ outputTokens }) || []);
         } else if (stream) {
           writer?.fail(persisted.error);
@@ -1481,6 +1483,7 @@ export function createOpenAIRuntime({
         if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
         if (body.stream && persisted.ok) {
           ensureStreamStarted();
+          writer?.writeComment('bridge-chat-canceled');
           emit(encoder.finalize({ finishReason, canceled: true }));
           if (cancelKind === 'backpressure') {
             writer.fail(controller.signal.reason);
@@ -1625,6 +1628,13 @@ export function createOpenAIRuntime({
         meta: { model: body.model, usage: {} },
       };
       if (cancelKind) {
+        leaseResult = {
+          ok: false,
+          code: cancelKind === 'backpressure' ? 'BACKPRESSURE_OVERFLOW' : 'ABORTED',
+          error: cancelKind,
+          durationMs: now() - startedAt,
+          meta: { model: body.model, usage: {} },
+        };
         return {
           ok: false,
           started: true,
@@ -1653,7 +1663,6 @@ export function createOpenAIRuntime({
       }
       await Promise.allSettled(pendingWrites);
       if (cancelKind && !cancelPersisted) {
-        cancelPersisted = true;
         const output = visibleText ? [{
           type: 'message',
           role: 'assistant',
@@ -1676,6 +1685,17 @@ export function createOpenAIRuntime({
         });
         cancelPersisted = true;
         cancelPersistenceResult = persisted;
+        if (body.stream && !responseEnded) {
+          if (persisted.ok) {
+            ensureStreamStarted();
+            writer?.writeComment('bridge-chat-canceled');
+            emit(encoder.finalize({ finishReason, canceled: true }));
+          } else {
+            writer?.fail(persisted.error);
+          }
+          responseEnded = true;
+          writer?.end();
+        }
       }
       if (cancelPersistenceResult?.deadLetterWritten) {
         warn(`canceled Chat fragment written to dead letter: ${chatResponseId}`);
