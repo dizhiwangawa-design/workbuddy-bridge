@@ -82,7 +82,11 @@ wb login --account alice
 
 # 6. 启动管理页、Anthropic API 与可选 OpenAI API
 wb http --port 7666
-# 浏览器打开 http://127.0.0.1:7666/admin
+# 启动后默认地址：
+# OpenAI base URL    http://127.0.0.1:7666/v1 （默认关闭）
+# Anthropic base URL http://127.0.0.1:7666    （默认开启）
+# Admin              http://127.0.0.1:7666/admin
+# Health             http://127.0.0.1:7666/health
 ```
 
 `wb install` 会自动探测并写入：
@@ -390,11 +394,13 @@ wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
 
 **API 兼容区**支持：
 
-- Anthropic API 与 OpenAI Chat Completions / Responses 的独立开关；
-- 两个协议的接口地址与复制；
+- API 总开关，以及 Anthropic 与 OpenAI Chat Completions / Responses 的独立协议开关；
+- 流式响应、工具调用、通道兼容清洗的运行时开关；OpenAI Chat 在关闭流式后会对 `stream:true` 返回 `400 streaming_disabled`；
 - Responses 持久化与续跑提示的独立开关；OpenAI 关闭时二者不可用，持久化关闭时续跑提示不可用；
+- 上游地址、默认模型（默认 `deepseek-v4.1-flash`）、首字节 / 空闲 / 总超时和 DSML 缓冲上限；
+- 鉴权策略：所有连接要求 Key、远程连接要求 Key、信任反向代理；
 - 客户端 Key 生成、全部重置、明文一次性查看 / 复制、掩码列表和删除；
-- 鉴权模式、流空闲超时和 DSML 缓冲上限摘要。
+- “测试 OpenAI 文本”和“测试 Anthropic 工具”：两者都走实际 runtime 与号池租约；Anthropic 测试执行一次 `tool_use` → `tool_result` 两轮探测，结果只显示 `ok`、账号、耗时和错误码，不显示提示词、token、完整 Key 或工具原文。
 
 顶部汇总可用账号数与状态分布，策略下拉即时生效。看板数据走 `GET /api/stats?range=today|3d|week|month|30d|all`，前端每 5 秒轮询一次。
 
@@ -710,6 +716,50 @@ hy4 是旗舰模型，单价高、排队久，拿它跑测试既费额度又拖�
 转义、官方 SDK 三轮 `tool_use/tool_result`、401 刷新、429 换号、并发上限、
 SQLite 持久化和死信、主动取消、RST、WS Close、TCP 假死、慢读 keepalive、1 MiB
 背压以及四层超时。管理页已做桌面端验收，不包含移动端验收。
+
+## 官方 wire-shape 验收样例
+
+以下命令要求 `wb http` 已启动、对应协议已在 `/admin` 开启，并已生成客户端 Key。
+把 `WB_API_KEY` 只放在当前 shell 环境变量中；不要把真实 Key 写入脚本、日志或仓库。
+
+OpenAI 非流式：
+
+```bash
+curl http://127.0.0.1:7666/v1/chat/completions \
+  -H "Authorization: Bearer $WB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"只回复 ok"}],"stream":false}'
+```
+
+OpenAI 流式：
+
+```bash
+curl -N http://127.0.0.1:7666/v1/chat/completions \
+  -H "Authorization: Bearer $WB_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"数到 3"}],"stream":true}'
+```
+
+Anthropic 非流式：
+
+```bash
+curl http://127.0.0.1:7666/v1/messages \
+  -H "x-api-key: $WB_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","max_tokens":64,"messages":[{"role":"user","content":"只回复 ok"}]}'
+```
+
+这些是可选的真实链路样例，不属于默认 `npm test`。默认测试使用本地假上游与官方 SDK
+离线校验同一条 wire-shape；工具往返分别覆盖 Anthropic `tool_use/tool_result` 与
+OpenAI `tool_calls` + `role:"tool"`。
+
+**wire-shape 回归**由离线假上游和官方 SDK 测试共同锁定：`test/api/sdk-roundtrip.test.mjs`
+验证 Anthropic SDK 对 SSE 事件顺序、文本索引和 `tool_use.input` 的解析；
+`test/api/openai-tool-roundtrip.test.mjs` 验证 OpenAI SDK 对 Chat completion /
+`tool_calls` / 多轮 `role:"tool"` 的解析；`test/api/responses.test.mjs` 验证
+Responses 的 SSE `sequence_number`、`output_item.done` 与 completed output 身份、
+WS 命令和续接。`npm test` 不需要真实账号或网络。
 
 真实链路冒烟测试使用官方 OpenAI SDK，并由脚本自动临时开启 OpenAI 开关，结束后恢复原设置：
 

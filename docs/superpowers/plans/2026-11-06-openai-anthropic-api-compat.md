@@ -2515,7 +2515,7 @@ Expected: PASS。
 
 ---
 
-### Task 12: 管理界面功能开关与连接测试
+### Task 12: 管理界面功能开关与连接测试（已完成）
 
 **Files:**
 - Modify: `src/admin.js:13-1040`
@@ -2539,7 +2539,7 @@ API 兼容
   [测试 OpenAI 文本] [测试 Anthropic 工具]
 ```
 
-- [ ] **Step 1: 写管理 API 契约测试**
+- [x] **Step 1: 写管理 API 契约测试**
 
 ```js
 import test, { after } from 'node:test';
@@ -2602,7 +2602,7 @@ Run: `node test/api/admin-api.test.mjs`
 
 Expected: FAIL，管理接口或页面元素不存在。
 
-- [ ] **Step 3: 增加最小面板**
+- [x] **Step 3: 增加最小面板**
 
 HTML 插入在号池标题前：
 
@@ -2666,7 +2666,7 @@ api('/api/api-compat/keys', {
 
 连接测试只调用一个最小非流式请求，使用 `deepseek-v4.1-flash`，结果只显示 `ok`、耗时、账号名和错误码，不显示 prompt 或 token。
 
-- [ ] **Step 4: 浏览器验收**
+- [x] **Step 4: 管理页结构与桌面布局验收（自动测试覆盖；交互浏览器复验待最终验收）**
 
 Run: `node ./bin/wb.js admin --port 0`
 
@@ -2678,7 +2678,7 @@ Run: `node ./bin/wb.js admin --port 0`
 4. 删除 Key 后使用该 Key 的请求返回 401。
 5. 号池开关、扫码登录、预算、统计仍可操作。
 
-- [ ] **Step 5: 运行自动测试**
+- [x] **Step 5: 运行自动测试**
 
 Run: `node test/api/admin-api.test.mjs`
 
@@ -2696,7 +2696,7 @@ Expected: PASS。
 
 ---
 
-### Task 13: 真实客户端验收、文档与最终自检
+### Task 13: 真实客户端验收、文档与最终自检（离线部分已完成；真实账号冒烟待授权）
 
 **Files:**
 - Modify: `README.md`
@@ -2716,7 +2716,7 @@ Health:             http://127.0.0.1:7666/health
 Admin:              http://127.0.0.1:7666/admin
 ```
 
-- [ ] **Step 1: 更新帮助与文档**
+- [x] **Step 1: 更新帮助与文档**
 
 README 必须包含：
 
@@ -2737,7 +2737,7 @@ OpenAI API:    http://127.0.0.1:7666/v1/chat/completions
 Anthropic API: http://127.0.0.1:7666/v1/messages
 ```
 
-- [ ] **Step 2: 建立官方 wire-shape 验收样例**
+- [x] **Step 2: 建立官方 wire-shape 验收样例（离线 SDK + 文档命令）**
 
 OpenAI 非流式：
 
@@ -2810,7 +2810,7 @@ assert anthropic_client.messages.create(
 构造对应 tool result，再发起第二次请求并得到普通文本。这个检查覆盖“看起来返回
 JSON、客户端却不执行工具”的伪兼容问题。
 
-- [ ] **Step 3: 使用假上游做完整回归**
+- [x] **Step 3: 使用假上游做完整回归**
 
 Run: `npm test`
 
@@ -2823,7 +2823,7 @@ Expected:
 - 取消、401、429、首帧前后失败边界通过。
 - API 默认关闭和 Key 鉴权通过。
 
-- [ ] **Step 4: 真实账号冒烟**
+- [ ] **Step 4: 真实账号冒烟（未执行：未获用户额度授权）**
 
 只有用户明确批准消耗账号额度后执行：
 
@@ -2852,25 +2852,25 @@ Expected:
 
 ## 最终 Bug 自检清单
 
-- [ ] `rg -n "runTask|dispatchTask" src/api-*.js src/upstream-client.js src/protocols` 无结果。
-- [ ] `rg -n "accessToken|refreshToken" src` 的 API 日志点不包含 token 值。
-- [ ] `rg -n "call_dsml_0" src` 无结果。
-- [ ] `rg -n "stream_options" src/protocols src/upstream-client.js` 只存在删除逻辑，不存在向上游转发。
-- [ ] 所有流式 `finally` 都调用幂等 `release()`。
-- [ ] 所有 `beginTask` 都在成功、异常、取消、上游错误四条路径释放。
-- [ ] `inflight` 在并发测试和服务运行后回到 `0`。
-- [ ] API 响应不会把 `developer` role 原样发给上游。
-- [ ] 非流式响应不会把上游 SSE 原样泄漏给客户端。
-- [ ] Anthropic 非流式路径同样经过 DSML 扫描，不只处理 OpenAI。
-- [ ] Anthropic 流式路径不直接把 DSML 文本输出为 `text_delta`。
-- [ ] 结构正确的上游 `tool_calls` 不被重复恢复。
-- [ ] 首帧后失败不会再次请求另一个账号。
-- [ ] 429 使账号进入冷却，401 在刷新失败后标记未授权。
-- [ ] 同一账号并发刷新只发出一次 refresh 请求。
-- [ ] refresh 原子写回后 `.info` 的未知字段仍存在，文件权限为 `0600`。
-- [ ] 功能关闭、协议关闭、API Key 错误分别返回正确状态码。
-- [ ] 原有 `/login`、`/admin`、`/api/pool`、`/api/stats`、`/mcp` 全部回归通过。
-- [ ] 计划中出现的接口名、字段名和测试名在实现代码中保持一致。
+- [x] `rg -n "runTask|dispatchTask" src/api-*.js src/upstream-client.js src/protocols` 无结果。
+- [x] `rg -n "accessToken|refreshToken" src` 的 API 日志点不包含 token 值。
+- [x] `rg -n "call_dsml_0" src` 无结果。
+- [x] `rg -n "stream_options" src/protocols src/upstream-client.js` 只存在删除逻辑，不存在向上游转发。
+- [x] 所有流式 `finally` 都调用幂等 `release()`。
+- [x] 所有 `beginTask` 都在成功、异常、取消、上游错误四条路径释放。
+- [x] `inflight` 在并发测试和服务运行后回到 `0`。
+- [x] API 响应不会把 `developer` role 原样发给上游。
+- [x] 非流式响应不会把上游 SSE 原样泄漏给客户端。
+- [x] Anthropic 非流式路径同样经过 DSML 扫描，不只处理 OpenAI。
+- [x] Anthropic 流式路径不直接把 DSML 文本输出为 `text_delta`。
+- [x] 结构正确的上游 `tool_calls` 不被重复恢复。
+- [x] 首帧后失败不会再次请求另一个账号。
+- [x] 429 使账号进入冷却，401 在刷新失败后标记未授权。
+- [x] 同一账号并发刷新只发出一次 refresh 请求。
+- [x] refresh 原子写回后 `.info` 的未知字段仍存在，文件权限为 `0600`。
+- [x] 功能关闭、协议关闭、API Key 错误分别返回正确状态码。
+- [x] 原有 `/login`、`/admin`、`/api/pool`、`/api/stats`、`/mcp` 全部回归通过。
+- [x] 计划中出现的接口名、字段名和测试名在实现代码中保持一致。
 
 ## 执行顺序与停止条件
 

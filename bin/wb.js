@@ -31,7 +31,7 @@ const C = {
 
 function help() {
   console.log(`
-${C.bold('workbuddy-bridge')} ${C.dim('v' + VERSION)} — WorkBuddy MCP 子 Agent + Anthropic Messages API
+${C.bold('workbuddy-bridge')} ${C.dim('v' + VERSION)} — WorkBuddy MCP 子 Agent + OpenAI / Anthropic API
 
 ${C.bold('用法')}
   wb login  [--account <名字>] [--site cn|intl|enterprise|ioa] [--port 7666] [--no-qr]
@@ -47,7 +47,8 @@ ${C.bold('用法')}
       以 stdio MCP 方式运行（Agent 内部调用，一般不手动执行）。
 
   wb http [--port 7666] [--mcp] [--host 0.0.0.0]
-      起 HTTP 服务：/login 登录页、/admin 管理页、/v1/messages Anthropic API。
+      起 HTTP 服务：/login、/admin、/health；
+      OpenAI /v1/chat/completions、/v1/responses（含 WS），Anthropic /v1/messages。
       API 直接请求 WorkBuddy 上游并复用现有账号池，不启动 codebuddy CLI。
       加 --mcp 同时暴露 Streamable HTTP MCP。
 
@@ -66,8 +67,8 @@ ${C.bold('用法')}
   wb pool test <名字>                发一条最小请求，确认这个号真的能用
 
   wb admin [--port 7667] [--host 0.0.0.0]
-      打开可视化管理界面（账号卡片、额度、负载、扫码登录、Anthropic 开关和
-      客户端 Key 都能在上面管理）。
+      打开可视化管理界面（账号卡片、额度、负载、扫码登录、OpenAI / Anthropic
+      开关、协议选项、上游与超时和客户端 Key 都能在上面管理）。
 
   wb accounts [list|use <名字>|remove <名字>]
       管理多账号。
@@ -82,10 +83,20 @@ ${C.bold('用法')}
   wb doctor
       检查环境。
 
-${C.bold('Anthropic API')}
-  Base URL     http://127.0.0.1:7666
+${C.bold('API 兼容入口')}
+  OpenAI Base  http://127.0.0.1:7666/v1
+  POST         /v1/chat/completions
+  POST         /v1/responses
+  WS           /v1/responses
+  GET          /v1/responses/:id
+  GET          /v1/models
+
+  Anthropic    http://127.0.0.1:7666
   POST         /v1/messages
   POST         /v1/messages/count_tokens   （保守估算，不用于精确计费）
+
+  OpenAI 开关默认关闭，Anthropic 默认开启；在 /admin 中管理协议开关、
+  Responses 持久化、流式 / 工具、上游地址、模型、超时和客户端 Key。
 
   TypeScript / JavaScript：
     const client = new Anthropic({
@@ -99,7 +110,7 @@ ${C.bold('Anthropic API')}
     });
 
   回环地址默认免 Key；非回环连接或 trustProxy=true 时必须提供 x-api-key
-  或 Authorization: Bearer。功能开关、Key 生成 / 删除和超时摘要都在 /admin。
+  或 Authorization: Bearer。
 
 ${C.bold('环境变量')}
   WB_COMMAND      codebuddy 可执行文件（仅 MCP / CLI 任务使用；API 不依赖它）
@@ -243,8 +254,12 @@ async function cmdHttp(values) {
   const port = Number(values.port || 7666);
   const host = values.host || '127.0.0.1';
   await startHttpServer({ port, host, mcp: !!values.mcp });
-  console.log(C.bold(`\n管理界面：${C.cyan(`http://${host === '0.0.0.0' ? 'localhost' : host}:${port}/admin`)}`));
-  console.log(C.dim('Ctrl+C 退出'));
+  const displayHost = host === '0.0.0.0' ? 'localhost' : host;
+  console.log(C.bold(`\n管理界面：${C.cyan(`http://${displayHost}:${port}/admin`)}`));
+  console.log(`OpenAI API：   ${C.cyan(`http://${displayHost}:${port}/v1`)}`);
+  console.log(`Anthropic API：${C.cyan(`http://${displayHost}:${port}/v1/messages`)}`);
+  console.log(`健康检查：     ${C.cyan(`http://${displayHost}:${port}/health`)}`);
+  console.log(C.dim('OpenAI 默认关闭，请在管理页启用并生成客户端 Key；Ctrl+C 退出'));
 }
 
 async function cmdTask(values, positionals) {
