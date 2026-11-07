@@ -138,7 +138,7 @@ test('连接测试端点不依赖 CLI，且只返回脱敏摘要', async () => {
     },
     runtime: {
       async chat({ body }) {
-        calls.push(body);
+        calls.push({ protocol: 'openai', body });
         return {
           ok: true,
           account: 'fixture-account',
@@ -155,7 +155,38 @@ test('连接测试端点不依赖 CLI，且只返回脱敏摘要', async () => {
     durationMs: 12,
     code: 'OK',
   });
-  assert.deepEqual(calls, [{ prompt: 'Reply with exactly: ok', stream: false }]);
+  assert.deepEqual(calls, [{ protocol: 'openai', body: { prompt: 'Reply with exactly: ok', stream: false } }]);
+});
+
+test('Anthropic 连接测试走工具探测路径并显示同一账号', async () => {
+  const { probeApiConnection } = await import('../../src/api-server.js');
+  const calls = [];
+  const result = await probeApiConnection({
+    protocol: 'anthropic',
+    config: { defaultModel: 'deepseek-v4.1-flash', tools: true },
+    runtime: {
+      async chat({ body, config }) {
+        calls.push({ body, config });
+        return {
+          ok: true,
+          account: 'fixture-anthropic',
+          durationMs: 21,
+          code: 'OK',
+          toolRoundtrip: true,
+        };
+      },
+    },
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    protocol: 'anthropic',
+    account: 'fixture-anthropic',
+    durationMs: 21,
+    code: 'OK',
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].config.tools, true);
+  assert.match(calls[0].body.prompt, /tool/i);
 });
 
 test('连接测试失败只暴露 account、耗时与错误码', async () => {
@@ -179,4 +210,91 @@ test('连接测试失败只暴露 account、耗时与错误码', async () => {
   assert.equal(JSON.stringify(result).includes('secret prompt'), false);
   assert.equal(JSON.stringify(result).includes('sk-wb_'), false);
   assert.equal(Object.hasOwn(result, 'error'), false);
+});
+
+
+test('Anthropic 工具探针走真实 HTTP runtime、号池租约与脱敏结果', async () => {
+  const accounts = await import('../../src/accounts.js');
+  const pool = await import('../../src/pool.js');
+  const http = await import('node:http');
+  const { once } = await import('node:events');
+
+  const accountName = 'probe-tool-account';
+  for (const account of pool.loadPool().accounts ? Object.keys(pool.loadPool().accounts) : []) {
+    if (account !== accountName) pool.updateAccount(account, { enabled: false });
+  }
+  accounts.ensureAccount(accountName);
+  const authDir = accounts.accountAuthDir(accountName);
+  fs.mkdirSync(authDir, { recursive: true });
+  fs.writeFileSync(path.join(authDir, 'auth.info'), JSON.stringify({
+    account: { uid: 'uid-probe-tool' },
+    auth: {
+      accessToken: 'probe-access',
+      refreshToken: 'probe-refresh',
+      expiresAt: Math.floor((Date.now() + 3600000) / 1000),
+      refreshExpiresAt: Math.floor((Date.now() + 7200000) / 1000),
+    },
+  }), { mode: 0o600 });
+  pool.updateAccount(accountName, { enabled: true, maxConcurrency: 1 });
+
+  const upstreamBodies = [];
+  const upstream = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    upstreamBodies.push(JSON.parse(raw));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_probe",'
+      + '"function":{"name":"probe_echo","arguments":"{\\"value\\":7}"}}]},'
+      + '"finish_reason":"tool_calls"}]}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+  upstream.listen(0, '127.0.0.1');
+  await once(upstream, 'listening');
+
+  settings.updateApiSettings({
+    enabled: true,
+    anthropic: true,
+    openai: false,
+    streaming: true,
+    tools: true,
+    requireApiKey: false,
+    upstreamBaseUrl: `http://127.0.0.1:${upstream.address().port}`,
+    defaultModel: 'deepseek-v4.1-flash',
+    firstByteTimeoutMs: 1000,
+    idleTimeoutMs: 1500,
+    finishGraceMs: 100,
+    totalTimeoutMs: 5000,
+  });
+
+  try {
+    await withServer(async (baseUrl) => {
+      const response = await adminFetch(baseUrl, '/api/api-compat/test', {
+        method: 'POST',
+        body: JSON.stringify({ protocol: 'anthropic' }),
+      });
+      assert.equal(response.status, 200);
+      const result = await response.json();
+      assert.equal(result.ok, true, JSON.stringify(result));
+      assert.equal(result.protocol, 'anthropic');
+      assert.equal(result.account, accountName);
+      assert.equal(result.code, 'OK');
+      assert.equal(JSON.stringify(result).includes('probe_echo'), false);
+      assert.equal(JSON.stringify(result).includes('probe-access'), false);
+    });
+  } finally {
+    upstream.closeAllConnections?.();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+
+  assert.equal(upstreamBodies.length, 2, JSON.stringify(upstreamBodies));
+  assert.equal(upstreamBodies[0].tools[0].function.name, 'probe_echo');
+  assert.equal(upstreamBodies[0].tool_choice, 'probe_echo');
+  assert.equal(upstreamBodies[1].tools[0].function.name, 'probe_echo');
+  assert.equal(
+    pool.poolView().accounts.find((item) => item.name === accountName).inflight,
+    0,
+  );
+  assert.equal(pool.loadPool().accounts[accountName].today.req, 2);
 });

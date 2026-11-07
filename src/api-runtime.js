@@ -664,6 +664,28 @@ export function createAnthropicRuntime({
           tools: arbitration.calls.map((call) => call.input),
         });
       const stopReason = mapStopReason(finishReason, arbitration.calls.length > 0);
+      const responseBody = {
+        id: requestId,
+        type: 'message',
+        role: 'assistant',
+        model: body.requestBody.model,
+        content: [],
+        stop_reason: stopReason,
+        stop_sequence: null,
+        usage: {
+          input_tokens: usage.inputTokens || inputEstimate,
+          output_tokens: Math.max(0, outputTokens),
+        },
+      };
+      if (visibleText) responseBody.content.push({ type: 'text', text: visibleText });
+      for (const call of arbitration.calls) {
+        responseBody.content.push({
+          type: 'tool_use',
+          id: call.id,
+          name: call.name,
+          input: call.input,
+        });
+      }
       if (stream) {
         write(encoder.finalize({
           calls: arbitration.calls,
@@ -675,29 +697,7 @@ export function createAnthropicRuntime({
           res.end();
         }
       } else {
-        const content = [];
-        if (visibleText) content.push({ type: 'text', text: visibleText });
-        for (const call of arbitration.calls) {
-          content.push({
-            type: 'tool_use',
-            id: call.id,
-            name: call.name,
-            input: call.input,
-          });
-        }
-        sendJson(res, 200, {
-          id: requestId,
-          type: 'message',
-          role: 'assistant',
-          model: body.requestBody.model,
-          content,
-          stop_reason: stopReason,
-          stop_sequence: null,
-          usage: {
-            input_tokens: usage.inputTokens || inputEstimate,
-            output_tokens: Math.max(0, outputTokens),
-          },
-        });
+        sendJson(res, 200, responseBody);
         responseEnded = true;
       }
 
@@ -713,7 +713,12 @@ export function createAnthropicRuntime({
           },
         },
       };
-      return { ok: true };
+      return {
+        ok: true,
+        account,
+        durationMs: now() - startedAt,
+        responseBody,
+      };
     } catch (error) {
       if (cancelKind) {
         const outputTokens = conservativeTokenEstimate(visibleText);
@@ -829,6 +834,155 @@ export function createAnthropicRuntime({
     }
   }
 
+  function probeRequest() {
+    return {
+      headers: {},
+      on() {},
+      once() {},
+      off() {},
+    };
+  }
+
+  function probeResponse() {
+    return {
+      headersSent: false,
+      writable: true,
+      destroyed: false,
+      writableEnded: false,
+      writableLength: 0,
+      on() {},
+      off() {},
+      once() {},
+      writeHead(status) {
+        this.headersSent = true;
+        this.statusCode = status;
+        return this;
+      },
+      flushHeaders() {},
+      write() {
+        return true;
+      },
+      end() {
+        this.writableEnded = true;
+        this.destroyed = true;
+      },
+      destroy() {
+        this.destroyed = true;
+      },
+    };
+  }
+
+  function probeTools() {
+    return [{
+      name: 'probe_echo',
+      description: 'Return the provided value unchanged.',
+      input_schema: {
+        type: 'object',
+        properties: { value: { type: 'number' } },
+        required: ['value'],
+      },
+    }];
+  }
+
+  async function probeTool(config) {
+    if (!config.tools) {
+      throw new ApiError(400, 'tool support is disabled', { code: 'tools_disabled' });
+    }
+    const startedAt = now();
+    const pool = poolLoader();
+    const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
+    const tried = [];
+    let lastFailure = null;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const picked = pick({ exclude: tried });
+      if (!picked.name) break;
+      tried.push(picked.name);
+      let first;
+      try {
+        const firstBody = normalizeBody({
+          model: config.defaultModel || 'deepseek-v4.1-flash',
+          max_tokens: 64,
+          stream: false,
+          messages: [{ role: 'user', content: 'Use the probe_echo tool with value 7.' }],
+          tools: probeTools(),
+          tool_choice: { type: 'tool', name: 'probe_echo' },
+        }, config);
+        first = await executeAttempt({
+          req: probeRequest(),
+          res: probeResponse(),
+          body: firstBody,
+          config,
+          stream: false,
+          account: picked.name,
+        });
+        if (!first.ok || !first.responseBody) {
+          lastFailure = first.error || new Error('Anthropic probe returned no response');
+          if (!lastFailure.retryable) break;
+          continue;
+        }
+        // executeAttempt owns and releases the lease for each attempt. The
+        // continuation is a separate billable probe request.
+        const toolUse = first.responseBody.content?.find((item) => item?.type === 'tool_use');
+        if (!toolUse || toolUse.name !== 'probe_echo') {
+          lastFailure = new RuntimeFailure('Anthropic probe did not call the probe tool', {
+            code: 'PROBE_TOOL_MISSING',
+            retryable: false,
+          });
+          break;
+        }
+
+        const secondBody = normalizeBody({
+          model: config.defaultModel || 'deepseek-v4.1-flash',
+          max_tokens: 64,
+          stream: false,
+          messages: [
+            { role: 'user', content: 'Use the probe_echo tool with value 7.' },
+            { role: 'assistant', content: first.responseBody.content },
+            {
+              role: 'user',
+              content: [{
+                type: 'tool_result',
+                tool_use_id: toolUse.id,
+                content: '7',
+              }],
+            },
+          ],
+          tools: probeTools(),
+        }, config);
+        begin(picked.name);
+        const second = await executeAttempt({
+          req: probeRequest(),
+          res: probeResponse(),
+          body: secondBody,
+          config,
+          stream: false,
+          account: picked.name,
+        });
+        if (!second.ok) {
+          lastFailure = second.error || new Error('Anthropic probe continuation failed');
+          if (!lastFailure.retryable) break;
+          continue;
+        }
+        return {
+          ok: true,
+          account: picked.name,
+          durationMs: now() - startedAt,
+          code: 'OK',
+        };
+      } catch (error) {
+        lastFailure = error;
+        if (!error?.retryable) break;
+      }
+    }
+
+    const failure = lastFailure || new ApiError(503, 'no usable account', {
+      code: 'POOL_EMPTY',
+    });
+    failure.account = failure.account || tried.at(-1) || null;
+    throw failure;
+  }
+
   async function messages({ req, res, body, config, interruptSignal = null }) {
     const normalized = normalizeBody(body, config);
     const pool = poolLoader();
@@ -859,7 +1013,8 @@ export function createAnthropicRuntime({
         account: picked.name,
         interruptSignal,
       });
-      if (result.ok || result.started) return result;
+      if (result.ok) return result;
+      if (result.started) return result;
       lastFailure = result.error;
       if (!result.error?.retryable) break;
     }
@@ -885,6 +1040,7 @@ export function createAnthropicRuntime({
   return {
     messages,
     countTokens,
+    probeTool,
     cancelStore: cancelPersistence,
   };
 }
@@ -1350,6 +1506,23 @@ export function createOpenAIRuntime({
           tools: arbitration.calls.map((call) => call.input),
         }),
       );
+      const responseBody = toOpenAIResponse({
+        id: upstreamId,
+        created: upstreamCreated,
+        content: visibleText,
+        reasoning: reasoningText,
+        refusal: refusalText,
+        toolCalls: new Map(arbitration.calls.map((call, index) => [
+          index,
+          {
+            id: call.id,
+            name: call.name,
+            arguments: JSON.stringify(call.input),
+          },
+        ])),
+        finishReason,
+        usage,
+      }, body.model, { now });
       if (body.stream) {
         ensureStreamStarted();
         emit(encoder.finalize({
@@ -1362,23 +1535,6 @@ export function createOpenAIRuntime({
           writer.end();
         }
       } else {
-        const responseBody = toOpenAIResponse({
-          id: upstreamId,
-          created: upstreamCreated,
-          content: visibleText,
-          reasoning: reasoningText,
-          refusal: refusalText,
-          toolCalls: new Map(arbitration.calls.map((call, index) => [
-            index,
-            {
-              id: call.id,
-              name: call.name,
-              arguments: JSON.stringify(call.input),
-            },
-          ])),
-          finishReason,
-          usage,
-        }, body.model, { now });
         sendJson(res, 200, responseBody);
       }
 
@@ -1394,7 +1550,14 @@ export function createOpenAIRuntime({
           },
         },
       };
-      return body.stream ? { ok: true, started: true } : { ok: true, started: false };
+      return {
+        ok: true,
+        started: body.stream,
+        account,
+        durationMs: now() - startedAt,
+        code: 'OK',
+        responseBody,
+      };
     } catch (error) {
       const failure = error instanceof RuntimeFailure
         ? error
@@ -1478,6 +1641,9 @@ export function createOpenAIRuntime({
   }
 
   async function chatWithCancellation({ req, res, body, config, interruptSignal = null }) {
+    if (body?.stream === true && config.streaming === false) {
+      throw new ApiError(400, 'streaming is disabled', { code: 'streaming_disabled' });
+    }
     const normalized = prepareOpenAIRequest(body, {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,

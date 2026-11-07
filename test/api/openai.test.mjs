@@ -431,6 +431,30 @@ test('模型目录不可用时返回 fallback，未知模型返回 OpenAI 404', 
   assert.equal(body.error.code, 'model_not_found');
 });
 
+test('OpenAI Chat 在流式开关关闭时拒绝 stream:true 且不请求上游', async (t) => {
+  let upstreamRequests = 0;
+  const { baseUrl } = await startFixture(t, async (_req, res) => {
+    upstreamRequests += 1;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('{"choices":[{"message":{"content":"unexpected"}}]}');
+  }, { streaming: false });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'ping' }],
+    }),
+  });
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.equal(body.error.code, 'streaming_disabled');
+  assert.equal(upstreamRequests, 0);
+  assert.equal(inflight('openai-a'), 0);
+});
+
 test('OpenAI 上游失败在 SSE 开始前使用 OpenAI 错误形状', async (t) => {
   const { baseUrl } = await startFixture(t, async (_req, res) => {
     res.writeHead(500, { 'content-type': 'application/json' });

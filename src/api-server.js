@@ -10,9 +10,7 @@ import {
 import { ApiError, sendApiError } from './api-errors.js';
 import { createAnthropicRuntime, createOpenAIRuntime } from './api-runtime.js';
 import { createResponsesRuntime } from './api-responses.js';
-import { pickAccount } from './pool.js';
-import { readAccountCredentials } from './auth-store.js';
-import { createUpstreamClient } from './upstream-client.js';
+import { createResponsesStore } from './responses-store.js';
 
 function sendJson(res, status, body) {
   res.writeHead(status, {
@@ -287,10 +285,14 @@ function connectionProbeResult(protocol, startedAt, result = {}, error = null) {
 export async function probeApiConnection({ protocol, config, runtime, now = Date.now }) {
   const startedAt = now();
   try {
-    const result = await runtime.chat({
-      body: { prompt: 'Reply with exactly: ok', stream: false },
-      config,
-    });
+    const body = protocol === 'anthropic'
+      ? {
+          prompt: 'Call the probe_echo tool with value 7, then confirm the tool result.',
+          stream: false,
+          toolProbe: true,
+        }
+      : { prompt: 'Reply with exactly: ok', stream: false };
+    const result = await runtime.chat({ body, config });
     return connectionProbeResult(protocol, startedAt, result);
   } catch (error) {
     return connectionProbeResult(protocol, startedAt, {},
@@ -299,6 +301,98 @@ export async function probeApiConnection({ protocol, config, runtime, now = Date
         account: error?.account || null,
       }));
   }
+}
+
+function probeAccountName(result = {}, error = null) {
+  return result?.account || error?.account || null;
+}
+
+function probeFailure(error) {
+  return Object.assign({}, error, {
+    code: error?.code || 'UPSTREAM_ERROR',
+    account: probeAccountName({}, error),
+  });
+}
+
+async function probeOpenAIThroughRuntime(config) {
+  const runtime = createOpenAIRuntime({
+    cancelPersistence: createResponsesStore(),
+  });
+  const res = createProbeResponse();
+  try {
+    const result = await runtime.chatWithCancellation({
+      req: createProbeRequest(),
+      res,
+      body: {
+        model: config.defaultModel || 'deepseek-v4.1-flash',
+        stream: false,
+        messages: [{ role: 'user', content: 'Reply with exactly: ok' }],
+      },
+      config,
+    });
+    if (result.ok) {
+      return {
+        ok: true,
+        account: result.account || probeAccountName(result),
+        durationMs: result.durationMs,
+        code: 'OK',
+      };
+    }
+    throw probeFailure(result.error || new Error('OpenAI probe failed'));
+  } finally {
+    res.destroy?.();
+  }
+}
+
+async function probeAnthropicThroughRuntime(config) {
+  const runtime = createAnthropicRuntime({
+    cancelPersistence: createResponsesStore(),
+  });
+  const result = await runtime.probeTool(config);
+  return {
+    ok: true,
+    account: result.account || probeAccountName(result),
+    durationMs: result.durationMs,
+    code: 'OK',
+  };
+}
+
+function createProbeRequest() {
+  return {
+    headers: {},
+    on() {},
+    once() {},
+    off() {},
+  };
+}
+
+function createProbeResponse() {
+  return {
+    headersSent: false,
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    on() {},
+    off() {},
+    once() {},
+    writeHead(status) {
+      this.headersSent = true;
+      this.statusCode = status;
+      return this;
+    },
+    flushHeaders() {},
+    write() {
+      return true;
+    },
+    end() {
+      this.writableEnded = true;
+      this.destroyed = true;
+    },
+    destroy() {
+      this.destroyed = true;
+    },
+  };
 }
 
 export async function handleApiSettingsApi(req, res, url) {
@@ -334,46 +428,10 @@ export async function handleApiSettingsApi(req, res, url) {
         config,
         runtime: {
           async chat({ body: probeBody, config: probeConfig }) {
-            const pool = pickAccount();
-            if (!pool.name) {
-              const error = new ApiError(503, 'no usable account', { code: 'POOL_EMPTY' });
-              error.account = null;
-              throw error;
+            if (probeBody.toolProbe) {
+              return probeAnthropicThroughRuntime(probeConfig);
             }
-            const credentials = readAccountCredentials(pool.name);
-            if (!credentials?.ok) {
-              const error = new ApiError(401, 'no usable credentials', { code: 'AUTH_REQUIRED' });
-              error.account = pool.name;
-              throw error;
-            }
-            const started = Date.now();
-            const chat = await createUpstreamClient();
-            const response = await chat.chat({
-              accountId: pool.name,
-              credentials,
-              model: probeConfig.defaultModel,
-              body: {
-                messages: [{ role: 'user', content: 'Reply with exactly: ok' }],
-                stream: true,
-              },
-              sanitize: probeConfig.channelSanitize,
-            });
-            if (!response.ok) {
-              const error = new ApiError(
-                response.status === 429 ? 429 : 502,
-                `upstream HTTP ${response.status}`,
-                { code: response.status === 429 ? 'RATE_LIMITED' : 'UPSTREAM_ERROR' },
-              );
-              error.account = pool.name;
-              throw error;
-            }
-            const text = await response.text();
-            return {
-              ok: text.includes('data:') || text.length > 0,
-              account: pool.name,
-              durationMs: Date.now() - started,
-              code: 'OK',
-            };
+            return probeOpenAIThroughRuntime(probeConfig);
           },
         },
       });
