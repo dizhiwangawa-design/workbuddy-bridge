@@ -265,6 +265,52 @@ test('Responses 首帧前 429 换号后再提交 200 SSE', async (t) => {
     .find((item) => item.name === second)?.inflight === 0);
 });
 
+test('模型级 429 不会阻断 Responses 同账号的其他模型', async (t) => {
+  const account = 'model-scope-responses';
+  const seenModels = [];
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw || '{}');
+    seenModels.push(body.model);
+    if (body.model === 'deepseek-v4.1-flash') {
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end('{"error":{"message":"model quota exceeded"}}');
+      return;
+    }
+    upstream(res, 'responses fallback model ok');
+  }, { account });
+
+  const limited = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'limited model',
+    }),
+  });
+  assert.equal(limited.status, 429);
+  await limited.text();
+
+  const fallback = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'fixture-model-b',
+      input: 'fallback model',
+    }),
+  });
+  assert.equal(fallback.status, 200);
+  const body = await fallback.json();
+  assert.equal(body.status, 'completed');
+  assert.equal(body.output[0].content[0].text, 'responses fallback model ok');
+
+  assert.deepEqual(seenModels, ['deepseek-v4.1-flash', 'fixture-model-b']);
+  const row = pool.poolView().accounts.find((item) => item.name === account);
+  assert.equal(row.inflight, 0);
+  assert.deepEqual(row.cooldownModels, ['deepseek-v4.1-flash']);
+});
+
 test('Responses SSE 序号单调、done 身份与 completed output 一致，支持图片', async (t) => {
   const { baseUrl } = await fixture(t, async (req, res) => {
     let raw = '';
@@ -363,6 +409,84 @@ test('Responses 流式 item 身份在持久化后与 completed event 一致', as
   assert.equal(fetched.status, 200);
   const stored = await fetched.json();
   assert.equal(stored.output.find((item) => item.type === 'message').id, finalMessage.id);
+});
+
+test('Responses 流式工具 item 使用合法 function/custom 结构并与 completed 身份一致', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    upstream(res, [{
+      tools: [
+        {
+          index: 0,
+          id: 'call_shell',
+          function: { name: 'shell', arguments: '{"command":"pwd"}' },
+        },
+        {
+          index: 1,
+          id: 'call_patch',
+          function: { name: 'apply_patch', arguments: '{"input":"*** Begin Patch"}' },
+        },
+      ],
+    }], 'tool_calls');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      input: 'perform shell and patch calls',
+      tools: [
+        {
+          type: 'shell',
+          name: 'shell',
+          parameters: { type: 'object', properties: { command: { type: 'string' } } },
+        },
+        { type: 'custom', name: 'apply_patch' },
+      ],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const events = parseSse(await response.text());
+  const completed = events.findLast((event) => event.type === 'response.completed');
+  assert.ok(completed);
+  const finalCalls = completed.response.output.filter((item) => (
+    ['function_call', 'custom_tool_call'].includes(item.type)
+  ));
+  assert.equal(finalCalls.length, 2);
+
+  for (const finalCall of finalCalls) {
+    const added = events.find((event) => (
+      event.type === 'response.output_item.added'
+      && event.item?.id === finalCall.id
+    ));
+    const done = events.find((event) => (
+      event.type === 'response.output_item.done'
+      && event.item?.id === finalCall.id
+    ));
+    assert.ok(added, JSON.stringify(finalCall));
+    assert.ok(done, JSON.stringify(finalCall));
+    assert.equal(added.item.type, finalCall.type);
+    assert.equal(done.item.type, finalCall.type);
+    assert.equal(added.item.call_id, finalCall.call_id);
+    assert.equal(done.item.call_id, finalCall.call_id);
+    assert.equal(added.item.name, finalCall.name);
+    assert.equal(done.item.name, finalCall.name);
+    assert.deepEqual(done.item, finalCall);
+  }
+
+  const functionCall = finalCalls.find((item) => item.type === 'function_call');
+  const functionDone = events.find((event) => (
+    event.type === 'response.function_call_arguments.done'
+    && event.item_id === functionCall.id
+  ));
+  assert.equal(functionDone.arguments, functionCall.arguments);
+
+  const customCall = finalCalls.find((item) => item.type === 'custom_tool_call');
+  const customDone = events.find((event) => (
+    event.type === 'response.custom_tool_call_input.done'
+    && event.item_id === customCall.id
+  ));
+  assert.equal(customDone.input, customCall.input);
 });
 
 test('Responses SSE 仅在上游后续静默时仍发送增量正文，最终不重复 delta', async (t) => {

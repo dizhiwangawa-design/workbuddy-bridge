@@ -436,6 +436,64 @@ test('WEB_SOCKET Ping/Pong 发现 TCP 假死并释放租约', async (t) => {
   assert.equal(requestCount, 1);
 });
 
+test('WEB_SOCKET 普通业务消息不能替代 Pong', async (t) => {
+  let requestCount = 0;
+  let upstreamClosed = false;
+  const { bridge, account } = await fixture(t, (_req, res) => {
+    requestCount += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.flushHeaders();
+    res.once('close', () => {
+      upstreamClosed = true;
+    });
+  }, {
+    apiDeps: {
+      wsRequirePong: true,
+      wsPingMs: 40,
+      wsPongGraceMs: 120,
+    },
+  });
+  const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}/v1/responses`, {
+    autoPong: false,
+  });
+  let businessMessages = 0;
+  ws.on('ping', () => {
+    businessMessages += 1;
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'client.activity',
+        sequence: businessMessages,
+      }));
+    }
+  });
+  await once(ws, 'open');
+  ws.send(JSON.stringify({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'business messages are not pong',
+  }));
+  await waitFor(() => inflight(account) === 1);
+
+  let closeTimer;
+  const [code, reason] = await Promise.race([
+    once(ws, 'close'),
+    new Promise((_, reject) => {
+      closeTimer = setTimeout(
+        () => reject(new Error('business messages incorrectly kept the websocket alive')),
+        2000,
+      );
+      closeTimer.unref?.();
+    }),
+  ]).finally(() => clearTimeout(closeTimer));
+
+  assert.equal(code, 1011);
+  assert.match(reason.toString(), /heartbeat timeout/);
+  assert.ok(businessMessages > 0);
+  assert.equal(requestCount, 1);
+  await waitFor(() => inflight(account) === 0);
+  await waitFor(() => upstreamClosed);
+});
+
 test('WEB_SOCKET 正常 Pong 不会在后续静默周期误报心跳超时', async (t) => {
   const { bridge, account } = await fixture(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -550,6 +608,39 @@ test('WEB_SOCKET 原生流发送生命周期事件与实时正文增量', async 
     events.map((event) => event.data.sequence_number),
     events.map((_, index) => index),
   );
+  ws.close(1000, 'done');
+  await once(ws, 'close');
+});
+
+test('WEB_SOCKET 关闭持久化时仍可无状态完成且不写响应库', async (t) => {
+  const { bridge, store, account } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'stateless websocket' } }],
+    }) + encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+    }) + 'data: [DONE]\n\n');
+  }, {
+    config: { responsesPersistence: false },
+  });
+  const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}/v1/responses`);
+  const events = [];
+  ws.on('message', (raw) => events.push(JSON.parse(raw.toString())));
+  await once(ws, 'open');
+  ws.send(JSON.stringify({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'stateless over websocket',
+  }));
+  await waitFor(() => events.some((event) => event.type === 'response.completed'), 3000);
+  const completed = events.find((event) => event.type === 'response.completed');
+  assert.equal(completed.data.response.status, 'completed');
+  assert.equal(
+    completed.data.response.output[0].content[0].text,
+    'stateless websocket',
+  );
+  await waitFor(() => inflight(account) === 0);
+  assert.deepEqual(store.memoryView(), []);
   ws.close(1000, 'done');
   await once(ws, 'close');
 });

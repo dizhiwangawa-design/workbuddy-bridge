@@ -385,6 +385,62 @@ test('Responses SQLite 精确保留 256 条且内存历史最多 64 条', async 
   }
 });
 
+test('Responses SQLite 按 32 MiB 上限淘汰最旧记录', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-responses-size-'));
+  const first = createResponsesStore({ directory });
+  assert.equal((await first.save({
+    id: 'resp_size_seed',
+    status: 'completed',
+    body: { id: 'resp_size_seed', status: 'completed', output: [] },
+  })).ok, true);
+  await first.close();
+
+  const database = new DatabaseSync(path.join(directory, 'responses.sqlite'));
+  try {
+    const insert = database.prepare(`
+      INSERT INTO responses(id, created_at, bytes, status, body_json)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    for (let index = 0; index < 5; index += 1) {
+      insert.run(
+        `resp_size_${index}`,
+        Date.now() + index,
+        7 * 1024 * 1024,
+        'completed',
+        '{}',
+      );
+    }
+  } finally {
+    database.close();
+  }
+
+  const second = createResponsesStore({ directory });
+  try {
+    assert.equal((await second.save({
+      id: 'resp_size_new',
+      status: 'completed',
+      body: { id: 'resp_size_new', status: 'completed', output: [] },
+    })).ok, true);
+  } finally {
+    await second.close();
+  }
+
+  const check = new DatabaseSync(path.join(directory, 'responses.sqlite'), { readOnly: true });
+  try {
+    const totals = check.prepare(
+      'SELECT COUNT(*) AS count, COALESCE(SUM(bytes), 0) AS bytes FROM responses',
+    ).get();
+    assert.equal(totals.count, 5);
+    assert.ok(totals.bytes <= 32 * 1024 * 1024);
+    assert.equal(
+      check.prepare('SELECT COUNT(*) AS count FROM responses WHERE id = ?').get('resp_size_0').count,
+      0,
+    );
+  } finally {
+    check.close();
+  }
+});
+
 test('SQLite 同步停顿不阻塞主线程，超时后可重启 worker 保存', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-responses-timeout-'));
   const store = createResponsesStore({

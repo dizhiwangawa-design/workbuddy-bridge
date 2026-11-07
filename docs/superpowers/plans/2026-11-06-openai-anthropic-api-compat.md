@@ -3029,5 +3029,27 @@ Expected:
   5 秒内归零；`default` 使用 `deepseek-v4.1-flash` 通过。
 - [x] 将上游 429 冷却绑定到失败模型，同账号显式请求其他模型仍可调度；
   保持默认模型不变且不自动换模型，旧版账号级冷却继续按全模型冷却迁移。
+- [x] 修复 Codex CLI 基础系统提示触发的上游渠道校验：只替换已知签名句，
+  保留其余系统指令，不修改普通用户消息。
+- [x] 修复 Responses 流式工具生命周期事件：`output_item.added`/`done` 使用合法的
+  `function_call`/`custom_tool_call` 结构，参数与 `call_id` 完整，并与
+  `response.completed.output` 使用同一 item 身份。
+- [x] 新增 `test/live/codex-client-smoke.mjs` 与 `npm run test:live:codex`：
+  Codex CLI 0.160.0 在隔离临时环境中通过 Responses HTTP 完成多步工具循环，
+  创建 `calc.mjs`、`test.mjs`、`README.md`，执行测试通过，多轮请求全部记账且
+  `inflight=0`。真实 Codex 客户端不发起 WS 首试，HTTP 路径已验证。
 - [ ] 在 `deepseek-v4.1-flash` 配额重置后，用 `test:live:account` 对
   `awa` 和 `codex-fresh-mvxgctfk` 各完成一次通过。该步骤只能等待外部配额恢复。
+
+**2026-11-07 CI 稳定版执行记录:**
+
+- 聚焦回归通过：`disconnect-resilience` 15/15、`stream-control` 25/25、
+  `anthropic-http` 33/33、`responses` 37/37、`failover` 11/11、
+  `upstream` 9/9。
+- 全量 `npm test` 通过：基础 55/55，API 222/222，合计 277/277。
+- 已覆盖本次新增证据：WS 关闭 Responses 持久化后仍可无状态完成、普通业务消息
+  不能冒充 Pong、三协议模型级 429 隔离、Responses SQLite 32 MiB 淘汰、Codex
+  Responses 工具循环、系统签名替换不污染用户原文。
+- 按用户要求不执行手机端验收；管理页只保留既有的桌面浏览器复验结论。
+- 版本保持 `0.4.0`，不 tag、不 push；未读取、打印或提交 access token、
+  refresh token 或完整客户端 Key。

@@ -772,6 +772,7 @@ npm run test:live:openai
 node test/live/openai-live.mjs --thinking
 node test/live/openai-live.mjs --tools
 npm run test:live:responses
+npm run test:live:codex
 WB_LIVE_ACCOUNT=default npm run test:live:account
 ```
 
@@ -782,6 +783,11 @@ Responses HTTP/SSE/WS、多步工具、取消持久化、断连和慢读；CLI �
 API 路径。`test:live:responses` 使用临时响应库并在结束后无条件恢复号池开关与
 API 设置，验证 Responses HTTP、SSE、原生 WS 和 `previous_response_id` 续接；
 默认使用 `default` 号，可用 `WB_LIVE_ACCOUNT`、`WB_LIVE_MODEL` 覆盖。
+`test:live:codex` 在隔离临时 `CODEX_HOME` 中调用本机 Codex CLI，通过 Responses
+HTTP 完成一个多步编码任务：创建模块与测试、执行测试并生成 README。脚本会校验
+生成文件、测试退出码、工具事件身份与号池租约归零；它复制桥接状态到临时目录并在
+结束后删除，不读取现有 Codex 登录凭据。Codex 请求禁用其自带 web search，因为
+Responses 兼容层只接受已声明的 function/custom/namespace/shell/apply_patch 工具。
 `test:live:account` 固定只启用目标账号，依次验证 Chat 非流式、流式、
 `tool_calls` / `tool` 续轮、真实客户端中断、取消片段持久化、租约 5 秒内归零；
 成功时输出脱敏 JSON。上游 429 时以退出码 `2` 返回 `blocked:true`，不会打印

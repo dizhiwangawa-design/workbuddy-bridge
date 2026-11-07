@@ -237,7 +237,7 @@ test('模型级 429 不会阻断同一账号的其他模型', async (t) => {
     await limited.text();
 
     const fallback = await chatRequest(baseUrl, {
-      model: 'deepseek-v4-flash',
+      model: 'fixture-model-b',
     });
     assert.equal(fallback.status, 200);
     const body = await fallback.json();
@@ -246,7 +246,7 @@ test('模型级 429 不会阻断同一账号的其他模型', async (t) => {
 
   assert.deepEqual(
     upstream.calls.map((call) => call.body.model),
-    ['deepseek-v4.1-flash', 'deepseek-v4-flash'],
+    ['deepseek-v4.1-flash', 'fixture-model-b'],
   );
   const entry = row('model-scope-a');
   assert.equal(entry.inflight, 0);

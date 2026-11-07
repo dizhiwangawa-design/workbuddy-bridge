@@ -865,11 +865,21 @@ export function responseEvents({
       item,
     });
   }
-  for (const [offset, item] of calls.entries()) {
-    const outputIndex = offset + (reasoning ? 1 : 0) + (content || !calls.length ? 1 : 0);
+  const completedCalls = output
+    .filter((item) => ['function_call', 'custom_tool_call'].includes(item.type))
+    .slice(-calls.length);
+  const callItems = completedCalls.length === calls.length
+    ? completedCalls
+    : responseCallItems(calls, registry);
+  for (const [offset, item] of callItems.entries()) {
+    const outputIndex = output.indexOf(item) >= 0
+      ? output.indexOf(item)
+      : offset + (reasoning ? 1 : 0) + (content || !calls.length ? 1 : 0);
     push('response.output_item.added', {
       output_index: outputIndex,
-      item: { ...item, status: 'in_progress' },
+      item: item.type === 'custom_tool_call'
+        ? { ...item, status: 'in_progress', input: '' }
+        : { ...item, status: 'in_progress', arguments: '' },
     });
     if (item.type === 'custom_tool_call') {
       push('response.custom_tool_call_input.delta', {

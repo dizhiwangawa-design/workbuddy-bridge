@@ -102,6 +102,51 @@ test('developer 折叠为 system，并替换已知通道签名', () => {
   assert.equal(result.scrubbedStrings, 1);
 });
 
+test('Codex 基础系统提示移除上游会拒绝的通道签名', () => {
+  const input = {
+    messages: [
+      {
+        role: 'system',
+        content: [
+          'You are a coding agent running in the Codex CLI, a terminal-based coding assistant.',
+          'Codex CLI is an open source project led by OpenAI.',
+          'You are expected to be precise, safe, and helpful.',
+        ].join(' '),
+      },
+    ],
+  };
+  const before = structuredClone(input);
+  const result = sanitizeChatBody(input);
+
+  assert.equal(
+    result.body.messages[0].content,
+    [
+      'You are a coding agent running in the Codex CLI, a terminal-based coding assistant.',
+      'Codex CLI is an open source coding interface.',
+      'You are expected to be precise, safe, and helpful.',
+    ].join(' '),
+  );
+  assert.equal(result.scrubbedStrings, 1);
+  assert.deepEqual(input, before);
+});
+
+test('通道签名替换不会修改用户原文', () => {
+  const content = 'Quote this exactly: Codex CLI is an open source project led by OpenAI.';
+  const input = {
+    messages: [
+      { role: 'user', content },
+      { role: 'assistant', content },
+    ],
+  };
+  const before = structuredClone(input);
+  const result = sanitizeChatBody(input);
+
+  assert.equal(result.body.messages[0].content, content);
+  assert.equal(result.body.messages[1].content, content);
+  assert.equal(result.scrubbedStrings, 0);
+  assert.deepEqual(input, before);
+});
+
 test('普通消息逐字保留且不修改调用方对象', () => {
   const input = {
     messages: [

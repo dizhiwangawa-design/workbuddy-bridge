@@ -432,6 +432,57 @@ test('发出 message_start 前的 429 会使首号冷却并自动切换下一账
   assert.equal(rows.find((item) => item.name === 'fail-b').inflight, 0);
 });
 
+test('模型级 429 不会阻断 Anthropic 同账号的其他模型', async (t) => {
+  const seenModels = [];
+  const account = 'model-scope-anthropic';
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    const body = JSON.parse(raw || '{}');
+    seenModels.push(body.model);
+    if (body.model === 'deepseek-v4.1-flash') {
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end('{"error":{"message":"model quota exceeded"}}');
+      return;
+    }
+    sendJson(res, {
+      choices: [{ delta: { content: 'anthropic fallback model ok' }, finish_reason: 'stop' }],
+    });
+  }, {
+    accountNames: [account],
+  });
+
+  const limited = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'limited model' }],
+    }),
+  });
+  assert.equal(limited.status, 429);
+  await limited.text();
+
+  const fallback = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'fixture-model-b',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'fallback model' }],
+    }),
+  });
+  assert.equal(fallback.status, 200);
+  const body = await fallback.json();
+  assert.equal(body.content[0].text, 'anthropic fallback model ok');
+
+  assert.deepEqual(seenModels, ['deepseek-v4.1-flash', 'fixture-model-b']);
+  const row = pool.poolView().accounts.find((item) => item.name === account);
+  assert.equal(row.inflight, 0);
+  assert.deepEqual(row.cooldownModels, ['deepseek-v4.1-flash']);
+});
+
 test('上游 401 会刷新 Token、0600 回写凭据后重试同一请求', async (t) => {
   let refreshed = false;
   let chatCalls = 0;

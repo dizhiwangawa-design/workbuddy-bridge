@@ -10,6 +10,10 @@ const SIGNATURES = [
   ['You are an AI agent powered by DeepSeek Harness.', 'You are an AI coding agent.'],
   ['Tokens prefixed with @ are paths the user explicitly referenced.', 'Paths may begin with @ when the user references them.'],
   ['DeepSeek Harness Web GUI', 'Web GUI'],
+  [
+    'Codex CLI is an open source project led by OpenAI.',
+    'Codex CLI is an open source coding interface.',
+  ],
 ];
 
 function escapeRegExp(value) {
@@ -58,7 +62,7 @@ export function sanitizeChatBody(input) {
       message.role = 'system';
       developerRoles += 1;
     }
-    if (message?.content !== undefined) {
+    if (message?.role === 'system' && message?.content !== undefined) {
       const next = scrubValue(message.content);
       message.content = next.value;
       if (next.changed) scrubbedStrings += 1;
