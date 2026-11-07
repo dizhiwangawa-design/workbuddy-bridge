@@ -661,7 +661,7 @@ export function createResponsesStreamEncoder({ response }) {
   let messageItem = null;
   let reasoningText = '';
   let outputText = '';
-  let outputIndex = 0;
+  let outputIndex = Array.isArray(response.output) ? response.output.length : 0;
   const output = [];
   const event = (type, data) => ({
     type,

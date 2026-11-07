@@ -445,6 +445,45 @@ test('Responses 持久化支持续接、GET 查询和取消片段查询', async 
   assert.ok(upstreamBodies[1].messages.some((item) => item.role === 'assistant'));
 });
 
+test('Responses 续接 SSE 使用当前 item ID 与 prior 之后的 output_index', async (t) => {
+  let requestCount = 0;
+  const { baseUrl } = await fixture(t, async (_req, res) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      upstream(res, 'first answer');
+      return;
+    }
+    upstream(res, [{ content: 'continued answer' }]);
+  });
+  const first = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', input: 'first', store: true }),
+  });
+  const initial = await first.json();
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'continue',
+      previous_response_id: initial.id,
+      store: true,
+      stream: true,
+    }),
+  });
+  const events = parseSse(await response.text());
+  const textDone = events.find((event) => event.type === 'response.output_text.done');
+  const itemDone = events.find((event) => event.type === 'response.output_item.done'
+    && event.item?.type === 'message');
+  const terminal = events.find((event) => event.type === 'response.completed');
+  assert.equal(textDone.output_index, 1);
+  assert.equal(itemDone.output_index, 1);
+  assert.notEqual(textDone.item_id, initial.output[0].id);
+  assert.equal(itemDone.item.id, textDone.item_id);
+  assert.equal(terminal.response.output[1].id, textDone.item_id);
+});
+
 test('Responses 取消片段可通过 HTTP GET 查询并用于续接', async (t) => {
   let requestCount = 0;
   const upstreamBodies = [];

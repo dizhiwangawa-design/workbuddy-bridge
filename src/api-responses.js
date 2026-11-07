@@ -364,9 +364,13 @@ export function createResponsesRuntime(options = {}) {
     }
 
     function protocolEvents(finalBody, retainItemIdentity = true) {
-      const message = finalBody.output.find((item) => item.type === 'message');
-      const reasoning = finalBody.output.find((item) => item.type === 'reasoning');
-      const callOutputs = finalBody.output.filter((item) => (
+      // Continuations include prior output in the response body. Protocol
+      // events describe only the current turn; IDs, indexes and item payloads
+      // must therefore come from output after the resumed prefix.
+      const currentOutput = finalBody.output.slice(prior.length);
+      const message = currentOutput.find((item) => item.type === 'message');
+      const reasoning = currentOutput.find((item) => item.type === 'reasoning');
+      const callOutputs = currentOutput.filter((item) => (
         item.type !== 'message' && item.type !== 'reasoning'
       ));
       const calls = callOutputs.map((item) => {
@@ -389,7 +393,10 @@ export function createResponsesRuntime(options = {}) {
         }];
       }));
       const events = responseEvents({
-        response: finalBody,
+        // Build events against this turn's output only. prior items remain in
+        // finalBody.output and are included in the terminal response, but they
+        // must never be selected as the identity/index of a resumed delta.
+        response: { ...finalBody, output: currentOutput },
         reasoning: reasoning?.summary?.map((part) => part.text).join('') || '',
         content: message?.content?.map((part) => part.text).join('') || '',
         calls,
@@ -402,6 +409,9 @@ export function createResponsesRuntime(options = {}) {
       });
       for (const item of events.slice(2)) {
         if (item.data.response) item.data.response = finalBody;
+        if (typeof item.data.output_index === 'number') {
+          item.data.output_index += prior.length;
+        }
         if (item.data.item && retainItemIdentity) {
           const finalItem = finalBody.output[item.data.output_index];
           if (finalItem) item.data.item = finalItem;
