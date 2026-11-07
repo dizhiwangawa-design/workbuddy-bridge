@@ -2917,8 +2917,8 @@ Expected:
   新数据；健康慢读和 256 KiB 软阈值记录仍保留。
 - [x] 慢读压测必须证明上游在 1 MiB 量级被取消、租约归零、审计为
   `BACKPRESSURE_OVERFLOW`、子进程峰值 RSS 小于 160 MiB、子进程确定性退出。
-  测试子进程显式设置 `--max-semi-space-size=8`；Node 24 默认会按宿主资源预留较大
-  young generation，该测试参数不改生产运行时。
+  测试子进程显式设置 `--max-semi-space-size=4 --max-old-space-size=64`；Node 24
+  默认会按宿主资源预留较大堆，该测试参数不改生产运行时。
 - [x] 新增 WS 无 Key/错误 Key 的 401 测试。
 
 **验收:**

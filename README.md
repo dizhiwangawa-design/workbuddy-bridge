@@ -690,8 +690,9 @@ npm run test:live
 npm run test:load
 ```
 
-该命令测量 `VmRSS`、heap、external、writer 峰值 pending 字节、上游是否被取消和租约
-是否归零；子进程使用有界 V8 semi-space，硬阈值触发后必须确定退出。
+该命令测量匿名 RSS、进程峰值 RSS、heap、external、writer 峰值 pending 字节、
+上游是否被取消和租约是否归零；子进程使用有界 V8 old generation 与 semi-space，
+硬阈值触发后必须确定退出。
 
 也可以让脚本连接已经运行的 bridge：
 
