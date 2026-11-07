@@ -1700,3 +1700,63 @@ test('结构化调用全无效但文本中含完整 DSML 时使用 DSML fallback
     'tool_use',
   );
 });
+
+test('Anthropic 租约释放保留客户端 Key 归因', async () => {
+  const { createAnthropicRuntime } = await import('../../src/api-runtime.js');
+  const released = [];
+  const runtime = createAnthropicRuntime({
+    pick: () => ({ name: 'attributed-anthropic' }),
+    begin: () => {},
+    end: (account, result) => released.push({ account, result }),
+    readCredentials: () => ({
+      ok: true,
+      accessToken: 'test-access',
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    }),
+    upstreamClient: {
+      chat: async () => ({
+        status: 200,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+              + '"usage":{"prompt_tokens":4,"completion_tokens":1}}\n\n'
+              + 'data: [DONE]\n\n',
+            ));
+            controller.close();
+          },
+        }),
+      }),
+    },
+  });
+  const res = {
+    headersSent: false,
+    writable: true,
+    writableEnded: false,
+    destroyed: false,
+    writeHead() { this.headersSent = true; },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+
+  const result = await runtime.messages({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'attribute this' }],
+    },
+    config: settings.getApiSettings(),
+    clientKey: { id: 'key-anthropic', name: 'laptop' },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(released.length, 1);
+  assert.equal(released[0].result.meta.apiProtocol, 'anthropic');
+  assert.equal(released[0].result.meta.clientKeyId, 'key-anthropic');
+  assert.equal(released[0].result.meta.clientKeyName, 'laptop');
+});

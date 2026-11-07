@@ -13,7 +13,7 @@ process.env.WB_ADMIN_TOKEN = 'admin-fixture';
 const settings = await import('../../src/api-settings.js');
 const paths = await import('../../src/paths.js');
 const { startHttpServer } = await import('../../src/http.js');
-const { clientKeyRequired } = await import('../../src/api-server.js');
+const { clientKeyRequired, createApiAuthCheck } = await import('../../src/api-server.js');
 
 async function withServer(fn) {
   const server = await startHttpServer({ port: 0, host: '127.0.0.1' });
@@ -118,6 +118,40 @@ test('API Key 只返回一次明文，配置只保存摘要', () => {
   const publicSettings = settings.publicApiSettings();
   assert.equal(JSON.stringify(publicSettings).includes('"hash"'), false);
   assert.equal(publicSettings.clientKeyConfigured, true);
+});
+
+test('新 Key 会获得唯一名称并能解析出脱敏身份', () => {
+  settings.resetApiKey('dashboard');
+  const second = settings.createApiKey('dashboard');
+  const unnamed = settings.createApiKey();
+  const custom = settings.createApiKey('my-codex');
+
+  assert.equal(second.record.name, 'dashboard-2');
+  assert.equal(unnamed.record.name, 'dashboard-3');
+  assert.equal(custom.record.name, 'my-codex');
+  const identity = settings.resolveApiKey(second.key);
+  assert.equal(identity.id, second.record.id);
+  assert.equal(identity.name, 'dashboard-2');
+  assert.equal(identity.hash, undefined);
+  assert.equal(settings.resolveApiKey('sk-wb_invalid'), null);
+});
+
+test('认证结果携带当前 Key 身份，无 Key 请求保持匿名', () => {
+  const created = settings.createApiKey('auth-attribution');
+  settings.updateApiSettings({ enabled: true, openai: true });
+  const check = createApiAuthCheck({ responsesRuntime: {} });
+
+  const keyed = check({
+    headers: { authorization: `Bearer ${created.key}` },
+    remoteAddress: '127.0.0.1',
+  });
+  assert.equal(keyed.ok, true);
+  assert.equal(keyed.clientKey.id, created.record.id);
+  assert.equal(keyed.clientKey.name, 'auth-attribution');
+
+  const anonymous = check({ headers: {}, remoteAddress: '127.0.0.1' });
+  assert.equal(anonymous.ok, true);
+  assert.equal(anonymous.clientKey, null);
 });
 
 test('重置客户端 Key 会撤销全部旧 Key 并只保留一份新摘要', () => {

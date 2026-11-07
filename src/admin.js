@@ -221,7 +221,8 @@ export function adminPage({ home = '', token = '' } = {}) {
 
   /* ------------------------------------------------------------ API 兼容 */
   .api-section{margin:12px 0;padding-bottom:14px;overflow:hidden}
-  .api-grid{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(0,.92fr);gap:12px;padding:0 14px}
+  .api-grid{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(0,.92fr);gap:12px;padding:0 14px;
+            align-items:start}
   .api-card{border:1px solid var(--line);border-radius:12px;padding:13px;background:var(--soft);min-width:0}
   .api-card-head{display:flex;align-items:center;gap:9px}
   .api-icon{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;flex:none;
@@ -234,7 +235,15 @@ export function adminPage({ home = '', token = '' } = {}) {
   .api-endpoint{display:flex;align-items:center;gap:7px;margin-top:12px;padding:8px 9px;border-radius:8px;
                 background:var(--card);border:1px solid var(--line);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
                 font-size:10.5px;min-width:0}
-  .api-endpoint code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .api-endpoints{display:grid;gap:7px;margin-top:12px}
+  .api-endpoints .api-endpoint{margin-top:0}
+  .api-endpoint-tag{font-family:ui-sans-serif,-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+                    color:var(--brand);background:var(--soft);border:1px solid var(--line);border-radius:5px;
+                    padding:1px 5px;font-size:9.5px;font-weight:650;flex:none}
+  .api-endpoint-copy{min-width:0;flex:1}
+  .api-endpoint-copy code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .api-endpoint-copy small{display:block;margin-top:2px;color:var(--muted);font-family:ui-sans-serif,-apple-system,
+                           "PingFang SC","Microsoft YaHei",system-ui,sans-serif;font-size:9.5px;font-variant-numeric:tabular-nums}
   .api-meta{display:flex;gap:14px;flex-wrap:wrap;margin-top:9px;font-size:10.5px;color:var(--sub)}
   .api-meta b{color:var(--fg);font-weight:600}
   .api-option{display:flex;align-items:center;gap:10px;margin-top:9px;padding-top:9px;border-top:1px dashed var(--line)}
@@ -262,6 +271,12 @@ export function adminPage({ home = '', token = '' } = {}) {
   .key-main{min-width:0;flex:1}
   .key-name{font-size:11.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .key-time{font-size:9.5px;color:var(--muted);margin-top:1px}
+  .key-usage{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-top:7px}
+  .key-usage-item{min-width:0;padding:5px 6px;border:1px solid var(--line);border-radius:7px;background:var(--card)}
+  .key-usage-item b{display:block;font-size:9.5px;color:var(--sub);font-weight:600;white-space:nowrap;
+                    overflow:hidden;text-overflow:ellipsis}
+  .key-usage-item span{display:block;margin-top:1px;font-size:9.5px;color:var(--muted);white-space:nowrap;
+                       overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
   .key-empty{padding:12px 2px;font-size:10.5px;color:var(--muted);line-height:1.6}
   .api-actions{display:flex;align-items:center;gap:7px;margin-top:8px}
   .api-actions .grow{flex:1}
@@ -271,6 +286,10 @@ export function adminPage({ home = '', token = '' } = {}) {
                      padding:0 10px;cursor:pointer;font-size:11px}
   .key-warning{margin-top:9px!important;padding:8px 9px;border-radius:8px;color:var(--warn)!important;
                background:color-mix(in srgb,var(--warn) 10%,transparent);font-size:10.5px!important}
+  .modal code{padding:1px 4px;border-radius:4px;background:color-mix(in srgb,var(--fg) 7%,transparent);
+              font-size:10.5px;overflow-wrap:anywhere}
+  .key-generated-name{margin:-4px 0 12px;color:var(--muted);font-size:10.5px}
+  .key-generated-name b{color:var(--fg);font-weight:600}
 
   /* ------------------------------------------------------------ 热力图 */
   .heat-panel{margin-top:12px;padding-bottom:12px}
@@ -315,7 +334,7 @@ export function adminPage({ home = '', token = '' } = {}) {
   .modal input:focus{border-color:var(--brand)}
   .modal .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   .modal .row button{border:1px solid var(--line);background:var(--card);border-radius:8px;padding:6px 13px;cursor:pointer;font-size:12.5px}
-  .modal .row button.primary{border-color:var(--brand)}
+  .modal .row button.primary{background:var(--brand);border-color:var(--brand);color:#fff}
   .qrbox{margin-top:12px;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:#fff}
   .qrbox iframe{width:100%;height:min(500px,62vh);border:0;display:block}
   .toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,14px);opacity:0;pointer-events:none;
@@ -328,6 +347,9 @@ export function adminPage({ home = '', token = '' } = {}) {
     .kpis{grid-template-columns:repeat(3,minmax(0,1fr))}
     .panels{grid-template-columns:minmax(0,1fr)}
     .feed{max-height:260px}
+  }
+  @media(max-width:900px){
+    .api-grid{grid-template-columns:minmax(0,1fr);padding:0 11px}
   }
   @media(max-width:720px){
     .wrap{padding:16px 13px 44px}
@@ -344,7 +366,6 @@ export function adminPage({ home = '', token = '' } = {}) {
     .heat-inner{gap:14px}
     .heat-stats{grid-template-columns:repeat(2,1fr);gap:10px 24px}
     .feed-row .mdl{max-width:36%}
-    .api-grid{grid-template-columns:minmax(0,1fr);padding:0 11px}
     .api-config-grid,.api-fields{grid-template-columns:minmax(0,1fr)}
     .api-field.wide{grid-column:auto}
   }
@@ -449,8 +470,12 @@ export function adminPage({ home = '', token = '' } = {}) {
           <button class="switch" id="api-switch" role="switch" aria-checked="false" data-act="api-toggle" title="启用/停用 Anthropic API"></button>
         </div>
         <div class="api-endpoint">
-          <code id="api-endpoint"></code>
-          <button class="mini" data-act="api-copy-endpoint" title="复制接口地址">复制</button>
+          <span class="api-endpoint-tag">Messages</span>
+          <div class="api-endpoint-copy">
+            <code id="api-endpoint"></code>
+            <small id="api-usage">当前区间 · 0 次 · 0 tok</small>
+          </div>
+          <button class="mini" id="api-copy-endpoint" data-act="api-copy-endpoint" title="复制 Anthropic 接口地址">复制</button>
         </div>
         <div class="api-meta" id="api-meta"></div>
       </div>
@@ -496,7 +521,7 @@ export function adminPage({ home = '', token = '' } = {}) {
           <div class="api-icon">#</div>
           <div class="api-copy">
             <div class="api-name">客户端密钥</div>
-            <div class="api-desc">仅保存 SHA-256 摘要，明文只显示一次</div>
+            <div class="api-desc">Anthropic / OpenAI 共用；回环地址免 Key；仅保存摘要</div>
           </div>
           <button class="mini danger" data-act="api-key-reset">重置全部</button>
           <button class="ghost" data-act="api-key-create">生成新 Key</button>
@@ -513,9 +538,15 @@ export function adminPage({ home = '', token = '' } = {}) {
           <span class="api-state" id="api-openai-state">关闭</span>
           <button class="switch" id="api-openai-switch" role="switch" aria-checked="false" data-act="api-openai-toggle" title="启用/停用 OpenAI API"></button>
         </div>
-        <div class="api-endpoint">
-          <code id="api-openai-endpoint"></code>
-          <button class="mini" data-act="api-copy-openai-endpoint" title="复制 OpenAI 接口地址">复制</button>
+        <div class="api-endpoints" id="api-openai-endpoints">
+          <div class="api-endpoint">
+            <span class="api-endpoint-tag">Chat</span>
+            <div class="api-endpoint-copy">
+              <code id="api-openai-endpoint"></code>
+              <small>当前区间 · 0 次 · 0 tok</small>
+            </div>
+            <button class="mini" data-act="api-copy-openai-endpoint" title="复制 OpenAI Chat 接口地址">复制</button>
+          </div>
         </div>
         <div class="api-meta" id="api-openai-meta"></div>
         <div class="api-option">
@@ -891,7 +922,7 @@ function card(a){
           '<div class="qline sub2"><span>未设每日预算</span><span>'+a.today.req+' 次</span></div>';
   }
   var cdModels=(a.cooldownModels||[]).filter(Boolean).map(function(m){return m==='*'?'全部模型':m;}).join(', ');
-  var cd=a.cooldownLeftMs>0?'<div class="cd" data-until="'+(Date.now()+a.cooldownLeftMs)+'">冷却剩余 '+Math.ceil(a.cooldownLeftMs/1000)+'s'+(cdModels?' · '+esc(cdModels):'')+'</div>':'';
+  var cd=a.cooldownLeftMs>0?'<div class="cd" data-until="'+(Date.now()+a.cooldownLeftMs)+'">冷却剩余 '+Math.ceil(a.cooldownLeftMs/1000)+'s'+(cdModels?' · '+h(cdModels):'')+'</div>':'';
   var err=a.lastError?'<div class="err">'+String(a.lastError).replace(/</g,'&lt;')+'</div>':'';
   var sub=a.lastUsedAt?ago(a.lastUsedAt):a.auth;
   var cacheRate=a.today.cacheHitRate;
@@ -901,7 +932,7 @@ function card(a){
       '<div class="avatar">'+initials(a.name)+'</div>'+
       '<div class="who"><div class="name">'+a.name+
         (a.isDefault?' <span class="tag">默认</span>':'')+
-        (a.model?' <span class="tag">'+esc(a.model)+'</span>':'')+
+        (a.model?' <span class="tag">'+h(a.model)+'</span>':'')+
       '</div><div class="meta">'+sub+'</div></div>'+
       pill(a)+
       '<button class="switch" role="switch" aria-checked="'+(a.enabled?'true':'false')+'" data-act="toggle" data-name="'+a.name+'" title="启用/停用"></button>'+
@@ -958,19 +989,66 @@ function renderPool(){
 }
 
 /* ------------------------------------------------------------ API 兼容 */
+function defaultKeyName(keys, base){
+  base=String(base||'dashboard').trim().slice(0,40)||'dashboard';
+  var used=Object.create(null);
+  (keys||[]).forEach(function(k){ used[String(k&&k.name||'')]=true });
+  if(!used[base]) return base;
+  var n=2;
+  while(used[base+'-'+n]) n++;
+  return base+'-'+n;
+}
+
+function usageLine(usage){
+  return int(usage&&usage.req)+' 次 · '+num(usage&&usage.tokens)+' tok';
+}
+
+function keyUsageHtml(apis){
+  apis=apis||{};
+  var rows=[
+    {label:'Anthropic',usage:apis.anthropic},
+    {label:'Chat',usage:apis.openai_chat},
+    {label:'Responses',usage:apis.openai_responses}
+  ];
+  return '<div class="key-usage">'+rows.map(function(row){
+    return '<div class="key-usage-item"><b>'+row.label+'</b><span>'+usageLine(row.usage)+'</span></div>';
+  }).join('')+'</div>';
+}
+
+function openAiEndpointRows(origin, byApi){
+  byApi=byApi||{};
+  var rows=[
+    {label:'Chat',path:'/v1/chat/completions',usage:byApi.openai_chat},
+    {label:'Responses',path:'/v1/responses',usage:byApi.openai_responses}
+  ];
+  return rows.map(function(row){
+    var url=origin+row.path;
+    return '<div class="api-endpoint">'+
+      '<span class="api-endpoint-tag">'+row.label+'</span>'+
+      '<div class="api-endpoint-copy"><code>'+h(url)+'</code>'+
+        '<small>当前区间 · '+usageLine(row.usage)+'</small></div>'+
+      '<button class="mini" data-act="api-copy-endpoint" data-url="'+h(url)+'" title="复制 OpenAI '+row.label+' 接口地址">复制</button>'+
+    '</div>';
+  }).join('');
+}
+
 function renderApi(){
   var s=state.api;
   if(!s) return;
+  var byApi=state.stats&&state.stats.byApi||{};
   var enabled=!!(s.enabled&&s.anthropicEnabled);
   $('api-state').textContent=enabled?'已启用':'已关闭';
   $('api-state').className='api-state'+(enabled?'':' off');
   $('api-switch').setAttribute('aria-checked',enabled?'true':'false');
-  $('api-endpoint').textContent=location.origin+'/v1/messages';
+  var anthropicEndpoint=location.origin+'/v1/messages';
+  $('api-endpoint').textContent=anthropicEndpoint;
+  $('api-copy-endpoint').setAttribute('data-url',anthropicEndpoint);
+  $('api-usage').textContent='当前区间 · '+usageLine(byApi.anthropic);
   var openaiEnabled=!!(s.enabled&&s.openai);
   $('api-openai-state').textContent=openaiEnabled?'已启用':'已关闭';
   $('api-openai-state').className='api-state'+(openaiEnabled?'':' off');
   $('api-openai-switch').setAttribute('aria-checked',openaiEnabled?'true':'false');
-  $('api-openai-endpoint').textContent=location.origin+'/v1/chat/completions';
+  $('api-openai-endpoints').innerHTML=openAiEndpointRows(location.origin,byApi);
   $('api-openai-meta').innerHTML=
     '<span>Chat <b>SSE / JSON</b></span>'+
     '<span>Responses <b>HTTP / WS</b></span>'+
@@ -1007,9 +1085,12 @@ function renderApi(){
   }
   $('api-keys').innerHTML=keys.map(function(k){
     var when=k.createdAt?new Date(k.createdAt).toLocaleString('zh-CN'):'';
+    var usage=state.stats&&state.stats.byKey&&state.stats.byKey[k.id]||{};
     return '<div class="key-row"><span class="key-dot"></span><div class="key-main">'+
       '<div class="key-name">'+h(k.name||'default')+'</div>'+
-      '<div class="key-time">sk-wb_•••••••• · '+when+'</div></div>'+
+      '<div class="key-time">sk-wb_•••••••• · '+when+'</div>'+
+      keyUsageHtml(usage.apis)+
+      '</div>'+
       '<button class="mini danger" data-act="api-key-delete" data-id="'+k.id+'">删除</button></div>';
   }).join('');
 }
@@ -1175,11 +1256,7 @@ document.addEventListener('click',function(ev){
     });
   }
   if(a==='api-key-create'){
-    el.disabled=true;
-    return api('/api/api-compat/keys',{method:'POST',body:JSON.stringify({name:'dashboard'})})
-      .then(function(j){ return load().then(function(){ openApiKey(j.key) }) })
-      .catch(function(e){ toast(e.message,true) })
-      .then(function(){ el.disabled=false });
+    return openCreateApiKey();
   }
   if(a==='api-key-reset'){
     if(!confirm('重置全部客户端 Key？现有客户端会立即无法访问 API。')) return;
@@ -1197,8 +1274,12 @@ document.addEventListener('click',function(ev){
         .then(function(){toast('客户端 Key 已删除')});
     });
   }
-  if(a==='api-copy-endpoint') return copyText(location.origin+'/v1/messages','接口地址已复制');
-  if(a==='api-copy-openai-endpoint') return copyText(location.origin+'/v1/chat/completions','OpenAI 接口地址已复制');
+  if(a==='api-copy-endpoint'){
+    return copyText(el.getAttribute('data-url')||location.origin+'/v1/messages','接口地址已复制');
+  }
+  if(a==='api-copy-openai-endpoint'){
+    return copyText(location.origin+'/v1/chat/completions','OpenAI Chat 接口地址已复制');
+  }
   if(a==='toggle'){
     var cur=el.getAttribute('aria-checked')==='true';
     return act(function(){return api('/api/pool/'+encodeURIComponent(name),{method:'PATCH',body:JSON.stringify({enabled:!cur})})});
@@ -1282,10 +1363,33 @@ function copyText(text,okMessage){
   ok?done():toast('复制失败，请手动选择',true);
 }
 
-function openApiKey(key){
+function openCreateApiKey(){
+  var name=defaultKeyName(state.api&&state.api.keys||[],'dashboard');
+  $('mask').className='mask on';
+  $('modal').innerHTML='<h2>命名客户端 Key</h2>'+
+    '<p>同一个 Key 同时用于 <code>Anthropic Messages</code>、<code>OpenAI Chat</code> 与 <code>OpenAI Responses</code>。本机回环地址可免 Key；远程访问需携带此 Key。</p>'+
+    '<input id="new-key-name" maxlength="40" autocomplete="off" value="'+h(name)+'" placeholder="例如 codex-mac 或 claude-laptop"/>'+
+    '<p class="key-generated-name">重名时服务端会自动追加数字后缀。</p>'+
+    '<div class="row"><button data-x="close">取消</button><button class="primary" id="do-create-key">生成 Key</button></div>';
+  var input=$('new-key-name');
+  input.focus(); input.select();
+  $('modal').querySelector('[data-x=close]').onclick=closeModal;
+  $('do-create-key').onclick=function(){
+    var chosen=(input.value||'').trim();
+    if(!chosen) return toast('请输入 Key 名称',true);
+    this.disabled=true;
+    api('/api/api-compat/keys',{method:'POST',body:JSON.stringify({name:chosen})})
+      .then(function(j){ return load().then(function(){ openApiKey(j.key,j.record&&j.record.name) }) })
+      .catch(function(e){ toast(e.message,true); this.disabled=false }.bind(this));
+  };
+  input.addEventListener('keydown',function(e){ if(e.key==='Enter') $('do-create-key').click() });
+}
+
+function openApiKey(key,name){
   $('mask').className='mask on';
   $('modal').innerHTML='<h2>客户端 Key 已生成</h2>'+
-    '<p>用于 Anthropic SDK 的 <code>apiKey</code> 或 <code>Authorization: Bearer</code>。关闭后将无法再次查看明文。</p>'+
+    (name?'<div class="key-generated-name">名称 · <b>'+h(name)+'</b> · 适用于 Anthropic 与 OpenAI</div>':'')+
+    '<p>同一个 Key 同时用于 Anthropic SDK 的 <code>apiKey</code>，以及 OpenAI Chat / Responses 的 <code>Authorization: Bearer</code>。关闭后将无法再次查看明文。</p>'+
     '<div class="key-secret"><input id="new-api-key" type="password" readonly value="'+String(key).replace(/"/g,'&quot;')+'"/>'+
     '<button id="toggle-api-key">显示</button><button id="copy-api-key">复制</button></div>'+
     '<p class="key-warning">请像密码一样保管。服务端只保留摘要，无法帮你找回这个 Key。</p>'+

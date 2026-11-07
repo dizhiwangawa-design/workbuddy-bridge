@@ -321,6 +321,9 @@ export function endTask(name, result) {
       cacheWrite,
       ms,
       cost,
+      apiProtocol: result?.meta?.apiProtocol || '',
+      clientKeyId: result?.meta?.clientKeyId || '',
+      clientKeyName: result?.meta?.clientKeyName || '',
     },
     at,
   );

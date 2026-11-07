@@ -1909,6 +1909,121 @@ test('Responses DSML 流只发送完整工具调用，半截参数不成为可�
   await waitFor(() => pool.poolView().accounts.find((item) => item.name === 'responses-offline')?.inflight === 0);
 });
 
+test('Responses HTTP 租约释放保留客户端 Key 归因', async () => {
+  const released = [];
+  const runtime = createResponsesRuntime({
+    pick: () => ({ name: 'attributed-responses' }),
+    begin: () => {},
+    end: (account, result) => released.push({ account, result }),
+    readCredentials: () => ({
+      ok: true,
+      accessToken: 'test-access',
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    }),
+    upstreamClient: {
+      chat: async () => ({
+        status: 200,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+              + '"usage":{"prompt_tokens":4,"completion_tokens":1}}\n\n'
+              + 'data: [DONE]\n\n',
+            ));
+            controller.close();
+          },
+        }),
+      }),
+    },
+    store: {
+      async get() { return null; },
+      async save() { return { ok: true }; },
+    },
+  });
+  const res = {
+    headersSent: false,
+    writable: true,
+    writableEnded: false,
+    destroyed: false,
+    writeHead() { this.headersSent = true; },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+
+  const result = await runtime.create({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      input: 'attribute this',
+    },
+    config: { ...settings.getApiSettings(), openai: true },
+    clientKey: { id: 'key-responses', name: 'notebook' },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(released.length, 1);
+  assert.equal(released[0].result.meta.apiProtocol, 'openai_responses');
+  assert.equal(released[0].result.meta.clientKeyId, 'key-responses');
+  assert.equal(released[0].result.meta.clientKeyName, 'notebook');
+});
+
+test('Responses WebSocket 租约释放保留客户端 Key 归因', async () => {
+  const released = [];
+  const runtime = createResponsesRuntime({
+    pick: () => ({ name: 'attributed-responses-ws' }),
+    begin: () => {},
+    end: (account, result) => released.push({ account, result }),
+    readCredentials: () => ({
+      ok: true,
+      accessToken: 'test-access',
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    }),
+    upstreamClient: {
+      chat: async () => ({
+        status: 200,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+              + '"usage":{"prompt_tokens":4,"completion_tokens":1}}\n\n'
+              + 'data: [DONE]\n\n',
+            ));
+            controller.close();
+          },
+        }),
+      }),
+    },
+    store: {
+      async get() { return null; },
+      async save() { return { ok: true }; },
+    },
+  });
+  const sent = [];
+  const session = runtime.wsSession({
+    ws: { close() {} },
+    send: (event) => { sent.push(event); return true; },
+    config: { ...settings.getApiSettings(), openai: true },
+    clientKey: { id: 'key-responses-ws', name: 'tablet' },
+  });
+  session.create({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'attribute websocket',
+  });
+
+  await waitFor(() => released.length === 1);
+  assert.equal(sent.some((event) => event.type === 'response.completed'), true);
+  assert.equal(released[0].result.meta.apiProtocol, 'openai_responses');
+  assert.equal(released[0].result.meta.clientKeyId, 'key-responses-ws');
+  assert.equal(released[0].result.meta.clientKeyName, 'tablet');
+});
+
 async function waitFor(predicate, timeout = 1000) {
   const deadline = Date.now() + timeout;
   while (!predicate()) {

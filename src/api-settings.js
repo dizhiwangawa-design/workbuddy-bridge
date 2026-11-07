@@ -136,16 +136,26 @@ export function publicApiSettings() {
 
 export function createApiKey(name) {
   const config = loadConfig();
-  const created = makeApiKey(name);
+  const current = getApiSettings();
+  const created = makeApiKey(uniqueKeyName(name || 'dashboard', current.keys));
   config.apiCompat = {
-    ...getApiSettings(),
-    keys: [...getApiSettings().keys, created.record],
+    ...current,
+    keys: [...current.keys, created.record],
   };
   saveConfig(config);
   return {
     key: created.key,
     record: publicKey(created.record),
   };
+}
+
+function uniqueKeyName(name, records = []) {
+  const base = String(name || 'dashboard').trim().slice(0, 40) || 'dashboard';
+  const used = new Set(records.map((record) => String(record?.name || '')));
+  if (!used.has(base)) return base;
+  let suffix = 2;
+  while (used.has(`${base}-${suffix}`)) suffix += 1;
+  return `${base}-${suffix}`;
 }
 
 function makeApiKey(name) {
@@ -181,6 +191,16 @@ export function deleteApiKey(id) {
   config.apiCompat = { ...getApiSettings(), keys: after };
   saveConfig(config);
   return true;
+}
+
+export function resolveApiKey(raw) {
+  if (!raw) return null;
+  const got = createHash('sha256').update(String(raw)).digest();
+  const record = getApiSettings().keys.find((candidate) => {
+    const expected = Buffer.from(String(candidate.hash || ''), 'hex');
+    return got.length === expected.length && timingSafeEqual(expected, got);
+  });
+  return record ? publicKey(record) : null;
 }
 
 export function verifyApiKey(raw) {

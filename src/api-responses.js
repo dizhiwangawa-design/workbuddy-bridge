@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ApiError } from './api-errors.js';
+import { withClientKeyAttribution } from './api-attribution.js';
 import {
   readAccountCredentials,
   refreshAccountCredentials,
@@ -184,6 +185,7 @@ export function createResponsesRuntime(options = {}) {
     previousResponseId,
     prior,
     history = [],
+    clientKey = null,
     transport = 'http',
     interruptSignal = null,
     sendWs = null,
@@ -269,7 +271,7 @@ export function createResponsesRuntime(options = {}) {
     function release(result) {
       if (leaseReleased) return;
       leaseReleased = true;
-      end(account, result);
+      end(account, withClientKeyAttribution(result, clientKey, 'openai_responses'));
     }
 
     function clearTimers() {
@@ -1408,6 +1410,7 @@ export function createResponsesRuntime(options = {}) {
     body,
     config,
     account,
+    clientKey = null,
     previousResponseId = null,
     prior = [],
     history = [],
@@ -1435,26 +1438,27 @@ export function createResponsesRuntime(options = {}) {
         previousResponseId,
         prior,
         history,
+        clientKey,
         transport,
         interruptSignal,
         sendWs,
         onDone,
       });
     } catch (error) {
-      end(account, {
+      end(account, withClientKeyAttribution({
         ok: false,
         code: error?.code || 'SETUP_ERROR',
         error: error?.message || 'Responses attempt setup failed',
         durationMs: 0,
         meta: { model: prepared?.model || config?.defaultModel || '', usage: {} },
-      });
+      }, clientKey, 'openai_responses'));
       throw error;
     }
 
     return attempt.run();
   }
 
-  async function create({ req, res, body, config }) {
+  async function create({ req, res, body, config, clientKey = null }) {
     await ensureDeadLetterRetry();
     const persistence = Boolean(config.responsesPersistence);
     const previous = await loadHistory(body?.previous_response_id, persistence);
@@ -1490,6 +1494,7 @@ export function createResponsesRuntime(options = {}) {
         previousResponseId: body?.previous_response_id || null,
         prior: previous.prior,
         history: previous.messages,
+        clientKey,
         onAttempt: (value) => {
           attempt = value;
         },
@@ -1521,7 +1526,7 @@ export function createResponsesRuntime(options = {}) {
     await store.close?.();
   }
 
-  function wsSession({ ws = null, send, config, onResponse }) {
+  function wsSession({ ws = null, send, config, onResponse, clientKey = null }) {
     let controller = null;
     let attempt = null;
     let running = null;
@@ -1606,19 +1611,20 @@ export function createResponsesRuntime(options = {}) {
           previousResponseId: command.previous_response_id || null,
           prior: history.prior,
           history: history.messages,
+          clientKey,
           transport: 'ws',
           interruptSignal: controller.signal,
           sendWs: send,
           onDone: (result) => onResponse?.(result),
         });
       } catch (error) {
-        end(picked.name, {
+        end(picked.name, withClientKeyAttribution({
           ok: false,
           code: error?.code || 'SETUP_ERROR',
           error: error?.message || 'Responses WebSocket setup failed',
           durationMs: 0,
           meta: { model: prepared.model, usage: {} },
-        });
+        }, clientKey, 'openai_responses'));
         throw error;
       }
       attempt = current;
