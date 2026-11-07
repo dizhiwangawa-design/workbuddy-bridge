@@ -1407,7 +1407,7 @@ export function createResponsesRuntime(options = {}) {
     await ensureDeadLetterRetry();
     const persistence = Boolean(config.responsesPersistence);
     const previous = await loadHistory(body?.previous_response_id, persistence);
-    prepareResponsesRequest(body, {
+    const prepared = prepareResponsesRequest(body, {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
       history: previous.messages,
@@ -1419,7 +1419,7 @@ export function createResponsesRuntime(options = {}) {
     const tried = [];
     let last = null;
     for (let attempt = 0; attempt < Math.max(1, Math.min(pool.maxAttempts || 3, 5)); attempt += 1) {
-      const picked = pick({ exclude: tried });
+      const picked = pick({ exclude: tried, model: prepared.model });
       if (!picked.name) {
         if (!tried.length) throw new ApiError(503, '号池没有可用账号', {
           type: 'service_unavailable',
@@ -1503,12 +1503,6 @@ export function createResponsesRuntime(options = {}) {
         return;
       }
       if (closed) return;
-      const picked = pick({ exclude: [] });
-      if (!picked.name) {
-        send({ type: 'error', error: { code: 'POOL_EMPTY', message: '号池没有可用账号' } });
-        return;
-      }
-      begin(picked.name);
       let prepared;
       try {
         prepared = prepareResponsesRequest(command, {
@@ -1517,16 +1511,15 @@ export function createResponsesRuntime(options = {}) {
           history: history.messages,
         });
       } catch (error) {
-        end(picked.name, {
-          ok: false,
-          code: 'INVALID_REQUEST',
-          error: error.message,
-          durationMs: 0,
-          meta: { model: config.defaultModel, usage: {} },
-        });
         send({ type: 'error', error: { code: error.code || 'invalid_request', message: error.message } });
         return;
       }
+      const picked = pick({ exclude: [], model: prepared.model });
+      if (!picked.name) {
+        send({ type: 'error', error: { code: 'POOL_EMPTY', message: '号池没有可用账号' } });
+        return;
+      }
+      begin(picked.name);
       let current;
       try {
         current = await setupAttempt({

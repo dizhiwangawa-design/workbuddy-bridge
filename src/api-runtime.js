@@ -1028,15 +1028,16 @@ export function createAnthropicRuntime({
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
     const tried = [];
     let lastFailure = null;
+    const probeModel = config.defaultModel || 'deepseek-v4.1-flash';
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const picked = pick({ exclude: tried });
+      const picked = pick({ exclude: tried, model: probeModel });
       if (!picked.name) break;
       tried.push(picked.name);
       let first;
       try {
         const firstBody = normalizeBody({
-          model: config.defaultModel || 'deepseek-v4.1-flash',
+          model: probeModel,
           max_tokens: 64,
           stream: false,
           messages: [{ role: 'user', content: 'Use the probe_echo tool with value 7.' }],
@@ -1068,7 +1069,7 @@ export function createAnthropicRuntime({
         }
 
         const secondBody = normalizeBody({
-          model: config.defaultModel || 'deepseek-v4.1-flash',
+          model: probeModel,
           max_tokens: 64,
           stream: false,
           messages: [
@@ -1126,7 +1127,10 @@ export function createAnthropicRuntime({
     let lastFailure = null;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const picked = pick({ exclude: tried });
+      const picked = pick({
+        exclude: tried,
+        model: normalized.requestBody.model,
+      });
       if (!picked.name) {
         if (!tried.length) {
           throw new ApiError(503, `号池里没有可用账号（${picked.reason}）`, {
@@ -1895,7 +1899,7 @@ export function createOpenAIRuntime({
     let lastFailure = null;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const picked = pick({ exclude: tried });
+      const picked = pick({ exclude: tried, model: normalized.model });
       if (!picked.name) {
         if (!tried.length) {
           throw new ApiError(503, `号池里没有可用账号（${picked.reason}）`, {

@@ -2692,11 +2692,11 @@ Expected: PASS。
 - 默认全关；只开启总开关时两个协议仍不可用。
 - API Key 明文只显示一次，页面和接口不返回 hash。
 - 连接测试不使用 CLI，不泄漏提示词和 cookie/token。
-- 原有管理界面布局在桌面和窄屏下无横向溢出。
+- 原有管理界面桌面布局无横向溢出；按用户要求不把手机端验收列为完成条件。
 
 ---
 
-### Task 13: 真实客户端验收、文档与最终自检（离线部分已完成；真实账号冒烟待授权）
+### Task 13: 真实客户端验收、文档与最终自检（`default` 通过；另两个账号受模型级配额阻断）
 
 **Files:**
 - Modify: `README.md`
@@ -2860,15 +2860,19 @@ Expected:
   和 Responses `max_output_tokens=1` 截断均通过。
 - 管理页已用真实浏览器复验 1440×1000：OpenAI 开关会联动 Responses 持久化与续跑提示，
   桌面布局无横向溢出；按用户要求不把手机端验收列为完成条件。
-- 新增 `test:live:account`：固定单账号执行 Chat 非流式、SSE、工具续轮和租约归零检查。
-  `default` 使用 `deepseek-v4.1-flash` 通过，4 次请求全部记账且 `inflight=0`。
+- 新增 `test:live:account`：固定单账号执行 Chat 非流式、SSE、工具续轮、真实客户端中断、
+  取消片段持久化和租约 5 秒内归零检查。`default` 使用 `deepseek-v4.1-flash`
+  通过，5 次请求全部记账且 `inflight=0`。
 - `awa` 单独重试仍返回上游 `429 RATE_LIMITED`，因此“每个已登录账号至少成功一次”
   未满足；`codex-fresh-mvxgctfk` 返回同一上游 429。两者提示的重置时间分别为
   2026-11-08 02:27:25 和 2026-11-07 22:40:23（UTC+8）。
 - 清除本地冷却后，`awa` 与 `codex-fresh-mvxgctfk` 使用 `deepseek-v4-flash`
-  均通过同一套 4 请求账号冒烟（文本、SSE、工具续轮、租约归零）。这证明阻塞是
-  `deepseek-v4.1-flash` 的外部模型级配额，不是凭据、号池或协议链路故障；默认模型
-  仍保持 `deepseek-v4.1-flash`，没有自动换模型掩盖 429。
+  均通过同一套 5 请求账号冒烟（文本、SSE、工具续轮、主动中断取消片段持久化、
+  租约归零）。这证明阻塞是 `deepseek-v4.1-flash` 的外部模型级配额，不是凭据、
+  号池或协议链路故障；默认模型仍保持 `deepseek-v4.1-flash`，没有自动换模型掩盖 429。
+- 2026-11-07 20:28 再次复核：两个受限账号的 `deepseek-v4.1-flash` 仍为 429；
+  将 429 冷却绑定失败模型后，同一账号显式请求 `deepseek-v4-flash` 均通过，
+  管理视图中的 `cooldownModels` 只记录 `deepseek-v4.1-flash`。
 - 未读取、打印或提交 access token、refresh token 或完整客户端 Key。
 
 ---
@@ -3021,5 +3025,9 @@ Expected:
   的跨重启测试，并校验输入、输出和续接关系。
 - [x] 新增固定账号脱敏 live 冒烟脚本；429 使用独立退出码 2 和
   `blocked:true`，不打印上游正文、token 或客户端 Key。
+- [x] 真实客户端中断验证：首段可见文本后 abort，取消片段成功持久化，租约在
+  5 秒内归零；`default` 使用 `deepseek-v4.1-flash` 通过。
+- [x] 将上游 429 冷却绑定到失败模型，同账号显式请求其他模型仍可调度；
+  保持默认模型不变且不自动换模型，旧版账号级冷却继续按全模型冷却迁移。
 - [ ] 在 `deepseek-v4.1-flash` 配额重置后，用 `test:live:account` 对
   `awa` 和 `codex-fresh-mvxgctfk` 各完成一次通过。该步骤只能等待外部配额恢复。

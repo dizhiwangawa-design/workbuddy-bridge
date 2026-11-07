@@ -34,6 +34,7 @@ const DAY_MS = 86400000;
 const MAX_COOLDOWN_MS = 30 * 60 * 1000;
 const COOLDOWN_BASE_MS = 60 * 1000;
 const HISTORY_DAYS = 7;
+const ALL_MODELS = '*';
 
 // inflight 属于进程运行态，不能跟号池统计一起从磁盘重载。
 const inflightByAccount = new Map();
@@ -74,6 +75,7 @@ function emptyEntry(name) {
     total: emptyTotal(),
     status: 'ready',
     cooldownUntil: 0,
+    cooldowns: Object.create(null),
     failures: 0,
     lastUsedAt: 0,
     lastError: '',
@@ -94,6 +96,41 @@ function emptyPool() {
   };
 }
 
+function normalizeCooldowns(raw, now = Date.now()) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return Object.create(null);
+  }
+  const out = Object.create(null);
+  for (const [model, value] of Object.entries(raw)) {
+    if (!model) continue;
+    const until = Number(value?.until ?? value);
+    if (!Number.isFinite(until) || until <= now) continue;
+    out[model] = {
+      until,
+      failures: Math.max(1, Number(value?.failures) || 1),
+    };
+  }
+  return out;
+}
+
+function cooldownUntil(entry, now = Date.now()) {
+  const active = Object.values(entry?.cooldowns || {})
+    .filter((value) => Number(value?.until) > now);
+  return active.length
+    ? Math.max(...active.map((value) => Number(value.until)))
+    : 0;
+}
+
+function syncCooldownState(entry, now = Date.now()) {
+  entry.cooldowns = normalizeCooldowns(entry.cooldowns, now);
+  entry.cooldownUntil = cooldownUntil(entry, now);
+  if (entry.status !== 'unauthorized' && entry.status !== 'disabled') {
+    if (entry.cooldownUntil > now) entry.status = 'cooling';
+    else if (entry.status === 'cooling') entry.status = 'ready';
+  }
+  return entry.cooldownUntil;
+}
+
 export function loadPool() {
   const raw = readJson(POOL_FILE, null);
   const pool = { ...emptyPool(), ...(raw || {}) };
@@ -104,15 +141,26 @@ export function loadPool() {
   // inflight 是进程内状态；磁盘只保存统计，运行时值从内存覆盖回来。
   for (const [name, e] of Object.entries(pool.accounts)) {
     const base = emptyEntry(name);
+    const now = Date.now();
+    const cooldowns = normalizeCooldowns(e.cooldowns, now);
+    // v2 只保存账号级冷却。升级后按“所有模型”处理，避免旧状态提前失效。
+    if (!Object.hasOwn(e, 'cooldowns') && Number(e.cooldownUntil) > now) {
+      cooldowns[ALL_MODELS] = {
+        until: Number(e.cooldownUntil),
+        failures: Math.max(1, Number(e.failures) || 1),
+      };
+    }
     pool.accounts[name] = {
       ...base,
       ...e,
+      cooldowns,
       // 老版本的 today/total 没有缓存字段，逐项补齐
       today: { ...emptyToday(), ...(e.today || {}) },
       total: { ...emptyTotal(), ...(e.total || {}) },
       inflight: inflightByAccount.get(name) || 0,
       name,
     };
+    syncCooldownState(pool.accounts[name], now);
     rollDay(pool.accounts[name]);
   }
   return pool;
@@ -178,6 +226,7 @@ export function noteAuth(name, loggedIn) {
     if (e.status === 'unauthorized') e.status = 'ready';
     e.failures = 0;
     e.cooldownUntil = 0;
+    e.cooldowns = Object.create(null);
   } else {
     e.status = 'unauthorized';
   }
@@ -237,9 +286,12 @@ export function endTask(name, result) {
     e.total.ok += 1;
     e.today.ok += 1;
     e.failures = 0;
-    e.cooldownUntil = 0;
-    e.lastError = '';
     e.status = 'ready';
+    const previousLastError = e.lastError;
+    const requestModel = String(result?.meta?.model || '');
+    if (!requestModel) e.cooldowns = Object.create(null);
+    else delete e.cooldowns[requestModel];
+    e.lastError = Object.keys(e.cooldowns).length ? previousLastError : '';
   } else {
     e.total.fail += 1;
     e.today.fail += 1;
@@ -248,11 +300,12 @@ export function endTask(name, result) {
     if (result?.code === 'AUTH_REQUIRED') {
       e.status = 'unauthorized';
     } else if (isQuotaError(result)) {
-      applyCooldown(e);
+      applyCooldown(e, result?.meta?.model);
     } else {
       e.failures += 1;
     }
   }
+  syncCooldownState(e, at);
 
   recordSample(
     pool,
@@ -292,11 +345,21 @@ export async function withAccountLease(name, fn) {
   }
 }
 
-function applyCooldown(e, now = Date.now()) {
+function applyCooldown(e, model, now = Date.now()) {
+  const key = String(model || ALL_MODELS);
+  if (!e.cooldowns || typeof e.cooldowns !== 'object' || Array.isArray(e.cooldowns)) {
+    e.cooldowns = Object.create(null);
+  }
+  const previous = e.cooldowns[key];
+  const failures = Math.max(1, Number(previous?.failures) || 0) + 1;
   e.failures = (e.failures || 0) + 1;
-  const backoff = Math.min(COOLDOWN_BASE_MS * 2 ** (e.failures - 1), MAX_COOLDOWN_MS);
-  e.cooldownUntil = now + backoff;
-  e.status = 'cooling';
+  const backoff = Math.min(COOLDOWN_BASE_MS * 2 ** (failures - 1), MAX_COOLDOWN_MS);
+  e.cooldowns[key] = {
+    until: now + backoff,
+    failures,
+  };
+  if (e.status !== 'unauthorized' && e.status !== 'disabled') e.status = 'cooling';
+  syncCooldownState(e, now);
   return backoff;
 }
 
@@ -305,6 +368,7 @@ export function resetCooldown(name) {
   const pool = loadPool();
   const e = entryFor(pool, name);
   e.cooldownUntil = 0;
+  e.cooldowns = Object.create(null);
   e.failures = 0;
   e.lastError = '';
   if (e.status !== 'disabled' && e.status !== 'unauthorized') e.status = 'ready';
@@ -318,15 +382,29 @@ export function isQuotaError(result) {
 }
 
 /** 账号能否接活；不能时给出可读原因，面板直接用这句话。 */
-export function availability(entry, { auth, now = Date.now() } = {}) {
+function activeCooldownFor(entry, { model, now = Date.now() } = {}) {
+  const cooldowns = normalizeCooldowns(entry?.cooldowns, now);
+  const allModels = cooldowns[ALL_MODELS];
+  if (allModels) return { model: ALL_MODELS, ...allModels };
+  if (model && cooldowns[model]) return { model, ...cooldowns[model] };
+  if (!model) {
+    const active = Object.entries(cooldowns)
+      .sort((a, b) => Number(b[1].until) - Number(a[1].until));
+    if (active.length) return { model: active[0][0], ...active[0][1] };
+  }
+  return null;
+}
+
+export function availability(entry, { auth, now = Date.now(), model } = {}) {
   if (!entry.enabled) return { ok: false, reason: '已停用', kind: 'disabled' };
   // 凭证文件还在、但 CLI 已经报过未登录（例如 token 过期）——以运行态为准
   if (entry.status === 'unauthorized') {
     return { ok: false, reason: '登录已失效', kind: 'unauthorized' };
   }
   if (auth && !auth.loggedIn) return { ok: false, reason: auth.reason || '未登录', kind: 'unauthorized' };
-  if (entry.cooldownUntil > now) {
-    return { ok: false, reason: '冷却中', kind: 'cooling', until: entry.cooldownUntil };
+  const cooldown = activeCooldownFor(entry, { model, now });
+  if (cooldown) {
+    return { ok: false, reason: '冷却中', kind: 'cooling', until: cooldown.until, model: cooldown.model };
   }
   if ((entry.inflight || 0) >= (entry.maxConcurrency || 1)) {
     return { ok: false, reason: '并发已满', kind: 'busy' };
@@ -390,13 +468,15 @@ export function poolView() {
     const e = pool.accounts[name];
     const auth = quickAuthCheck(name);
     const avail = availability(e, { auth, now });
+    const cooldowns = normalizeCooldowns(e.cooldowns, now);
+    const cooldownModels = Object.keys(cooldowns);
     // 有官方额度接口就用真数据，否则退回本地计量（口径见 README）
     const quota = externalQuota(name) || quotaOf(e);
     const status = !e.enabled
       ? 'disabled'
       : e.status === 'unauthorized' || !auth.loggedIn
         ? 'unauthorized'
-        : e.cooldownUntil > now
+        : cooldownModels.length
           ? 'cooling'
           : 'ready';
 
@@ -421,6 +501,7 @@ export function poolView() {
       budgetTokens: e.budgetTokens || 0,
       cooldownUntil: e.cooldownUntil || 0,
       cooldownLeftMs: Math.max(0, (e.cooldownUntil || 0) - now),
+      cooldownModels,
       lastUsedAt: e.lastUsedAt || 0,
       lastError: e.lastError || '',
       lastLatencyMs: e.lastLatencyMs || 0,
@@ -501,7 +582,12 @@ function historySeries(entry, days = 7, now = Date.now()) {
 }
 
 /** 候选排序。返回选中的账号名，或一份「为什么没人可用」。 */
-export function pickAccount({ exclude = [], strategy, now = Date.now() } = {}) {
+export function pickAccount({
+  exclude = [],
+  strategy,
+  now = Date.now(),
+  model,
+} = {}) {
   const pool = syncPool();
   const strat = strategy || pool.strategy;
   const rows = [];
@@ -509,7 +595,7 @@ export function pickAccount({ exclude = [], strategy, now = Date.now() } = {}) {
   for (const [name, e] of Object.entries(pool.accounts)) {
     if (exclude.includes(name)) continue;
     const auth = quickAuthCheck(name);
-    const avail = availability(e, { auth, now });
+    const avail = availability(e, { auth, now, model });
     if (!avail.ok) {
       rows.push({ name, avail, e });
       continue;

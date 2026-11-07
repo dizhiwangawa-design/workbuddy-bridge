@@ -487,6 +487,23 @@ await test('重置冷却后重新可用', () => {
   assertEqual(poolMod.pickAccount().name, 'limitedcli');
 });
 
+await test('旧账号级冷却记录迁移为全模型冷却', () => {
+  const current = poolMod.loadPool();
+  const entry = current.accounts.limitedcli;
+  entry.cooldownUntil = Date.now() + 60000;
+  delete entry.cooldowns;
+  poolMod.savePool(current);
+
+  const loaded = poolMod.loadPool().accounts.limitedcli;
+  assert(loaded.cooldowns['*'].until > Date.now(), '旧冷却应迁移到所有模型');
+  assertEqual(
+    poolMod.pickAccount({ model: 'deepseek-v4-flash' }).name,
+    null,
+    '迁移后的旧冷却仍应阻断请求',
+  );
+  poolMod.resetCooldown('limitedcli');
+});
+
 await test('加权轮询按权重分配', () => {
   accounts.removeAccount('limitedcli');
   credAccount('w1');

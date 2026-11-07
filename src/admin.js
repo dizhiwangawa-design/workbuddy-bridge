@@ -890,7 +890,8 @@ function card(a){
           ' <span class="muted">tok</span></b></div>'+
           '<div class="qline sub2"><span>未设每日预算</span><span>'+a.today.req+' 次</span></div>';
   }
-  var cd=a.cooldownLeftMs>0?'<div class="cd" data-until="'+(Date.now()+a.cooldownLeftMs)+'">冷却剩余 '+Math.ceil(a.cooldownLeftMs/1000)+'s</div>':'';
+  var cdModels=(a.cooldownModels||[]).filter(Boolean).map(function(m){return m==='*'?'全部模型':m;}).join(', ');
+  var cd=a.cooldownLeftMs>0?'<div class="cd" data-until="'+(Date.now()+a.cooldownLeftMs)+'">冷却剩余 '+Math.ceil(a.cooldownLeftMs/1000)+'s'+(cdModels?' · '+esc(cdModels):'')+'</div>':'';
   var err=a.lastError?'<div class="err">'+String(a.lastError).replace(/</g,'&lt;')+'</div>':'';
   var sub=a.lastUsedAt?ago(a.lastUsedAt):a.auth;
   var cacheRate=a.today.cacheHitRate;
@@ -900,7 +901,7 @@ function card(a){
       '<div class="avatar">'+initials(a.name)+'</div>'+
       '<div class="who"><div class="name">'+a.name+
         (a.isDefault?' <span class="tag">默认</span>':'')+
-        (a.model?' <span class="tag">'+a.model+'</span>':'')+
+        (a.model?' <span class="tag">'+esc(a.model)+'</span>':'')+
       '</div><div class="meta">'+sub+'</div></div>'+
       pill(a)+
       '<button class="switch" role="switch" aria-checked="'+(a.enabled?'true':'false')+'" data-act="toggle" data-name="'+a.name+'" title="启用/停用"></button>'+

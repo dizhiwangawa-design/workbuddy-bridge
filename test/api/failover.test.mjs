@@ -82,12 +82,15 @@ async function withBridge(fn, upstreamUrl) {
   }
 }
 
-function chatRequest(baseUrl, { stream = false } = {}) {
+function chatRequest(baseUrl, {
+  stream = false,
+  model = 'deepseek-v4.1-flash',
+} = {}) {
   return fetch(`${baseUrl}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4.1-flash',
+      model,
       stream,
       messages: [{ role: 'user', content: 'failover-fixture' }],
     }),
@@ -208,6 +211,47 @@ test('OpenAI 429 会冷却首号并换号，成功 token 只记到实际账号',
   assert.equal(tokensFor('rate-b').tokensOut, 9);
   assert.equal(row('rate-a').inflight, 0);
   assert.equal(row('rate-b').inflight, 0);
+});
+
+test('模型级 429 不会阻断同一账号的其他模型', async (t) => {
+  resetAccounts(['model-scope-a']);
+  const upstream = await startUpstream((_req, res, body) => {
+    if (body.model === 'deepseek-v4.1-flash') {
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end('{"error":{"message":"model quota exceeded"}}');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"fallback-model-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+  t.after(() => upstream.close());
+
+  await withBridge(async (baseUrl) => {
+    const limited = await chatRequest(baseUrl, {
+      model: 'deepseek-v4.1-flash',
+    });
+    assert.equal(limited.status, 429);
+    await limited.text();
+
+    const fallback = await chatRequest(baseUrl, {
+      model: 'deepseek-v4-flash',
+    });
+    assert.equal(fallback.status, 200);
+    const body = await fallback.json();
+    assert.equal(body.choices[0].message.content, 'fallback-model-ok');
+  }, upstream.url);
+
+  assert.deepEqual(
+    upstream.calls.map((call) => call.body.model),
+    ['deepseek-v4.1-flash', 'deepseek-v4-flash'],
+  );
+  const entry = row('model-scope-a');
+  assert.equal(entry.inflight, 0);
+  assert.ok(entry.cooldownLeftMs > 0);
+  assert.deepEqual(entry.cooldownModels, ['deepseek-v4.1-flash']);
 });
 
 test('OpenAI 流式首帧后失败不会换号重放，并释放租约', async (t) => {

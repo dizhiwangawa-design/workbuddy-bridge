@@ -56,6 +56,15 @@ function failureDetails(error) {
   };
 }
 
+async function waitFor(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return true;
+}
+
 try {
   settings.updateApiSettings({
     enabled: true,
@@ -158,12 +167,53 @@ try {
     throw new Error('Chat tools smoke did not use the tool result');
   }
 
+  const disconnectController = new AbortController();
+  const disconnectStream = await client.chat.completions.create({
+    model,
+    stream: true,
+    messages: [{
+      role: 'user',
+      content: '写一段 100 字以内的说明文字，第一段以 READY 开头。',
+    }],
+  }, { signal: disconnectController.signal });
+  let disconnectText = '';
+  try {
+    for await (const chunk of disconnectStream) {
+      const delta = String(chunk.choices[0]?.delta?.content || '');
+      disconnectText += delta;
+      if (disconnectText.trim()) {
+        disconnectController.abort();
+        break;
+      }
+    }
+  } catch (error) {
+    if (error?.name !== 'AbortError' && error?.code !== 'ABORT_ERR') throw error;
+  }
+  if (!disconnectText.trim()) {
+    throw new Error('Chat disconnect smoke received no visible fragment before abort');
+  }
+
   const rows = pool.poolView().accounts;
   const after = rows.find((item) => item.name === account);
-  if (!after || after.inflight !== 0) {
+  const leaseReleased = await waitFor(
+    () => pool.poolView().accounts.find((item) => item.name === account)?.inflight === 0,
+    5000,
+  );
+  if (!after || !leaseReleased) {
     throw new Error('Chat smoke left an account lease active');
   }
-  if (after.today.req < before.today.req + 4) {
+  const cancelPersisted = await waitFor(
+    () => store.memoryView().some((record) => (
+      record.status === 'incomplete'
+      && JSON.stringify(record.body?.output || []).includes(disconnectText.trim().slice(0, 8))
+    )),
+    3000,
+  );
+  if (!cancelPersisted) {
+    throw new Error('Chat disconnect smoke did not persist a visible cancellation fragment');
+  }
+  const finalRow = pool.poolView().accounts.find((item) => item.name === account);
+  if (finalRow.today.req < before.today.req + 5) {
     throw new Error('Chat smoke did not account for every live request');
   }
 
@@ -174,11 +224,16 @@ try {
     text: { chars: text.length },
     stream: { chars: streamText.trim().length, finish_reason: streamFinish },
     tools: { name: call.function.name, continuation: 'text' },
+    disconnect: {
+      visible_fragment: disconnectText.trim().length > 0,
+      lease_released: leaseReleased,
+      cancellation_persisted: cancelPersisted,
+    },
     pool: {
-      inflight: after.inflight,
-      requests_added: after.today.req - before.today.req,
-      status: after.status,
-      cooldown_left_ms: after.cooldownLeftMs,
+      inflight: finalRow.inflight,
+      requests_added: finalRow.today.req - before.today.req,
+      status: finalRow.status,
+      cooldown_left_ms: finalRow.cooldownLeftMs,
     },
   }));
 } catch (error) {
