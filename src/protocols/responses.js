@@ -498,7 +498,8 @@ export function prepareResponsesRequest(body, {
   if (choice === undefined && body.parallel_tool_calls === false) choice = 'required';
   if (choice === 'required' && !tools.length) throw bad('tool_choice requires at least one tool');
   if (choice && typeof choice === 'object') {
-    const chosen = String(choice.name || choice.function?.name || '');
+    const builtin = ['apply_patch', 'shell'].includes(choice.type) ? choice.type : '';
+    const chosen = String(builtin || choice.name || choice.function?.name || '');
     if (!chosen) throw bad('tool_choice must name a tool');
     const match = lookupRegistry(registry, chosen);
     if (!match) throw bad(`tool_choice references unknown tool: ${chosen}`);

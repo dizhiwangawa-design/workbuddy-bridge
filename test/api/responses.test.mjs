@@ -1691,6 +1691,30 @@ test('Responses parallel_tool_calls=false 不覆盖显式 tool_choice', () => {
   });
 });
 
+test('Responses tool_choice 支持 apply_patch 与 shell 内置类型', () => {
+  const applyPatch = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'patch',
+    tools: [{ type: 'apply_patch' }],
+    tool_choice: { type: 'apply_patch' },
+  });
+  assert.deepEqual(applyPatch.body.tool_choice, {
+    type: 'function',
+    function: { name: 'apply_patch' },
+  });
+
+  const shell = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'shell',
+    tools: [{ type: 'shell' }],
+    tool_choice: { type: 'shell' },
+  });
+  assert.deepEqual(shell.body.tool_choice, {
+    type: 'function',
+    function: { name: 'shell' },
+  });
+});
+
 test('Responses 支持 local_shell、shell 与 apply_patch 工具', async (t) => {
   let requestCount = 0;
   const received = [];

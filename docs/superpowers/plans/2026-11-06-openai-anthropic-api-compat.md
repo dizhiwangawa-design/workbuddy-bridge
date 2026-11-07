@@ -2989,7 +2989,8 @@ Expected:
 - [x] 覆盖 `max_output_tokens` 与 `upstream_length_limit` 两种截断原因。
 - [x] 覆盖 `parallel_tool_calls:false`、`allowed_tools`、function/custom/namespace、
   `local_shell`、`shell`、`apply_patch`、URL/data URL 图片。
-- [x] `parallel_tool_calls:false` 不覆盖显式 `tool_choice`（包括 `none`）；历史中的
+- [x] `parallel_tool_calls:false` 不覆盖显式 `tool_choice`（包括 `none`）；
+  `apply_patch`/`shell` 内置 `tool_choice` 可归一；历史中的
   `local_shell_call`/`shell_call` 可按 `call_id` 配对并续接。
 - [x] 覆盖内嵌 item、output 早于 call、超长 namespace 哈希去歧义、不支持工具的
   `400 unsupported_tool_type` 与 `file_id` 拒绝。
@@ -3055,9 +3056,9 @@ Expected:
 **2026-11-07 CI 稳定版执行记录:**
 
 - 聚焦回归通过：`disconnect-resilience` 18/18、`stream-control` 25/25、
-  `anthropic-http` 33/33、`responses` 42/42、`failover` 11/11、
+  `anthropic-http` 33/33、`responses` 43/43、`failover` 11/11、
   `upstream` 9/9。
-- 全量 `npm test` 通过：基础 55/55，API 230/230，合计 285/285。
+- 全量 `npm test` 通过：基础 55/55，API 231/231，合计 286/286。
 - 独立慢读压测通过：约 1.12 MiB 连续正文触发 `BACKPRESSURE_OVERFLOW`，
   上游关闭、租约归零，子进程峰值 RSS 约 123 MiB。
 - Responses HTTP RST 回归覆盖“已发送可见文本 + 完整工具调用”的取消场景：
