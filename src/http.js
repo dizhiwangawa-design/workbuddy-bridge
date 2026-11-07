@@ -97,8 +97,27 @@ tick();
 }
 
 function send(res, code, body, type = 'text/plain; charset=utf-8') {
-  res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store' });
-  res.end(body);
+  if (!res || res.destroyed || res.writableEnded) return false;
+  if (res.headersSent) {
+    try {
+      res.end();
+    } catch {
+      // The response already crossed a failed terminal path.
+    }
+    return false;
+  }
+  try {
+    res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store' });
+    res.end(body);
+    return true;
+  } catch {
+    try {
+      if (!res.destroyed && !res.writableEnded) res.end();
+    } catch {
+      // The peer may reset between the header and body writes.
+    }
+    return false;
+  }
 }
 
 function json(res, code, obj) {

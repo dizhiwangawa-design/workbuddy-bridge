@@ -36,6 +36,7 @@ async function fixture(t, handler, {
   config = {},
   apiDeps = {},
   account = 'responses-offline',
+  store = null,
 } = {}) {
   createAccount(account);
   for (const name of Object.keys(pool.loadPool().accounts)) {
@@ -63,6 +64,9 @@ async function fixture(t, handler, {
   const upstreamClient = createUpstreamClient({
     baseUrl: `http://127.0.0.1:${upstreamServer.address().port}`,
   });
+  const responsesStore = store || createResponsesStore({
+    directory: path.join(tmp, `responses-${Date.now()}-${Math.random()}`),
+  });
   const bridge = await startHttpServer({
     port: 0,
     host: '127.0.0.1',
@@ -70,9 +74,7 @@ async function fixture(t, handler, {
       upstreamClient,
       responsesRuntime: createResponsesRuntime({
         upstreamClient,
-        store: createResponsesStore({
-          directory: path.join(tmp, `responses-${Date.now()}-${Math.random()}`),
-        }),
+        store: responsesStore,
       }),
       ...apiDeps,
     },
@@ -86,6 +88,8 @@ async function fixture(t, handler, {
     baseUrl: `http://127.0.0.1:${bridge.port}`,
     bridge,
     account,
+    store: responsesStore,
+    upstreamPort: upstreamServer.address().port,
   };
 }
 
@@ -137,6 +141,54 @@ test('Responses 非流式输出 reasoning 与 message', async (t) => {
   assert.equal(body.status, 'completed');
   assert.equal(body.output[0].type, 'reasoning');
   assert.equal(body.output[1].content[0].text, 'done');
+});
+
+test('Responses 首字节超时发送失败终态且不会二次写响应头', async (t) => {
+  let upstreamClosed;
+  const closed = new Promise((resolve) => {
+    upstreamClosed = resolve;
+  });
+  const store = createResponsesStore({
+    directory: path.join(tmp, `responses-timeout-${Date.now()}-${Math.random()}`),
+  });
+  const { baseUrl, account } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.flushHeaders();
+    res.once('close', upstreamClosed);
+  }, {
+    config: {
+      firstByteTimeoutMs: 50,
+      idleTimeoutMs: 2000,
+      totalTimeoutMs: 4000,
+    },
+    store,
+  });
+  void account;
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      input: 'timeout',
+    }),
+  });
+  assert.equal(response.status, 200);
+  const events = parseSse(await response.text());
+  const terminal = events.find((item) => [
+    'response.completed',
+    'response.incomplete',
+    'response.failed',
+  ].includes(item.type));
+  assert.equal(terminal?.type, 'response.failed');
+  assert.equal(terminal.response.status, 'failed');
+  assert.equal(terminal.response.error.code, 'UPSTREAM_FIRST_BYTE_TIMEOUT');
+  assert.equal(events.some((item) => item.type === 'response.completed'), false);
+  await closed;
+  await waitFor(() => pool.poolView().accounts
+    .find((item) => item.name === 'responses-offline')?.inflight === 0);
+  assert.equal(store.memoryView().length, 0);
+  await store.close();
 });
 
 test('Responses SSE 序号单调、done 身份与 completed output 一致，支持图片', async (t) => {

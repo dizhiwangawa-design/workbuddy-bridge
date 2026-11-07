@@ -29,9 +29,29 @@ export function sendApiError(res, error, protocol = 'openai') {
           code: error.code || null,
         },
       };
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-  });
-  res.end(JSON.stringify(body));
+  if (!res || res.destroyed || res.writableEnded) return false;
+  if (res.headersSent) {
+    try {
+      res.end();
+    } catch {
+      // A transport reset may race the error path. The request is already
+      // terminated and must not reach the process-level error handler.
+    }
+    return false;
+  }
+  try {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    });
+    res.end(JSON.stringify(body));
+    return true;
+  } catch {
+    try {
+      if (!res.destroyed && !res.writableEnded) res.end();
+    } catch {
+      // The peer won the teardown race.
+    }
+    return false;
+  }
 }

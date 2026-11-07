@@ -455,25 +455,30 @@ export function createResponsesRuntime(options = {}) {
         });
     }
     async function terminalFailure(kind, error) {
-      if (finished) return;
+      if (finished) return cancelPromise;
       finished = true;
       canceling = true;
       cancelKind = kind;
       controller.abort(error);
       clearTimers();
       cancelReader(error);
-      const live = liveEncoder?.snapshot();
-      if (live?.content) visibleText = live.content;
-      if (live?.reasoning) reasoningText = live.reasoning;
-      const retained = snapshot(false);
-      release({
-        ok: false,
-        code: error.code || 'UPSTREAM_ERROR',
-        error: `${kind} ${error.message || ''}`.trim(),
-        durationMs: now() - requestStarted,
-        meta: { model: prepared.model, usage: {} },
-      });
-      if (transport === 'http' && body.stream === true && writer && !writer.failed) {
+      cancelPromise = (async () => {
+        const live = liveEncoder?.snapshot();
+        if (live?.content) visibleText = live.content;
+        if (live?.reasoning) reasoningText = live.reasoning;
+        let retained = { content: visibleText, reasoning: reasoningText, calls: [], usage: {} };
+        try {
+          retained = snapshot(false);
+        } catch (snapshotError) {
+          debug(`Responses terminal snapshot failed: ${snapshotError.message}`);
+        }
+        release({
+          ok: false,
+          code: error.code || 'UPSTREAM_ERROR',
+          error: `${kind} ${error.message || ''}`.trim(),
+          durationMs: now() - requestStarted,
+          meta: { model: prepared.model, usage: {} },
+        });
         const failed = completedResponseBody({
           id: responseId,
           model: prepared.model,
@@ -487,12 +492,24 @@ export function createResponsesRuntime(options = {}) {
           previousResponseId,
         });
         failed.status = 'failed';
-        emit(cancelEvents(failed, {
-          finalDeltas: !live?.content,
-          finalReasoningDeltas: !live?.reasoning,
-        }));
-        writer.end();
-      }
+        if (transport === 'http' && body.stream === true && writer && !writer.failed) {
+          emit(cancelEvents(failed, {
+            finalDeltas: !live?.content,
+            finalReasoningDeltas: !live?.reasoning,
+          }));
+          writer.end();
+        } else if (transport === 'ws') {
+          publishWs(protocolEvents(failed, false));
+        }
+        return {
+          ok: false,
+          error,
+          failure: true,
+          started: transport === 'http' ? Boolean(res?.headersSent) : Boolean(response),
+          responseId,
+        };
+      })();
+      return cancelPromise;
     }
 
     function start() {
@@ -1010,7 +1027,7 @@ export function createResponsesRuntime(options = {}) {
         return {
           ok: false,
           error: failure,
-          started: Boolean(response),
+          started: transport === 'http' ? Boolean(res?.headersSent) : Boolean(response),
           responseId,
         };
       } finally {
