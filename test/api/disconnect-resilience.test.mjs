@@ -128,7 +128,7 @@ async function waitFor(predicate, timeout = 3000) {
   }
 }
 
-function sendKernelRst(url, body) {
+function sendKernelRst(url, body, ready = (bytes) => bytes.includes('data:')) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const socket = net.createConnection({
@@ -153,7 +153,7 @@ function sendKernelRst(url, body) {
     let resetScheduled = false;
     socket.on('data', (chunk) => {
       bytes += chunk.toString('utf8');
-      if (!resetScheduled && bytes.includes('data:') && socket.resetAndDestroy) {
+      if (!resetScheduled && ready(bytes) && socket.resetAndDestroy) {
         resetScheduled = true;
         setTimeout(() => {
           socket.resetAndDestroy();
@@ -218,6 +218,86 @@ test('HTTP RST 后取消上游、写入取消片段，不产生虚假死信', as
   assert.ok(resolved);
   assert.equal(resolved?.body?.status, 'incomplete');
   assert.match(JSON.stringify(resolved.body), /persist this partial/);
+});
+
+test('Responses HTTP RST 保存可见文本与完整工具调用，只写一个取消片段', async (t) => {
+  let upstreamClosed;
+  const closed = new Promise((resolve) => {
+    upstreamClosed = resolve;
+  });
+  const baseStore = createResponsesStore({
+    directory: path.join(temporary, `rst-tools-store-${Date.now()}`),
+  });
+  const saves = [];
+  const store = {
+    ...baseStore,
+    async save(entry, options) {
+      saves.push({ entry, options });
+      return baseStore.save(entry, options);
+    },
+  };
+  const { bridge, baseUrl, account } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', {
+      choices: [{
+        delta: {
+          content: 'visible before reset',
+          tool_calls: [{
+            index: 0,
+            id: 'call_complete',
+            type: 'function',
+            function: {
+              name: 'write_file',
+              arguments: '{"input":"complete"}',
+            },
+          }],
+        },
+      }],
+    }));
+    res.flushHeaders();
+    res.once('close', upstreamClosed);
+  }, { store });
+
+  const received = await sendKernelRst(`${baseUrl}/v1/responses`, {
+    model: 'deepseek-v4.1-flash',
+    stream: true,
+    store: true,
+    input: 'reset with complete tool call',
+    tools: [{
+      type: 'function',
+      name: 'write_file',
+      parameters: {
+        type: 'object',
+        properties: { input: { type: 'string' } },
+        required: ['input'],
+      },
+    }],
+  }, (bytes) => bytes.includes('visible before reset'));
+  assert.match(received, /visible before reset/);
+  await closed;
+  await waitFor(() => inflight(account) === 0);
+  assert.equal(await bridge.waitForConnections((items) => items.length === 0, 1000), true);
+  await waitFor(() => store.memoryView().length === 1);
+
+  assert.equal(saves.length, 1);
+  assert.equal(saves[0].options.cancelInfo.reason, 'network_disconnect');
+  assert.equal(saves[0].options.partial.toolCalls[0].id, 'call_complete');
+  const [record] = store.memoryView();
+  assert.equal(record.status, 'incomplete');
+  assert.equal(record.body.incomplete_details.reason, 'canceled');
+  const message = record.body.output.find((item) => item.type === 'message');
+  assert.match(JSON.stringify(message), /visible before reset/);
+  const call = record.body.output.find((item) => item.type === 'function_call');
+  assert.ok(call, JSON.stringify({
+    output: record.body.output,
+    saves: saves.map(({ entry, options }) => ({
+      entry: entry.partial,
+      options,
+    })),
+  }));
+  assert.equal(call.call_id, 'call_complete');
+  assert.equal(call.name, 'write_file');
+  assert.deepEqual(JSON.parse(call.arguments), { input: 'complete' });
 });
 
 test('WEB_SOCKET 主动 Close 帧释放活动租约', async (t) => {

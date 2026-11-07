@@ -360,7 +360,9 @@ export function createResponsesRuntime(options = {}) {
     }
 
     function snapshot(final = false) {
-      const calls = final ? structured.finish() : structured.snapshot();
+      const snapshotValue = final ? structured.finish() : structured.snapshot();
+      const calls = Array.isArray(snapshotValue) ? snapshotValue : (snapshotValue.calls || []);
+      const invalidCalls = Array.isArray(snapshotValue) ? [] : (snapshotValue.invalid || []);
       const scanned = final ? scanner.finish() : { visibleText: '', calls: [], error: null };
       const truncation = scanned.error?.code === 'DSML_TRUNCATED';
       if (scanned.error && !truncation) {
@@ -368,8 +370,8 @@ export function createResponsesRuntime(options = {}) {
       }
       if (
         final
-        && calls.invalid?.length
-        && (calls.calls?.length || !dsmlCalls.length)
+        && invalidCalls.length
+        && (calls.length || !dsmlCalls.length)
       ) {
         throw runtimeError(
           'upstream produced an invalid structured tool call',
@@ -377,7 +379,7 @@ export function createResponsesRuntime(options = {}) {
         );
       }
       const arbitration = arbitrateToolCalls({
-        structured: { calls: calls.calls || [], invalid: [] },
+        structured: { calls, invalid: invalidCalls },
         dsml: [...dsmlCalls, ...(scanned.calls || [])],
         toolsDeclared: prepared.toolsDeclared,
         toolChoice: prepared.toolChoice,
@@ -398,7 +400,7 @@ export function createResponsesRuntime(options = {}) {
         content,
         reasoning: reasoningText.value(),
         calls: arbitration.calls,
-        callsComplete: !calls.invalid?.length,
+        callsComplete: !invalidCalls.length,
         usage: {
           prompt_tokens: Number(usage?.prompt_tokens ?? usage?.input_tokens ?? inputTokens),
           completion_tokens: Number(

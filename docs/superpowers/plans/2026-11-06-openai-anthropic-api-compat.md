@@ -3052,12 +3052,15 @@ Expected:
 
 **2026-11-07 CI 稳定版执行记录:**
 
-- 聚焦回归通过：`disconnect-resilience` 17/17、`stream-control` 25/25、
+- 聚焦回归通过：`disconnect-resilience` 18/18、`stream-control` 25/25、
   `anthropic-http` 33/33、`responses` 40/40、`failover` 11/11、
   `upstream` 9/9。
-- 全量 `npm test` 通过：基础 55/55，API 227/227，合计 282/282。
+- 全量 `npm test` 通过：基础 55/55，API 228/228，合计 283/283。
 - 独立慢读压测通过：约 1.12 MiB 连续正文触发 `BACKPRESSURE_OVERFLOW`，
   上游关闭、租约归零，子进程峰值 RSS 约 123 MiB。
+- Responses HTTP RST 回归覆盖“已发送可见文本 + 完整工具调用 + 半截同轮调用”
+  的取消场景：取消片段保留可见文本与完整调用，半截参数仍不可执行，SQLite
+  只写入一个取消片段且租约归零。
 - 2026-11-07 21:12 复跑真实链路：Codex CLI Responses HTTP 3 轮通过；
   Responses HTTP、SSE、原生 WS 和 `previous_response_id` 续接通过；
   `default` 的 Chat 文本、SSE、工具续轮、真实中断取消片段持久化通过，
