@@ -388,18 +388,21 @@ export function createResponsesRuntime(options = {}) {
         account,
         allowedToolNames: prepared.toolNames,
       });
+      const selectedCalls = prepared.parallelToolCalls === false
+        ? arbitration.calls.slice(0, 1)
+        : arbitration.calls;
       if (final && scanned.visibleText) {
         appendResponseText(visibleText, scanned.visibleText);
       }
       const content = visibleText.value();
       const completion = conservativeTokenEstimate({
         text: content,
-        tools: arbitration.calls.map((call) => call.input),
+        tools: selectedCalls.map((call) => call.input),
       });
       return {
         content,
         reasoning: reasoningText.value(),
-        calls: arbitration.calls,
+        calls: selectedCalls,
         callsComplete: !invalidCalls.length,
         usage: {
           prompt_tokens: Number(usage?.prompt_tokens ?? usage?.input_tokens ?? inputTokens),
@@ -432,6 +435,7 @@ export function createResponsesRuntime(options = {}) {
             output: prior,
             store: body.store === true,
             previousResponseId,
+            request: prepared,
             status: 'in_progress',
             usage: responseUsage(
               snapshotValue.usage.prompt_tokens,
@@ -609,6 +613,7 @@ export function createResponsesRuntime(options = {}) {
           registry: prepared.tools,
           error: { code: error.code || 'UPSTREAM_ERROR', message: error.message },
           previousResponseId,
+          request: prepared,
         });
         failed.status = 'failed';
         if (transport === 'http' && body.stream === true) {
@@ -714,6 +719,7 @@ export function createResponsesRuntime(options = {}) {
         output: prior,
         store: body.store === true,
         previousResponseId,
+        request: prepared,
       });
     }
 
@@ -846,6 +852,7 @@ export function createResponsesRuntime(options = {}) {
               usage: retained.usage,
               canceled: true,
               previousResponseId,
+              request: prepared,
             });
             cancelBody.output = mergePartialOutput(cancelBody.output, partial);
             alignLiveOutputIds(cancelBody);
@@ -916,6 +923,7 @@ export function createResponsesRuntime(options = {}) {
             usage: retained.usage,
             canceled: true,
             previousResponseId,
+            request: prepared,
           });
           cancelBody.reasoning = retained.reasoning || '';
           cancelBody.calls = retained.calls || [];
@@ -939,6 +947,7 @@ export function createResponsesRuntime(options = {}) {
                 message: persisted.error?.message || 'cancellation persistence failed',
               },
               previousResponseId,
+              request: prepared,
             });
             failed.status = 'failed';
             if (transport === 'ws') {
@@ -1231,6 +1240,7 @@ export function createResponsesRuntime(options = {}) {
           requestedMax: prepared.requestedMax,
           actuallyLimited: result.usage.completion_tokens >= Number(prepared.maxOutputTokens),
           previousResponseId,
+          request: prepared,
         });
         alignLiveOutputIds(finalBody);
         release({
@@ -1334,6 +1344,7 @@ export function createResponsesRuntime(options = {}) {
             prior,
             error: { code: failure.code || 'internal_error', message: failure.message },
             previousResponseId,
+            request: prepared,
           });
           failed.status = 'failed';
           emit(protocolEvents(failed).slice(2));
@@ -1346,6 +1357,7 @@ export function createResponsesRuntime(options = {}) {
             prior,
             error: { code: failure.code || 'internal_error', message: failure.message },
             previousResponseId,
+            request: prepared,
           });
           failed.status = 'failed';
           publishWs(cancelEvents(failed, {
@@ -1680,11 +1692,6 @@ export function createResponsesRuntime(options = {}) {
               },
             });
             ws?.close?.(1011, 'cancellation timeout');
-            return;
-          }
-          if (closed) return;
-          if (ws?.send({ type: 'response.cancelled' }) === false) {
-            ws.close?.(1000, 'interrupted');
           }
         });
       },

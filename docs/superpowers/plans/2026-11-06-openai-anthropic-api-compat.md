@@ -3064,13 +3064,35 @@ Expected:
 - Responses HTTP RST 回归覆盖“已发送可见文本 + 完整工具调用”的取消场景：
   取消片段保留可见文本与完整调用，SQLite 只写入一个取消片段且租约归零；
   半截结构化工具参数仍由既有的截断与同轮完整调用用例验证为不可执行。
-- 2026-11-07 21:12 复跑真实链路：Codex CLI Responses HTTP 3 轮通过；
+- 2026-11-07 21:29 复跑真实链路：Codex CLI Responses HTTP 4 轮通过；
   Responses HTTP、SSE、原生 WS 和 `previous_response_id` 续接通过；
-  `default` 的 Chat 文本、SSE、工具续轮、真实中断取消片段持久化通过，
-  `inflight=0`。
+  Chat 思考提示、Chat 工具续轮、Anthropic Messages 和 `default` 的 5 请求
+  账号冒烟通过，真实中断取消片段持久化且 `inflight=0`。
 - 已覆盖本次新增证据：WS 关闭 Responses 持久化后仍可无状态完成、普通业务消息
   不能冒充 Pong、三协议模型级 429 隔离、Responses SQLite 32 MiB 淘汰、Codex
   Responses 工具循环、系统签名替换不污染用户原文。
 - 按用户要求不执行手机端验收；管理页只保留既有的桌面浏览器复验结论。
 - 版本保持 `0.4.0`，不 tag、不 push；未读取、打印或提交 access token、
   refresh token 或完整客户端 Key。
+
+**2026-11-08 审计缺口收口记录:**
+
+- 聚焦回归通过：`responses` 45/45、`disconnect-resilience` 18/18、
+  `anthropic` 17/17、`anthropic-http` 33/33、`openai` 25/25。
+- 全量 `npm test` 通过：基础 55/55，API 234/234，合计 289/289。
+- 独立慢读压测通过：连续正文 1,146,880 字节触发
+  `BACKPRESSURE_OVERFLOW`；上游关闭、租约归零，子进程峰值 RSS
+  131,579,904 字节（约 125.5 MiB），增长约 40.4 MiB。
+- Responses 补齐 `parallel_tool_calls=false` 的纯能力语义，不再把该字段隐式
+  改成 `tool_choice:"required"`；最终输出最多保留一个工具调用，并回显请求中的
+  可观察生成参数。`tool_choice` 支持 `local_shell`，未知字符串、未知类型及非布尔
+  `parallel_tool_calls` 明确返回 400；所有 `file_id` content block 明确拒绝。
+- Anthropic 对 `thinking`、`mcp_servers`、`container`、`cache_control`、`top_k`
+  等未实现字段明确返回 `400 invalid_request_error`；`messages` 强制正安全整数
+  `max_tokens`，`count_tokens` 按官方形状允许省略该字段。
+- OpenAI Chat 不再静默删除 `parallel_tool_calls`，改为明确
+  `400 parallel_tool_calls_not_supported`，与 README 的兼容边界一致。
+- Responses WS 合法 `response.incomplete`/`response.failed` 终态后不再追加非标准
+  `response.cancelled`；取消持久化失败测试已改为 WS 事件驱动，删除固定 2200ms
+  等待。
+- 按用户最新要求不执行手机端验收；本轮只做离线回归、负载压测和桌面/API 验收。

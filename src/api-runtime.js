@@ -1164,7 +1164,7 @@ export function createAnthropicRuntime({
   }
 
   function countTokens({ res, body }) {
-    normalizeAnthropicRequest(body);
+    normalizeAnthropicRequest(body, { requireMaxTokens: false });
     const inputTokens = estimateAnthropicInputTokens(body);
     sendJson(res, 200, {
       input_tokens: inputTokens,

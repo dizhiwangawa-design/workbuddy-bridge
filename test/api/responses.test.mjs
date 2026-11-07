@@ -757,6 +757,7 @@ test('Responses max_output_tokens 截断优先使用 max_output_tokens 原因', 
   const body = await response.json();
   assert.equal(body.status, 'incomplete');
   assert.equal(body.incomplete_details.reason, 'max_output_tokens');
+  assert.equal(body.max_output_tokens, 2);
 });
 
 test('Responses 持久化支持续接、GET 查询和取消片段查询', async (t) => {
@@ -1561,54 +1562,72 @@ test('Responses store:false 主动中断仍发送合法 incomplete 终态', asyn
   assert.equal(stopped, 1);
 });
 
-test('Responses 取消持久化失败时不发送正常 incomplete 收尾', async (t) => {
-  const store = {
-    async save() {
-      return {
-        ok: false,
-        error: Object.assign(new Error('injected database failure'), { code: 'DB_FAILED' }),
-        deadLetterWritten: true,
-      };
+test('Responses 取消持久化失败时只发送 failed 终态', async () => {
+  const events = [];
+  let started = 0;
+  let stopped = 0;
+  const runtime = createResponsesRuntime({
+    pick: () => ({ name: 'responses-cancel-failure' }),
+    begin: () => { started += 1; },
+    end: () => { stopped += 1; },
+    readCredentials: () => ({ ok: true }),
+    upstreamClient: {
+      async chat() {
+        return {
+          status: 200,
+          ok: true,
+          headers: new Headers({ 'content-type': 'text/event-stream' }),
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(encodeSseEvent('message', {
+                choices: [{ delta: { content: 'visible partial' } }],
+              })));
+            },
+          }),
+        };
+      },
     },
-  };
-  const { baseUrl } = await fixture(t, (_req, res) => {
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
-    res.write(encodeSseEvent('message', {
-      choices: [{ delta: { content: 'visible partial' } }],
-    }));
-    res.flushHeaders();
-  }, { store });
-  const response = await fetch(`${baseUrl}/v1/responses`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: 'deepseek-v4.1-flash',
-      stream: true,
-      store: true,
-      input: 'failed cancel persistence',
-    }),
+    store: {
+      async get() { return null; },
+      async save() {
+        return {
+          ok: false,
+          error: Object.assign(new Error('injected database failure'), { code: 'DB_FAILED' }),
+          deadLetterWritten: true,
+        };
+      },
+    },
   });
-  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
-  let raw = '';
-  while (!raw.includes('visible partial')) {
-    const read = await reader.read();
-    if (read.done) break;
-    raw += read.value;
-  }
-  await new Promise((resolve) => setTimeout(resolve, 2200));
-  try {
-    while (true) {
-      const read = await reader.read();
-      if (read.done) break;
-      raw += read.value;
-    }
-  } catch {
-    // Abort may reset the downstream before the server closes it.
-  }
-  const events = parseSse(raw);
+  const session = runtime.wsSession({
+    ws: {
+      close() {},
+      send() { return true; },
+    },
+    send(event) {
+      events.push(event);
+      return true;
+    },
+    config: settings.getApiSettings(),
+  });
+  session.create({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'failed cancel persistence',
+    store: true,
+  });
+  await waitFor(() => events.some((event) => event.type === 'response.output_text.delta'));
+  session.interrupt();
+  await waitFor(() => events.some((event) => (
+    event.type === 'response.incomplete'
+    || event.type === 'response.failed'
+    || event.type === 'response.completed'
+  )));
   assert.equal(events.some((event) => event.type === 'response.incomplete'), false);
   assert.equal(events.some((event) => event.type === 'response.completed'), false);
   assert.equal(events.some((event) => event.type === 'response.failed'), true);
+  assert.equal(events.some((event) => event.type === 'response.cancelled'), false);
+  assert.equal(started, 1);
+  assert.equal(stopped, 1);
 });
 
 test('mergePartialOutput 对已完成 message 幂等', async () => {
@@ -1661,9 +1680,45 @@ test('Responses 支持 URL 图片、parallel_tool_calls=false 和 allowed_tools'
   const body = await response.json();
   assert.equal(received.tools.length, 1);
   assert.equal(received.tools[0].function.name, 'read');
-  assert.equal(received.tool_choice, 'required');
+  assert.equal(received.tool_choice, undefined);
   assert.equal(received.messages[0].content[1].image_url.url, 'https://example.test/a.png');
+  assert.equal(body.parallel_tool_calls, false);
+  assert.equal(body.tool_choice, 'auto');
   assert.equal(body.output.filter((item) => item.type === 'function_call').length, 1);
+});
+
+test('Responses parallel_tool_calls=false 不隐式强制工具调用', () => {
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'answer or use the tool',
+    tools: [{ type: 'function', name: 'read', parameters: { type: 'object' } }],
+    parallel_tool_calls: false,
+  });
+  assert.equal(prepared.body.tool_choice, undefined);
+  assert.equal(prepared.toolChoice, 'auto');
+  assert.equal(prepared.parallelToolCalls, false);
+});
+
+test('Responses 拒绝非法 parallel_tool_calls 与 tool_choice 类型', () => {
+  const tools = [{ type: 'function', name: 'read', parameters: { type: 'object' } }];
+  assert.throws(() => responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'invalid parallel flag',
+    tools,
+    parallel_tool_calls: 'false',
+  }), (error) => error.status === 400 && error.code === 'invalid_request');
+  assert.throws(() => responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'invalid choice',
+    tools,
+    tool_choice: 'sometimes',
+  }), (error) => error.status === 400 && error.code === 'invalid_request');
+  assert.throws(() => responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'invalid choice type',
+    tools,
+    tool_choice: { type: 'web_search' },
+  }), (error) => error.status === 400 && error.code === 'invalid_request');
 });
 
 test('Responses parallel_tool_calls=false 不覆盖显式 tool_choice', () => {
@@ -1790,6 +1845,20 @@ test('Responses 不支持工具与 file_id 使用明确 400', async (t) => {
   });
   assert.equal(fileId.status, 400);
   assert.equal((await fileId.json()).error.code, 'file_id_not_supported');
+  const inputFile = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: [{
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_file', file_id: 'file_1' }],
+      }],
+    }),
+  });
+  assert.equal(inputFile.status, 400);
+  assert.equal((await inputFile.json()).error.code, 'file_id_not_supported');
 });
 
 test('Responses DSML 流只发送完整工具调用，半截参数不成为可执行调用', async (t) => {

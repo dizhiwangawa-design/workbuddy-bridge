@@ -365,7 +365,6 @@ test('count_tokens 不调用上游并明确返回保守估算标记', async (t) 
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       model: 'deepseek-v4.1-flash',
-      max_tokens: 64,
       messages: [{ role: 'user', content: '你好 hello 😀' }],
     }),
   });

@@ -148,6 +148,12 @@ export function prepareOpenAIRequest(body, {
       'tools_not_supported',
     );
   }
+  if (body.parallel_tool_calls !== undefined) {
+    throw requestError(
+      'parallel_tool_calls is not supported for Chat Completions',
+      'parallel_tool_calls_not_supported',
+    );
+  }
   if (body.tools !== undefined && !Array.isArray(body.tools)) {
     throw requestError('tools must be an array');
   }
@@ -180,7 +186,6 @@ export function prepareOpenAIRequest(body, {
   outbound.stream = true;
   delete outbound.stream_options;
   delete outbound.n;
-  delete outbound.parallel_tool_calls;
   if (tools.length) {
     outbound.tools = tools;
     if (toolChoice !== undefined) outbound.tool_choice = toolChoice;

@@ -379,6 +379,7 @@ test('WEB_SOCKET response.interrupt 释放租约并返回合法 incomplete 终�
   assert.equal(terminal.data.response.status, 'incomplete');
   assert.equal(terminal.data.response.incomplete_details.reason, 'canceled');
   assert.equal(events.some((event) => event.type === 'response.completed'), false);
+  assert.equal(events.some((event) => event.type === 'response.cancelled'), false);
   ws.close(1000, 'done');
   await once(ws, 'close');
 });

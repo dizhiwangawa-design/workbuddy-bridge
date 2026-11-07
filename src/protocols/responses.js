@@ -95,7 +95,9 @@ export function baseResponse({
   error = null,
   store = true,
   previousResponseId = null,
+  request = null,
 }) {
+  const requestBody = request?.body || {};
   return {
     id,
     object: 'response',
@@ -104,28 +106,32 @@ export function baseResponse({
     background: false,
     error,
     incomplete_details: incomplete,
-    instructions: null,
-    max_output_tokens: null,
+    instructions: typeof requestBody.instructions === 'string'
+      ? requestBody.instructions
+      : null,
+    max_output_tokens: request?.requestedMax ? request.maxOutputTokens : null,
     max_tool_calls: null,
     model,
     output,
-    parallel_tool_calls: true,
+    parallel_tool_calls: request?.parallelToolCalls !== false,
     previous_response_id: previousResponseId,
     prompt_cache_key: null,
     reasoning: { effort: null, summary: null },
     safety_identifier: null,
     service_tier: 'default',
     store: Boolean(store),
-    temperature: null,
+    temperature: requestBody.temperature ?? null,
     text: { format: { type: 'text', format: null }, verbosity: 'medium' },
-    tool_choice: 'auto',
+    tool_choice: request?.requestedToolChoice ?? request?.toolChoice ?? 'auto',
     tools: [],
     top_logprobs: 0,
-    top_p: null,
-    truncation: 'disabled',
+    top_p: requestBody.top_p ?? null,
+    truncation: requestBody.truncation ?? 'disabled',
     usage,
-    user: null,
-    metadata: {},
+    user: requestBody.user ?? null,
+    metadata: requestBody.metadata && typeof requestBody.metadata === 'object'
+      ? requestBody.metadata
+      : {},
   };
 }
 
@@ -289,12 +295,14 @@ export function convertResponsesTools(input) {
 }
 
 function contentPart(item, phase) {
+  if (item?.file_id !== undefined) {
+    throw bad('file_id content is not supported', 'file_id_not_supported');
+  }
   if (item?.type === 'input_text') {
     if (typeof item.text !== 'string') throw bad(`${phase} input_text needs text`);
     return { type: 'text', text: item.text };
   }
   if (item?.type === 'input_image' || item?.type === 'image_url') {
-    if (item.file_id !== undefined) throw bad('file_id images are not supported', 'file_id_not_supported');
     const url = typeof item.image_url === 'string'
       ? item.image_url
       : item.image_url?.url || item.url;
@@ -494,11 +502,26 @@ export function prepareResponsesRequest(body, {
   const restricted = new Set(tools.map((item) => item.function.name));
   const registry = new Map([...converted.registry].filter(([name]) => restricted.has(name)));
 
+  if (
+    body.parallel_tool_calls !== undefined
+    && body.parallel_tool_calls !== null
+    && typeof body.parallel_tool_calls !== 'boolean'
+  ) {
+    throw bad('parallel_tool_calls must be boolean');
+  }
   let choice = body.tool_choice;
-  if (choice === undefined && body.parallel_tool_calls === false) choice = 'required';
+  if (typeof choice === 'string' && !['auto', 'none', 'required'].includes(choice)) {
+    throw bad('tool_choice must be auto, none, required or a tool selector');
+  }
   if (choice === 'required' && !tools.length) throw bad('tool_choice requires at least one tool');
   if (choice && typeof choice === 'object') {
-    const builtin = ['apply_patch', 'shell'].includes(choice.type) ? choice.type : '';
+    if (
+      choice.type !== undefined
+      && !['function', 'custom', 'apply_patch', 'shell', 'local_shell'].includes(choice.type)
+    ) {
+      throw bad(`tool_choice type ${choice.type || '(missing)'} is not supported`);
+    }
+    const builtin = ['apply_patch', 'shell', 'local_shell'].includes(choice.type) ? choice.type : '';
     const chosen = String(builtin || choice.name || choice.function?.name || '');
     if (!chosen) throw bad('tool_choice must name a tool');
     const match = lookupRegistry(registry, chosen);
@@ -546,6 +569,7 @@ export function prepareResponsesRequest(body, {
     ]),
     toolsDeclared: tools.length > 0,
     toolChoice: choice || 'auto',
+    requestedToolChoice: body.tool_choice === undefined ? 'auto' : body.tool_choice,
     parallelToolCalls: body.parallel_tool_calls !== false,
     requestedMax: max !== undefined,
     maxOutputTokens: max,
@@ -638,6 +662,7 @@ export function completedResponseBody({
   error = null,
   store = false,
   previousResponseId = null,
+  request = null,
 }) {
   let status = error ? 'failed' : canceled
     ? 'incomplete'
@@ -665,6 +690,7 @@ export function completedResponseBody({
     error,
     store,
     previousResponseId,
+    request,
   });
 }
 

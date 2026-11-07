@@ -241,6 +241,10 @@ test('OpenAI 请求接受 SSE 与图片，并明确拒绝关闭的工具和 file
     messages: [{ role: 'user', content: 'ping' }],
     function_call: 'auto',
   }), (error) => error.status === 400 && error.code === 'tools_not_supported');
+  assert.throws(() => prepareOpenAIRequest({
+    messages: [{ role: 'user', content: 'ping' }],
+    parallel_tool_calls: false,
+  }), (error) => error.status === 400 && error.code === 'parallel_tool_calls_not_supported');
 
   const invalidTools = [
     [{ type: 'custom', function: { name: 'x', parameters: {} } }],

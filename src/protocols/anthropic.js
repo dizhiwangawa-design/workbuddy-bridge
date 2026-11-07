@@ -12,6 +12,9 @@ function textFromBlocks(blocks, context) {
   if (!Array.isArray(blocks)) throw requestError(`${context} must be a string or content block array`);
   const parts = [];
   for (const block of blocks) {
+    if (block?.cache_control !== undefined) {
+      throw requestError(`${context} cache_control is not supported`);
+    }
     if (block?.type !== 'text' || typeof block.text !== 'string') {
       throw requestError(`${context} only supports text blocks`);
     }
@@ -96,6 +99,9 @@ function normalizeMessages(messages, warnings) {
       const toolCalls = [];
       const toolIds = new Set();
       for (const block of message.content) {
+        if (block?.cache_control !== undefined) {
+          throw requestError('assistant cache_control is not supported');
+        }
         if (block?.type === 'text') {
           if (typeof block.text !== 'string') throw requestError('assistant text block is invalid');
           texts.push(block.text);
@@ -133,6 +139,9 @@ function normalizeMessages(messages, warnings) {
     let sawNonResult = false;
     let reordered = false;
     for (const block of message.content) {
+      if (block?.cache_control !== undefined) {
+        throw requestError('user cache_control is not supported');
+      }
       if (block?.type === 'tool_result') {
         if (sawNonResult) reordered = true;
         const id = String(block.tool_use_id || '').trim();
@@ -174,12 +183,33 @@ function normalizeMessages(messages, warnings) {
   return output;
 }
 
-export function normalizeAnthropicRequest(body) {
+export function normalizeAnthropicRequest(body, {
+  requireMaxTokens = true,
+} = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw requestError('request body must be a JSON object');
   }
+  if (body.thinking !== undefined) {
+    throw requestError('thinking blocks are not supported');
+  }
+  if (body.mcp_servers !== undefined || body.container !== undefined) {
+    throw requestError('mcp_servers and container are not supported');
+  }
+  if (body.cache_control !== undefined) {
+    throw requestError('prompt caching is not supported');
+  }
+  if (body.top_k !== undefined) {
+    throw requestError('top_k is not supported');
+  }
   if (!Array.isArray(body.messages) || !body.messages.length) {
     throw requestError('messages must be a non-empty array');
+  }
+  const maxTokens = body.max_tokens;
+  if (
+    (requireMaxTokens || maxTokens !== undefined)
+    && (!Number.isSafeInteger(maxTokens) || maxTokens <= 0)
+  ) {
+    throw requestError('max_tokens must be a positive integer');
   }
 
   const warnings = [];
@@ -195,6 +225,9 @@ export function normalizeAnthropicRequest(body) {
   if (body.tools !== undefined) {
     if (!Array.isArray(body.tools)) throw requestError('tools must be an array');
     for (const tool of body.tools) {
+      if (tool?.cache_control !== undefined) {
+        throw requestError('tool cache_control is not supported');
+      }
       const name = String(tool?.name || '').trim();
       if (!name) throw requestError('tool name must not be empty');
       if (toolNames.has(name)) throw requestError(`duplicate tool name: ${name}`);
@@ -225,7 +258,7 @@ export function normalizeAnthropicRequest(body) {
     toolChoice,
     toolNames,
     warnings,
-    maxTokens: body.max_tokens,
+    maxTokens,
     model: body.model,
     temperature: body.temperature,
     topP: body.top_p,

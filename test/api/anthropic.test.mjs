@@ -156,6 +156,45 @@ test('tool_result 没有匹配前一条 assistant tool_use 时返回 400', () =>
   }), (error) => error.status === 400 && /tool_use/.test(error.message));
 });
 
+test('Anthropic 对不支持的 thinking、缓存与请求字段返回明确 400', () => {
+  const base = {
+    model: 'deepseek-v4.1-flash',
+    max_tokens: 64,
+    messages: [{ role: 'user', content: 'hello' }],
+  };
+  for (const body of [
+    { ...base, thinking: { type: 'enabled', budget_tokens: 1 } },
+    { ...base, mcp_servers: [] },
+    { ...base, container: 'container_1' },
+    { ...base, cache_control: { type: 'ephemeral' } },
+    { ...base, top_k: 5 },
+    { ...base, max_tokens: undefined },
+    { ...base, max_tokens: 0 },
+    {
+      ...base,
+      system: [{ type: 'text', text: 'system', cache_control: { type: 'ephemeral' } }],
+    },
+    {
+      ...base,
+      tools: [{
+        name: 'read',
+        input_schema: { type: 'object' },
+        cache_control: { type: 'ephemeral' },
+      }],
+    },
+  ]) {
+    assert.throws(
+      () => normalizeAnthropicRequest(body),
+      (error) => error.status === 400 && error.type === 'invalid_request_error',
+    );
+  }
+  const countOnly = normalizeAnthropicRequest({
+    model: 'deepseek-v4.1-flash',
+    messages: [{ role: 'user', content: 'count me' }],
+  }, { requireMaxTokens: false });
+  assert.equal(countOnly.maxTokens, undefined);
+});
+
 test('结构化工具调用只在响应结束时完成，并与 DSML 完全隔离', () => {
   const structured = createStructuredToolAssembler();
   structured.push([{
