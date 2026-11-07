@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { ApiError } from './api-errors.js';
-import { readAccountCredentials, saveRefreshedCredentials } from './auth-store.js';
+import {
+  readAccountCredentials,
+  refreshAccountCredentials,
+} from './auth-store.js';
 import { beginTask, endTask, loadPool, pickAccount } from './pool.js';
 import { createUpstreamClient } from './upstream-client.js';
 import { createSseParser } from './sse.js';
@@ -86,7 +89,6 @@ export function createResponsesRuntime(options = {}) {
   const {
     upstreamClient = createUpstreamClient(),
     readCredentials = readAccountCredentials,
-    saveCredentials = saveRefreshedCredentials,
     pick = pickAccount,
     begin = beginTask,
     end = endTask,
@@ -115,14 +117,16 @@ export function createResponsesRuntime(options = {}) {
     }
   }
 
-  async function refresh(credentials) {
+  async function refresh(account, credentials) {
     if (!credentials?.refreshToken) return credentials;
     try {
-      return saveCredentials(
-        credentials,
-        await upstreamClient.refresh(credentials),
-        { now: now() },
-      );
+      const refreshed = await refreshAccountCredentials(account, upstreamClient, {
+        now: now(),
+        refreshSkewMs: 0,
+      });
+      if (refreshed?.ok) return refreshed;
+      debug(`Responses credential refresh failed: ${refreshed?.reason || 'unknown error'}`);
+      return credentials;
     } catch (error) {
       debug(`Responses credential refresh failed: ${error.message}`);
       return credentials;
@@ -856,7 +860,7 @@ export function createResponsesRuntime(options = {}) {
           'AUTH_REQUIRED',
           { status: 401, type: 'authentication_error', retryable: true },
         );
-        if (credentials.needsRefresh) credentials = await refresh(credentials);
+        if (credentials.needsRefresh) credentials = await refresh(account, credentials);
         armFirstByte();
         armTotal();
         let upstream = await upstreamClient.chat({
@@ -868,7 +872,7 @@ export function createResponsesRuntime(options = {}) {
           signal: controller.signal,
         });
         if (upstream.status === 401 && credentials.refreshToken) {
-          credentials = await refresh(credentials);
+          credentials = await refresh(account, credentials);
           upstream = await upstreamClient.chat({
             accountId: account,
             credentials,

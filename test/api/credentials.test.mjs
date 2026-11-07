@@ -127,3 +127,83 @@ test('刷新结果以 0600 安全回写原凭据文件并保留其他字段', ()
   assert.equal(saved.auth.refreshExpiresAt, 2000007200000);
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 });
+
+
+test('同账号并发刷新只调用一次上游并原子回写', async () => {
+  const file = writeCredential('cred-refresh-lock', {
+    accessToken: 'lock-old-access',
+    refreshToken: 'lock-refresh',
+    expiresAt: Math.floor((Date.now() + 500) / 1000),
+    refreshExpiresAt: Math.floor((Date.now() + 86400) / 1000),
+  });
+  let calls = 0;
+  const client = {
+    async refresh() {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return { accessToken: 'lock-new-access', expiresIn: 3600 };
+    },
+  };
+  const [first, second] = await Promise.all([
+    auth.refreshAccountCredentials('cred-refresh-lock', client),
+    auth.refreshAccountCredentials('cred-refresh-lock', client),
+  ]);
+  assert.equal(calls, 1);
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(first.accessToken, 'lock-new-access');
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).auth.accessToken, 'lock-new-access');
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+});
+
+test('刷新期间外部 CLI 写入更新凭据时不反向覆盖', async () => {
+  const file = writeCredential('cred-refresh-race', {
+    accessToken: 'race-old-access',
+    refreshToken: 'race-refresh',
+    expiresAt: Math.floor((Date.now() + 500) / 1000),
+    refreshExpiresAt: Math.floor((Date.now() + 86400) / 1000),
+  });
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const client = {
+    async refresh() {
+      await gate;
+      return { accessToken: 'race-refreshed-access', expiresIn: 3600 };
+    },
+  };
+  const pending = auth.refreshAccountCredentials('cred-refresh-race', client);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+  doc.auth.accessToken = 'race-external-newer';
+  doc.auth.expiresAt = Date.now() + 7200000;
+  fs.writeFileSync(file, JSON.stringify(doc, null, 2), { mode: 0o600 });
+  release();
+  const result = await pending;
+  assert.equal(result.ok, true);
+  assert.equal(result.accessToken, 'race-external-newer');
+  assert.equal(
+    JSON.parse(fs.readFileSync(file, 'utf8')).auth.accessToken,
+    'race-external-newer',
+  );
+});
+
+
+test('刷新失败返回可诊断错误且不泄漏 token', async () => {
+  writeCredential('cred-refresh-failure', {
+    accessToken: 'failure-old-access',
+    refreshToken: 'failure-secret-refresh',
+    expiresAt: Math.floor((Date.now() + 500) / 1000),
+    refreshExpiresAt: Math.floor((Date.now() + 86400) / 1000),
+  });
+  const result = await auth.refreshAccountCredentials('cred-refresh-failure', {
+    async refresh() {
+      throw Object.assign(new Error('refresh rejected'), { code: 'UPSTREAM_401' });
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'UPSTREAM_401');
+  assert.equal(result.reason, 'refresh rejected');
+  assert.equal(JSON.stringify(result).includes('failure-secret-refresh'), false);
+});

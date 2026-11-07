@@ -17,7 +17,11 @@ import {
 import { createDsmlScanner } from './tool-calls.js';
 import { createSseParser, encodeSseEvent } from './sse.js';
 import { ApiError, sendApiError } from './api-errors.js';
-import { readAccountCredentials, saveRefreshedCredentials } from './auth-store.js';
+import {
+  readAccountCredentials,
+  refreshAccountCredentials,
+  saveRefreshedCredentials,
+} from './auth-store.js';
 import {
   beginTask,
   endTask,
@@ -120,6 +124,8 @@ function usageFromChunk(chunk, usage) {
   };
 }
 
+const RETRY_STATUS = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
+
 function upstreamError(status, detail = '') {
   if (detail) debug(`WorkBuddy upstream HTTP ${status}: ${String(detail).slice(0, 500)}`);
   if (status === 401) {
@@ -138,7 +144,15 @@ function upstreamError(status, detail = '') {
       retryable: true,
     });
   }
-  if (status >= 500) {
+  if (status === 402 || status === 403) {
+    return new RuntimeFailure(`WorkBuddy upstream forbidden or quota exhausted (${status})`, {
+      status,
+      type: status === 402 ? 'insufficient_quota' : 'permission_error',
+      code: 'RATE_LIMITED',
+      retryable: true,
+    });
+  }
+  if (status >= 500 || RETRY_STATUS.has(status)) {
     return new RuntimeFailure(`WorkBuddy upstream HTTP ${status}`, {
       status: 502,
       type: 'api_error',
@@ -486,8 +500,13 @@ export function createAnthropicRuntime({
     async function refreshCredentials(credentials) {
       if (!credentials.refreshToken) return credentials;
       try {
-        const refreshed = await upstreamClient.refresh(credentials);
-        return saveCredentials(credentials, refreshed, { now: now() });
+        const refreshed = await refreshAccountCredentials(account, upstreamClient, {
+          now: now(),
+          refreshSkewMs: 0,
+        });
+        if (refreshed?.ok) return refreshed;
+        debug(`credential refresh failed: ${refreshed?.reason || 'unknown error'}`);
+        return credentials;
       } catch (error) {
         debug(`credential refresh failed: ${error.message}`);
         return credentials;
@@ -899,16 +918,7 @@ export function createOpenAIRuntime({
   cancelPersistence = createResponsesStore({ now }),
 } = {}) {
   const keepaliveMs = effectiveKeepaliveMs(injectedKeepaliveMs);
-  async function refreshCredentials(credentials) {
-    if (!credentials.refreshToken) return credentials;
-    try {
-      const refreshed = await upstreamClient.refresh(credentials);
-      return saveCredentials(credentials, refreshed, { now: now() });
-    } catch (error) {
-      debug(`OpenAI credential refresh failed: ${error.message}`);
-      return credentials;
-    }
-  }
+
 
   async function executeAttempt({
     req,
@@ -1127,6 +1137,33 @@ export function createOpenAIRuntime({
         if (body.stream && visibleText.length > before) {
           emit(encoder.textDelta(visibleText.slice(before)));
         }
+      }
+    }
+
+    async function refreshCredentials(credentials) {
+      if (!credentials.refreshToken) return credentials;
+      try {
+        const refreshed = await refreshAccountCredentials(account, upstreamClient, {
+          now: now(),
+          refreshSkewMs: 0,
+        });
+        if (refreshed?.ok) return refreshed;
+        debug(`OpenAI credential refresh failed: ${refreshed?.reason || 'unknown error'}`);
+        throw new RuntimeFailure('WorkBuddy account authorization failed', {
+          status: 401,
+          type: 'authentication_error',
+          code: 'AUTH_REQUIRED',
+          retryable: true,
+        });
+      } catch (error) {
+        if (error instanceof RuntimeFailure) throw error;
+        debug(`OpenAI credential refresh failed: ${error.message}`);
+        throw new RuntimeFailure('WorkBuddy account authorization failed', {
+          status: 401,
+          type: 'authentication_error',
+          code: 'AUTH_REQUIRED',
+          retryable: true,
+        });
       }
     }
 
@@ -1497,7 +1534,13 @@ export function createOpenAIRuntime({
       try {
         let credentials = readCredentials(picked.name, { now: now() });
         if (!credentials?.ok) throw new Error('no credentials');
-        if (credentials.needsRefresh) credentials = await refreshCredentials(credentials);
+        if (credentials.needsRefresh) {
+          const refreshed = await refreshAccountCredentials(picked.name, upstreamClient, {
+            now: now(),
+            refreshSkewMs: 0,
+          });
+          if (refreshed?.ok) credentials = refreshed;
+        }
         const payload = await upstreamClient.models(credentials);
         const models = mapModelCatalogue(payload, {
           defaultModel: config.defaultModel,

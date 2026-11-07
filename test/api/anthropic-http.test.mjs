@@ -485,6 +485,49 @@ test('上游 401 会刷新 Token、0600 回写凭据后重试同一请求', asyn
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 });
 
+test('并发 401 只触发一次凭据刷新，两个请求都成功', async (t) => {
+  let refreshCalls = 0;
+  let chatCalls = 0;
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    if (req.url === '/v2/plugin/auth/token/refresh') {
+      refreshCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { accessToken: 'shared-access-new', expiresIn: 3600 } }));
+      return;
+    }
+    chatCalls += 1;
+    if (req.headers.authorization !== 'Bearer shared-access-new') {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{}');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  }, {
+    accountNames: ['refresh-shared'],
+    config: { totalTimeoutMs: 5000 },
+  });
+  pool.updateAccount('refresh-shared', { maxConcurrency: 2 });
+  const body = JSON.stringify({
+    model: 'deepseek-v4.1-flash',
+    max_tokens: 16,
+    messages: [{ role: 'user', content: 'same account' }],
+    stream: false,
+  });
+  const responses = await Promise.all([
+    fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body,
+    }),
+    fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body,
+    }),
+  ]);
+  assert.deepEqual(responses.map((response) => response.status), [200, 200]);
+  assert.equal(refreshCalls, 1);
+  assert.ok(chatCalls >= 3 && chatCalls <= 4, `unexpected chat attempts: ${chatCalls}`);
+});
+
 test('流已开始后空闲超时发送 error、无 message_stop 并释放租约', async (t) => {
   const { baseUrl } = await startFixture(t, async (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });

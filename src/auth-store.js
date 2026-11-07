@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { accountAuthDir, getAccount } from './accounts.js';
 import { writeJson } from './paths.js';
 
@@ -83,13 +84,14 @@ export function saveRefreshedCredentials(credentials, refreshed, {
     auth.refreshToken = refreshed.refreshToken;
   }
 
+  const timestamp = typeof now === 'function' ? now() : Number(now);
   const expiresIn = Number(refreshed.expiresIn);
   if (Number.isFinite(expiresIn) && expiresIn > 0) {
-    auth.expiresAt = now + expiresIn * 1000;
+    auth.expiresAt = timestamp + expiresIn * 1000;
   }
   const refreshExpiresIn = Number(refreshed.refreshExpiresIn);
   if (Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0) {
-    auth.refreshExpiresAt = now + refreshExpiresIn * 1000;
+    auth.refreshExpiresAt = timestamp + refreshExpiresIn * 1000;
   }
   current.auth = auth;
   writeJson(credentials.filePath, current, 0o600);
@@ -101,4 +103,87 @@ export function saveRefreshedCredentials(credentials, refreshed, {
     refreshExpiresAt: normalizeEpochMs(auth.refreshExpiresAt),
     needsRefresh: false,
   };
+}
+
+
+const refreshLocks = new Map();
+
+/** Refresh one account's access token, sharing one in-flight request with callers
+ * for the same account so concurrent API requests cannot stampede the auth service. */
+export function refreshAccountCredentials(accountName, client, {
+  now: nowValue = Date.now(),
+  refreshSkewMs = 0,
+} = {}) {
+  const now = () => (typeof nowValue === 'function' ? nowValue() : Number(nowValue));
+  const key = String(accountName);
+  const existing = refreshLocks.get(key);
+  if (existing) return existing;
+
+  const task = (async () => {
+    const current = readAccountCredentials(key, { now: now(), refreshSkewMs });
+    if (!current.ok) return current;
+    if (!current.refreshToken) return { ok: false, reason: '账号没有可用的 refresh token' };
+
+    let refreshed;
+    try {
+      refreshed = await client.refresh(current);
+    } catch (error) {
+      return { ok: false, reason: error?.message || '凭据刷新失败', code: error?.code };
+    }
+    if (typeof refreshed?.accessToken !== 'string' || !refreshed.accessToken) {
+      return { ok: false, reason: '刷新响应缺少 accessToken', code: 'INVALID_REFRESH_RESPONSE' };
+    }
+
+    // A separate CLI login may have produced a newer token while refresh was in
+    // flight. Never replace that newer credential with our older response.
+    const latest = readAccountCredentials(key, { now: now(), refreshSkewMs: 0 });
+    if (
+      latest.ok
+      && latest.accessToken !== current.accessToken
+      && (latest.expiresAt || 0) >= (current.expiresAt || 0)
+    ) {
+      return latest;
+    }
+
+    let doc;
+    try {
+      doc = JSON.parse(fs.readFileSync(current.filePath, 'utf8'));
+    } catch (error) {
+      return { ok: false, reason: error?.message || '凭据文件读取失败', code: error?.code };
+    }
+    const auth = doc.auth && typeof doc.auth === 'object' ? doc.auth : {};
+    auth.accessToken = refreshed.accessToken;
+    if (typeof refreshed.refreshToken === 'string' && refreshed.refreshToken) {
+      auth.refreshToken = refreshed.refreshToken;
+    }
+    const expiresIn = Number(refreshed.expiresIn);
+    if (Number.isFinite(expiresIn) && expiresIn > 0) {
+      auth.expiresAt = now() + expiresIn * 1000;
+    }
+    const refreshExpiresIn = Number(refreshed.refreshExpiresIn);
+    if (Number.isFinite(refreshExpiresIn) && refreshExpiresIn > 0) {
+      auth.refreshExpiresAt = now() + refreshExpiresIn * 1000;
+    }
+    doc.auth = auth;
+
+    const temporary = `${current.filePath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      fs.writeFileSync(temporary, JSON.stringify(doc, null, 2), { mode: 0o600 });
+      fs.chmodSync(temporary, 0o600);
+      fs.renameSync(temporary, current.filePath);
+    } catch (error) {
+      try {
+        fs.unlinkSync(temporary);
+      } catch {
+        // Ignore cleanup failure; the original credential remains authoritative.
+      }
+      return { ok: false, reason: error?.message || '凭据文件写入失败', code: error?.code };
+    }
+    return readAccountCredentials(key, { now: now(), refreshSkewMs: 0 });
+  })().finally(() => {
+    refreshLocks.delete(key);
+  });
+
+  refreshLocks.set(key, task);
+  return task;
 }
