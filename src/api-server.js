@@ -10,6 +10,9 @@ import {
 import { ApiError, sendApiError } from './api-errors.js';
 import { createAnthropicRuntime, createOpenAIRuntime } from './api-runtime.js';
 import { createResponsesRuntime } from './api-responses.js';
+import { pickAccount } from './pool.js';
+import { readAccountCredentials } from './auth-store.js';
+import { createUpstreamClient } from './upstream-client.js';
 
 function sendJson(res, status, body) {
   res.writeHead(status, {
@@ -267,6 +270,37 @@ export function createApiAuthCheck(deps = {}) {
   };
 }
 
+function connectionProbeResult(protocol, startedAt, result = {}, error = null) {
+  const account = result?.account || error?.account || null;
+  return {
+    ok: Boolean(result?.ok) && !error,
+    protocol,
+    account,
+    durationMs: Math.max(0, Number(result?.durationMs) || Date.now() - startedAt),
+    code: error?.code || result?.code || (error ? 'INTERNAL_ERROR' : 'OK'),
+  };
+}
+
+/** Run a minimal protocol probe through the same direct upstream runtime.
+ * The caller only receives an operational summary; prompts and credentials
+ * stay inside this function. */
+export async function probeApiConnection({ protocol, config, runtime, now = Date.now }) {
+  const startedAt = now();
+  try {
+    const result = await runtime.chat({
+      body: { prompt: 'Reply with exactly: ok', stream: false },
+      config,
+    });
+    return connectionProbeResult(protocol, startedAt, result);
+  } catch (error) {
+    return connectionProbeResult(protocol, startedAt, {},
+      Object.assign({}, error, {
+        code: error?.code || 'UPSTREAM_ERROR',
+        account: error?.account || null,
+      }));
+  }
+}
+
 export async function handleApiSettingsApi(req, res, url) {
   const pathname = url.pathname;
   try {
@@ -281,6 +315,69 @@ export async function handleApiSettingsApi(req, res, url) {
         return true;
       }
       sendJson(res, 405, { ok: false, error: 'method not allowed' });
+      return true;
+    }
+
+    if (pathname === '/api/api-compat/test') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        return true;
+      }
+      const body = await readBody(req);
+      if (!['openai', 'anthropic'].includes(body.protocol)) {
+        sendJson(res, 400, { ok: false, error: 'protocol must be openai or anthropic' });
+        return true;
+      }
+      const config = getApiSettings();
+      const result = await probeApiConnection({
+        protocol: body.protocol,
+        config,
+        runtime: {
+          async chat({ body: probeBody, config: probeConfig }) {
+            const pool = pickAccount();
+            if (!pool.name) {
+              const error = new ApiError(503, 'no usable account', { code: 'POOL_EMPTY' });
+              error.account = null;
+              throw error;
+            }
+            const credentials = readAccountCredentials(pool.name);
+            if (!credentials?.ok) {
+              const error = new ApiError(401, 'no usable credentials', { code: 'AUTH_REQUIRED' });
+              error.account = pool.name;
+              throw error;
+            }
+            const started = Date.now();
+            const chat = await createUpstreamClient();
+            const response = await chat.chat({
+              accountId: pool.name,
+              credentials,
+              model: probeConfig.defaultModel,
+              body: {
+                messages: [{ role: 'user', content: 'Reply with exactly: ok' }],
+                stream: true,
+              },
+              sanitize: probeConfig.channelSanitize,
+            });
+            if (!response.ok) {
+              const error = new ApiError(
+                response.status === 429 ? 429 : 502,
+                `upstream HTTP ${response.status}`,
+                { code: response.status === 429 ? 'RATE_LIMITED' : 'UPSTREAM_ERROR' },
+              );
+              error.account = pool.name;
+              throw error;
+            }
+            const text = await response.text();
+            return {
+              ok: text.includes('data:') || text.length > 0,
+              account: pool.name,
+              durationMs: Date.now() - started,
+              code: 'OK',
+            };
+          },
+        },
+      });
+      sendJson(res, 200, result);
       return true;
     }
 

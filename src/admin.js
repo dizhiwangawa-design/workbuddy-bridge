@@ -242,6 +242,20 @@ export function adminPage({ home = '', token = '' } = {}) {
   .api-option small{color:var(--muted);font-size:10px}
   .api-option .switch:disabled{opacity:.35;cursor:not-allowed}
   .api-option>div>small{display:block}
+  .api-config-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:10px}
+  .api-config-grid label{display:flex;align-items:center;gap:7px;padding:8px 9px;border:1px solid var(--line);
+                         border-radius:8px;background:var(--card);font-size:10.5px;min-width:0}
+  .api-config-grid input[type=checkbox]{accent-color:var(--brand);margin:0}
+  .api-fields{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:8px;margin-top:10px}
+  .api-field{display:flex;flex-direction:column;gap:3px;min-width:0}
+  .api-field span{font-size:9.5px;color:var(--muted)}
+  .api-field input{width:100%;min-width:0;background:var(--card);border:1px solid var(--line);border-radius:8px;
+                   padding:6px 8px;font-size:10.5px;outline:none}
+  .api-field input:focus{border-color:var(--brand2)}
+  .api-field.wide{grid-column:span 2}
+  .api-actions.test{margin-top:10px;flex-wrap:wrap}
+  .api-test-note{font-size:10px;color:var(--muted);line-height:1.5;margin-top:6px}
+  .api-test-result{font-size:10.5px;color:var(--muted);margin-top:5px;min-height:16px}
   .key-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px dashed var(--line)}
   .key-row:last-child{border-bottom:0}
   .key-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 13%,transparent)}
@@ -331,6 +345,8 @@ export function adminPage({ home = '', token = '' } = {}) {
     .heat-stats{grid-template-columns:repeat(2,1fr);gap:10px 24px}
     .feed-row .mdl{max-width:36%}
     .api-grid{grid-template-columns:minmax(0,1fr);padding:0 11px}
+    .api-config-grid,.api-fields{grid-template-columns:minmax(0,1fr)}
+    .api-field.wide{grid-column:auto}
   }
 </style></head>
 <body>
@@ -437,6 +453,43 @@ export function adminPage({ home = '', token = '' } = {}) {
           <button class="mini" data-act="api-copy-endpoint" title="复制接口地址">复制</button>
         </div>
         <div class="api-meta" id="api-meta"></div>
+      </div>
+      <div class="api-card api-controls">
+        <div class="api-card-head">
+          <div class="api-icon">⚙</div>
+          <div class="api-copy">
+            <div class="api-name">API 总开关与兼容选项</div>
+            <div class="api-desc">总开关、流式、工具、通道清洗与客户端 Key 策略</div>
+          </div>
+          <span class="api-state" id="api-master-state">关闭</span>
+          <button class="switch" id="api-master-switch" role="switch" aria-checked="false" data-act="api-master-toggle" title="启用/停用 API 总开关"></button>
+        </div>
+        <div class="api-config-grid">
+          <label><input type="checkbox" data-api-config="enabled"> API 总开关</label>
+          <label><input type="checkbox" data-api-config="openai"> OpenAI 协议</label>
+          <label><input type="checkbox" data-api-config="anthropic"> Anthropic 协议</label>
+          <label><input type="checkbox" data-api-config="streaming"> 流式响应</label>
+          <label><input type="checkbox" data-api-config="tools"> 工具调用</label>
+          <label><input type="checkbox" data-api-config="channelSanitize"> 通道兼容清洗</label>
+          <label><input type="checkbox" data-api-config="requireApiKey"> 所有连接要求 API Key</label>
+          <label><input type="checkbox" data-api-config="remoteRequireKey"> 远程连接要求 API Key</label>
+          <label><input type="checkbox" data-api-config="trustProxy"> 信任反向代理</label>
+        </div>
+        <div class="api-fields">
+          <label class="api-field wide"><span>上游地址</span><input data-api-field="upstreamBaseUrl" placeholder="https://copilot.tencent.com"/></label>
+          <label class="api-field"><span>默认模型</span><input data-api-field="defaultModel" placeholder="deepseek-v4.1-flash"/></label>
+          <label class="api-field"><span>首字节超时 (ms)</span><input data-api-field="firstByteTimeoutMs" inputmode="numeric"/></label>
+          <label class="api-field"><span>空闲超时 (ms)</span><input data-api-field="idleTimeoutMs" inputmode="numeric"/></label>
+          <label class="api-field"><span>总超时 (ms)</span><input data-api-field="totalTimeoutMs" inputmode="numeric"/></label>
+        </div>
+        <div class="api-actions test">
+          <button class="ghost" data-act="api-test-openai">测试 OpenAI 文本</button>
+          <button class="ghost" data-act="api-test-anthropic">测试 Anthropic 工具</button>
+          <span class="grow"></span>
+          <button class="primary" data-act="api-save-settings">保存连接配置</button>
+        </div>
+        <div class="api-test-note">测试只显示 ok、耗时、账号与错误码，不显示提示词、token 或完整 Key。</div>
+        <div class="api-test-result" id="api-test-result"></div>
       </div>
       <div class="api-card">
         <div class="api-card-head">
@@ -935,6 +988,17 @@ function renderApi(){
     '<span>鉴权 <b>'+authMode+'</b></span>'+
     '<span>流超时 <b>'+Math.round(s.idleTimeoutMs/1000)+'s</b></span>'+
     '<span>DSML 上限 <b>'+num(s.dsmlMaxBufferBytes)+' B</b></span>';
+  var masterEnabled=!!s.enabled;
+  $('api-master-state').textContent=masterEnabled?'已启用':'已关闭';
+  $('api-master-state').className='api-state'+(masterEnabled?'':' off');
+  $('api-master-switch').setAttribute('aria-checked',masterEnabled?'true':'false');
+  document.querySelectorAll('[data-api-config]').forEach(function(el){
+    el.checked=!!s[el.getAttribute('data-api-config')];
+  });
+  document.querySelectorAll('[data-api-field]').forEach(function(el){
+    var field=el.getAttribute('data-api-field');
+    if(document.activeElement!==el) el.value=s[field]===undefined?'':s[field];
+  });
   var keys=Array.isArray(s.keys)?s.keys:[];
   if(!keys.length){
     $('api-keys').innerHTML='<div class="key-empty">还没有客户端 Key。回环地址可直接调试；远程调用请先生成 Key。</div>';
@@ -1043,6 +1107,44 @@ document.addEventListener('click',function(ev){
   if(!el) return;
   var a=el.getAttribute('data-act'), name=el.getAttribute('data-name');
   if(a==='add') return openAdd();
+  if(a==='api-master-toggle'){
+    var masterOn=el.getAttribute('aria-checked')==='true';
+    return act(function(){
+      return api('/api/api-compat',{method:'PATCH',body:JSON.stringify({enabled:!masterOn})})
+        .then(function(){toast(!masterOn?'API 总开关已启用':'API 总开关已关闭')});
+    });
+  }
+  if(a==='api-save-settings'){
+    var patch={};
+    document.querySelectorAll('[data-api-config]').forEach(function(input){
+      patch[input.getAttribute('data-api-config')]=!!input.checked;
+    });
+    document.querySelectorAll('[data-api-field]').forEach(function(input){
+      var field=input.getAttribute('data-api-field');
+      var value=input.value.trim();
+      if(/Ms$/.test(field)) value=Number(value);
+      patch[field]=value;
+    });
+    el.disabled=true;
+    return api('/api/api-compat',{method:'PATCH',body:JSON.stringify(patch)})
+      .then(function(){toast('API 配置已保存')})
+      .catch(function(e){toast(e.message,true)})
+      .then(function(){el.disabled=false;return load()});
+  }
+  if(a==='api-test-openai'||a==='api-test-anthropic'){
+    var protocol=a==='api-test-openai'?'openai':'anthropic';
+    el.disabled=true;
+    return api('/api/api-compat/test',{method:'POST',body:JSON.stringify({protocol:protocol})})
+      .then(function(result){
+        var prefix=protocol==='openai'?'OpenAI':'Anthropic';
+        $('api-test-result').textContent=prefix+' · '+(result.ok?'ok':'失败')+
+          ' · '+(result.account||'unknown')+' · '+Math.round(result.durationMs||0)+'ms'+
+          ' · '+(result.code||'UNKNOWN');
+        toast(result.ok?prefix+' 连接测试通过':prefix+' 连接测试失败',!result.ok);
+      })
+      .catch(function(e){toast(e.message,true)})
+      .then(function(){el.disabled=false});
+  }
   if(a==='api-toggle'){
     var apiOn=el.getAttribute('aria-checked')==='true';
     return act(function(){
