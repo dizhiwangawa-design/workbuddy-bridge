@@ -20,7 +20,6 @@ import { ApiError, sendApiError } from './api-errors.js';
 import {
   readAccountCredentials,
   refreshAccountCredentials,
-  saveRefreshedCredentials,
 } from './auth-store.js';
 import {
   beginTask,
@@ -209,6 +208,9 @@ function streamHeaders() {
 }
 
 function normalizeBody(body, config) {
+  if (body?.stream === true && config.streaming === false) {
+    throw new ApiError(400, 'streaming is disabled', { code: 'streaming_disabled' });
+  }
   const candidate = {
     ...body,
     model: body?.model || config.defaultModel,
@@ -241,7 +243,6 @@ export function estimateAnthropicInputTokens(body) {
 export function createAnthropicRuntime({
   upstreamClient = createUpstreamClient(),
   readCredentials = readAccountCredentials,
-  saveCredentials = saveRefreshedCredentials,
   pick = pickAccount,
   begin = beginTask,
   end = endTask,
@@ -906,7 +907,6 @@ function openAIUsage(source, fallbackInput = 0, fallbackOutput = 0) {
 export function createOpenAIRuntime({
   upstreamClient = createUpstreamClient(),
   readCredentials = readAccountCredentials,
-  saveCredentials = saveRefreshedCredentials,
   pick = pickAccount,
   begin = beginTask,
   end = endTask,
@@ -918,7 +918,6 @@ export function createOpenAIRuntime({
   cancelPersistence = createResponsesStore({ now }),
 } = {}) {
   const keepaliveMs = effectiveKeepaliveMs(injectedKeepaliveMs);
-
 
   async function executeAttempt({
     req,
