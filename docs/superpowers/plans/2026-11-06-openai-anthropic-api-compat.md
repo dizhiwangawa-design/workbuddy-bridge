@@ -3050,8 +3050,10 @@ Expected:
   不再兜底广告未确认模型。
 - [x] 重新通过真实 `default` 账号冒烟、Responses HTTP/SSE/原生 WS/续接和
   Codex CLI 多步编码验收。
+- [x] 在 `deepseek-v4.1-flash` 配额重置后，用 `test:live:account` 对
+  `codex-fresh-mvxgctfk` 完成一次通过（5 请求，`inflight=0`）。
 - [ ] 在 `deepseek-v4.1-flash` 配额重置后，用 `test:live:account` 对
-  `awa` 和 `codex-fresh-mvxgctfk` 各完成一次通过。该步骤只能等待外部配额恢复。
+  `awa` 完成一次通过；当前仅受上游模型级 429 配额阻断，等待外部配额恢复。
 
 **2026-11-07 CI 稳定版执行记录:**
 
@@ -3095,4 +3097,6 @@ Expected:
 - Responses WS 合法 `response.incomplete`/`response.failed` 终态后不再追加非标准
   `response.cancelled`；取消持久化失败测试已改为 WS 事件驱动，删除固定 2200ms
   等待。
+- 真实账号验收已通过 `default` 与 `codex-fresh-mvxgctfk`；前者完成 Chat、
+  SSE、工具续轮和真实中断持久化，后者完成 5 请求最短文本冒烟且 `inflight=0`。
 - 按用户最新要求不执行手机端验收；本轮只做离线回归、负载压测和桌面/API 验收。
