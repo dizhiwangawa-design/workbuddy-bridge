@@ -2866,12 +2866,12 @@ Expected:
 - `awa` 单独重试仍返回上游 `429 RATE_LIMITED`，因此“每个已登录账号至少成功一次”
   未满足；`codex-fresh-mvxgctfk` 返回同一上游 429。两者提示的重置时间分别为
   2026-11-08 02:27:25 和 2026-11-07 22:40:23（UTC+8）。
-- 清除本地冷却后，`awa` 与 `codex-fresh-mvxgctfk` 使用 `deepseek-v4-flash`
+- 清除本地冷却后，`awa` 与 `codex-fresh-mvxgctfk` 使用显式指定的非默认诊断模型
   均通过同一套 5 请求账号冒烟（文本、SSE、工具续轮、主动中断取消片段持久化、
   租约归零）。这证明阻塞是 `deepseek-v4.1-flash` 的外部模型级配额，不是凭据、
   号池或协议链路故障；默认模型仍保持 `deepseek-v4.1-flash`，没有自动换模型掩盖 429。
 - 2026-11-07 20:28 再次复核：两个受限账号的 `deepseek-v4.1-flash` 仍为 429；
-  将 429 冷却绑定失败模型后，同一账号显式请求 `deepseek-v4-flash` 均通过，
+  将 429 冷却绑定失败模型后，同一账号显式请求非默认诊断模型均通过，
   管理视图中的 `cooldownModels` 只记录 `deepseek-v4.1-flash`。
 - 未读取、打印或提交 access token、refresh token 或完整客户端 Key。
 
