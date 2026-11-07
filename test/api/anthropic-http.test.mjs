@@ -778,6 +778,7 @@ test('Anthropic 主动取消先持久化，再用合法 canceled 收尾', async 
     on() {},
     off() {},
   };
+  createAccount('api-a');
   const run = runtime.messages({
     req: { once() {}, off() {} },
     res,
@@ -804,6 +805,93 @@ test('Anthropic 主动取消先持久化，再用合法 canceled 收尾', async 
   const record = store.memoryView()[0];
   assert.equal(record.status, 'incomplete');
   assert.equal(record.body.output[0].content[0].text, 'visible partial');
+});
+
+test('Anthropic 取消顺序为停止上游、释放租约、持久化、合法收尾', async (t) => {
+  const events = [];
+  let releaseLease;
+  const leaseReleased = new Promise((resolve) => {
+    releaseLease = resolve;
+  });
+  let releaseSave;
+  const saveStarted = new Promise((resolve) => {
+    releaseSave = resolve;
+  });
+  const store = {
+    async save() {
+      events.push(`save:${inflight('api-a')}`);
+      releaseSave();
+      await leaseReleased;
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const upstreamClient = {
+    chat: async ({ signal }) => {
+      events.push('upstream:start');
+      return {
+        status: 200,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+            ));
+            signal.addEventListener('abort', () => {
+              events.push('upstream:abort');
+              controller.error(signal.reason);
+            }, { once: true });
+          },
+        }),
+      };
+    },
+  };
+  const { createAnthropicRuntime } = await import('../../src/api-runtime.js');
+  const runtime = createAnthropicRuntime({ upstreamClient, cancelPersistence: store });
+  const controller = new AbortController();
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  createAccount('api-a');
+  const run = runtime.messages({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'cancel ordering' }],
+      stream: true,
+    },
+    config: settings.getApiSettings(),
+    interruptSignal: controller.signal,
+  });
+  const abort = setInterval(() => {
+    if (writes.join('').includes('visible partial')) {
+      clearInterval(abort);
+      controller.abort('ordering test');
+    }
+  }, 5);
+  await saveStarted;
+  assert.equal(inflight('api-a'), 0);
+  assert.equal(writes.join('').includes('"stop_reason":"canceled"'), false);
+  releaseLease();
+  const result = await run;
+  assert.equal(result.canceled, true);
+  assert.match(writes.join(''), /"stop_reason":"canceled"/);
 });
 
 test('Anthropic 真实内核 RST 保存片段且不伪造 message_stop', async (t) => {

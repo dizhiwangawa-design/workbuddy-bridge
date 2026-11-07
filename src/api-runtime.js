@@ -281,6 +281,7 @@ export function createAnthropicRuntime({
     let cancelPersisted = false;
     let cancelPersistenceResult = null;
     let cancelPromise = null;
+    let leaseReleased = false;
     let visibleText = '';
     let dsmlCalls = [];
     let structured;
@@ -305,6 +306,12 @@ export function createAnthropicRuntime({
           onOverflow: (error) => terminate('backpressure', error),
         })
       : null;
+
+    function releaseLease(result) {
+      if (leaseReleased) return;
+      leaseReleased = true;
+      end(account, result);
+    }
 
     function write(events) {
       if (!stream || !events.length || responseEnded) return;
@@ -355,6 +362,15 @@ export function createAnthropicRuntime({
         pendingWrites.push(Promise.resolve(reader.cancel(reason)).catch(() => {}));
       }
       controller.abort(reason);
+      if (['interrupt', 'client', 'backpressure'].includes(kind)) {
+        releaseLease({
+          ok: false,
+          code: kind === 'backpressure' ? 'BACKPRESSURE_OVERFLOW' : 'CANCELED',
+          error: kind,
+          durationMs: now() - startedAt,
+          meta: { model: body.requestBody.model, usage: {} },
+        });
+      }
     }
 
     function resetIdle() {
@@ -830,7 +846,7 @@ export function createAnthropicRuntime({
           partial: { content: visibleText },
         });
       }
-      end(account, leaseResult);
+      releaseLease(leaseResult);
     }
   }
 
@@ -1126,6 +1142,7 @@ export function createOpenAIRuntime({
       error: 'client disconnected',
       durationMs: 0,
     };
+    let leaseReleased = false;
 
     function terminate(kind, error) {
       if (timeoutKind) return;
@@ -1146,6 +1163,21 @@ export function createOpenAIRuntime({
       }
       controller.abort(reason);
       req.unpipe?.(res);
+      if (['interrupt', 'client', 'backpressure'].includes(kind)) {
+        releaseLease({
+          ok: false,
+          code: kind === 'backpressure' ? 'BACKPRESSURE_OVERFLOW' : 'CANCELED',
+          error: kind,
+          durationMs: now() - startedAt,
+          meta: { model: body.model, usage: {} },
+        });
+      }
+    }
+
+    function releaseLease(result) {
+      if (leaseReleased) return;
+      leaseReleased = true;
+      end(account, result);
     }
 
     function onClientDisconnect() {
@@ -1632,7 +1664,7 @@ export function createOpenAIRuntime({
       if (cancelPersistenceResult?.deadLetterWritten) {
         warn(`canceled Chat fragment written to dead letter: ${chatResponseId}`);
       }
-      end(account, leaseResult);
+      releaseLease(leaseResult);
     }
   }
 
