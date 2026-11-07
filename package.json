@@ -1,7 +1,7 @@
 {
   "name": "workbuddy-bridge",
   "version": "0.4.0",
-  "description": "WorkBuddy 多账号桥接：MCP 子 Agent、Anthropic Messages API、共享号池与扫码登录",
+  "description": "WorkBuddy 多账号桥接：MCP 子 Agent、Anthropic Messages、OpenAI Chat/Responses 与共享号池",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -9,6 +9,10 @@
     "wb": "bin/wb.js"
   },
   "main": "src/server.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dizhiwangawa-design/workbuddy-bridge.git"
+  },
   "files": [
     "bin",
     "src",
@@ -39,6 +43,8 @@
     "mcp",
     "workbuddy",
     "anthropic",
+    "openai",
+    "responses",
     "api",
     "codebuddy",
     "claude-code",

@@ -67,7 +67,8 @@ MCP 路径继续使用 CLI，因此登录、文件写入和工具执行语义与
 npm i -g @tencent-ai/codebuddy-code
 
 # 2. 装桥接
-git clone <this-repo> && cd workbuddy-bridge
+git clone https://github.com/dizhiwangawa-design/workbuddy-bridge.git
+cd workbuddy-bridge
 npm install
 npm link          # 之后可以直接用 wb 命令
 
@@ -92,7 +93,7 @@ wb http --port 7666
 `wb install` 会自动探测并写入：
 
 | 客户端 | 配置文件 |
-|:--|:--|
+|:---|:---|
 | Claude Code | `~/.claude.json` |
 | DeepSeek Harness | `~/.dsh/profiles/<profile>/cordis.patch.yml` |
 | Codex CLI | `~/.codex/config.toml` |
@@ -113,7 +114,7 @@ wb http --port 7666
 启动 `wb http` 后，同一个服务同时提供管理页和 Anthropic 兼容入口：
 
 | 方法与路径 | 说明 |
-|:--|:--|
+|:---|:---|
 | `POST /v1/messages` | 支持流式 / 非流式文本、图片输入、`tool_use` 和 `tool_result` |
 | `POST /v1/messages/count_tokens` | 本地保守估算，响应带 `estimated:true` 与 `estimator:"wb-conservative-v1"` |
 | `GET /admin` | 独立开关 Anthropic / OpenAI、Responses 持久化与续跑提示，管理客户端 Key |
@@ -199,7 +200,7 @@ if (toolUse) {
 同一端口使用以下接口（管理页继续提供独立 OpenAI 开关）：
 
 | 方法与路径 | 当前范围 |
-|:--|:--|
+|:---|:---|
 | `POST /v1/chat/completions` | 流式 / 非流式文本、图片、function 工具与多轮 `tool` 续传 |
 | `POST /v1/responses` | 非流式 JSON、SSE、`previous_response_id` 续接 |
 | `WS /v1/responses` | 原生 `response.create` / `response.interrupt` 命令 |
@@ -272,7 +273,7 @@ OpenAI 与 Anthropic 路由共用客户端 Key，也共用现有号池和扫码�
 
 - Chat `stream: true` 返回标准 SSE：文本立即转发，思考提示透传
   `reasoning_content`，最后只发送一个合法的 `finish_reason` 和 `[DONE]`。生产环境每
-  15 秒发送不超过 15 秒间隔的 keepalive 空 `choices` chunk，不伪造完成或工具调用。
+  15 秒发送一次 keepalive 空 `choices` chunk，不伪造完成或工具调用。
 - `tools` 支持 OpenAI function 工具；`tool_choice` 支持 `auto` / `none` /
   `required` / 指定函数。历史 assistant `tool_calls` 与 `role:"tool"` 的
   `tool_call_id` 可续传。关闭 API 配置中的工具开关时返回
@@ -315,8 +316,9 @@ Responses 的持久化和可靠性规则：
   服务端协议 Ping 为 15 秒，Pong 宽限 10 秒；超时后先取消上游、释放租约，再关闭传输。
   测试夹具可用短间隔注入这些阈值，生产固定为 15 秒 / 10 秒。
 
-Anthropic 的 thinking、文档附件、图片形式的 `tool_result` 和流式响应中的工具块
-原位交错暂不支持；遇到不支持的 content block 返回 400。
+Anthropic 的 thinking、prompt caching、`top_k`、`mcp_servers`、container、文档附件、
+图片形式的 `tool_result` 和流式响应中的工具块原位交错暂不支持；相关请求或
+content block 明确返回 `400 invalid_request_error`。
 
 ## 号池：多账号 + 自动分配负载
 
@@ -336,7 +338,7 @@ v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调
 失败处理：
 
 | 情况 | 处理 |
-|:--|:--|
+|:---|:---|
 | 未登录 / 登录失效 | 标记 `unauthorized`，立刻换下一个号；重新扫码后自动恢复 |
 | 429 / 额度不足 | 按失败模型指数退避冷却 1 → 2 → 4 … 分钟，上限 30 分钟；该模型暂不接活 |
 | 超时 / 调用方取消 | 不重试，原样返回 |
@@ -381,7 +383,7 @@ wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
 **顶部看板**，区间可切今日 / 近 3 日 / 本周 / 本月 / 近 30 日 / 全部：
 
 | 区块 | 内容 |
-|:--|:--|
+|:---|:---|
 | KPI | Token 消耗（输入 / 输出 / 缓存读写拆分）、请求数、生成速度、缓存命中率、API 等价费用、成功率环 |
 | 时序图 | Token / 请求数 / 吞吐量三视图，柱状叠折线，悬停看逐点明细；按区间自动切小时或按天聚合 |
 | 最近请求 | 实时活动流：时间、模型、账号、token、耗时，失败的标红 |
@@ -432,7 +434,7 @@ wb pool test alice             # 发一条最小请求验证
 新版 CLI 未登录时可能先显示主界面，提交一条消息后才进入登录流程；授权链接也可能只写进本账号日志。桥接会识别这两种情况，且只读取当前账号新增日志中的链接。链接提取做了四层，因为 Ink 还会把长 URL 折行、因重绘重复输出：
 
 | 层级 | 手段 | 说明 |
-|:--|:--|:--|
+|:---|:---|:---|
 | 1 | OSC 8 超链接 | 终端里可点击的链接，URL 完整不折行，最可靠 |
 | 2 | 去换行整体匹配 | Ink 折行不插空格，拼起来就是完整 URL |
 | 3 | 逐行 + 尾部清洗 | 兜底，去掉粘在尾巴上的 `Waiting for auth` 之类 UI 文案 |
@@ -445,7 +447,7 @@ wb pool test alice             # 发一条最小请求验证
 ### 三种场景怎么选
 
 | 场景 | 推荐做法 |
-|:--|:--|
+|:---|:---|
 | 本机开发（有浏览器） | `wb login`，终端扫码即可 |
 | 局域网服务器 | `wb login` + `wb http --host 0.0.0.0`，手机连同一 WiFi 打开登录页 |
 | 无浏览器的云主机 / 容器 | 本机 `wb login` → `wb export` → 拷到服务器 → `wb import` |
@@ -508,7 +510,7 @@ pnpm add @deepseek-ai/dsh-mcp-client@$(dsh --version)
 ## 工具一览
 
 | 工具 | 作用 |
-|:--|:--|
+|:---|:---|
 | `workbuddy_task` | 核心。把任务交给 WorkBuddy，返回最终文本；文件写到 `cwd` |
 | `workbuddy_login` | 返回二维码（图片 + 终端字符画 + 链接），发起登录 |
 | `workbuddy_login_status` | 查进度；`confirm=true` 可在自动检测失灵时手动确认 |
@@ -557,7 +559,7 @@ wb login --site ioa         # 腾讯内网
 ## 配置
 
 | 环境变量 | 默认 | 说明 |
-|:--|:--|:--|
+|:---|:---|:---|
 | `WB_COMMAND` | `codebuddy` | MCP / CLI 任务的命令路径；Anthropic / OpenAI API 不读取该命令 |
 | `WB_BRIDGE_HOME` | `~/.workbuddy-bridge` | 桥接数据目录 |
 | `WB_DEBUG` | – | `1` 打调试日志 |

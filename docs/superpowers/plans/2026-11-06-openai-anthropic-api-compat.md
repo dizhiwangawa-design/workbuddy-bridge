@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 在不经过 `codebuddy -p` 的前提下，让 `workbuddy-bridge` 直接使用现有账号池和隔离登录凭据，为 OpenAI Chat Completions 与 Anthropic Messages 客户端提供文本、SSE、工具调用和多账号故障切换。
+**Goal:** 在不经过 `codebuddy -p` 的前提下，让 `workbuddy-bridge` 直接使用现有账号池和隔离登录凭据，为 OpenAI Chat Completions、OpenAI Responses 与 Anthropic Messages 客户端提供文本、SSE、工具调用和多账号故障切换。
 
-**Architecture:** `/v1/*` 请求进入 bridge 的同一 HTTP 服务，先做客户端鉴权与功能开关检查，再由现有 `pickAccount` 选号、从账号隔离 HOME 的 `.info` 读取凭据并直连 WorkBuddy `/v2/chat/completions`。协议层负责 OpenAI/Anthropic 与 WorkBuddy SSE 的双向转换，包括 DSML 工具调用恢复；CLI 只保留扫码登录和原有 MCP 任务。
+**Architecture:** `/v1/*` 请求进入 bridge 的同一 HTTP 服务，先做客户端鉴权与功能开关检查，再由现有 `pickAccount` 选号、从账号隔离 HOME 的 `.info` 读取凭据并直连 WorkBuddy `/v2/chat/completions`。协议层负责 OpenAI Chat、OpenAI Responses、Anthropic 与 WorkBuddy SSE 的双向转换，包括 DSML 工具调用恢复；CLI 只保留扫码登录和原有 MCP 任务。
 
-**Tech Stack:** Node.js `>=18`、`node:http`、全局 `fetch`/Web Streams、`node:test`、现有零依赖 bridge 模块；不引入 Rust sidecar，不引入框架。
+**Tech Stack:** Node.js `>=22.13`、`node:http`、`node:sqlite`、全局 `fetch`/Web Streams、`node:test`、现有零依赖 bridge 模块；不引入 Rust sidecar，不引入框架。
 
 **Spec:** 本文件中的“需求基线”“兼容边界”“数据流和事实来源”三节是本次实施规格。
 
@@ -25,7 +25,7 @@
 
 当前基线必须保持：
 
-- bridge 位于 `/mnt/windata/awa/workbuddy-bridge`。
+- bridge 位于仓库根目录。
 - 2026-11-06 已建立 Git 仓库，`main` 分支保存实施前基线；功能开发在
   `feature/openai-anthropic-api-compat` 分支进行。
 - 2026-11-06 实际运行 `npm test` 得到 `54/54` 通过。
@@ -71,7 +71,7 @@ OpenAI chat.completion(.chunk)
 本次目标是“主流客户端使用的聊天接口完整”，不是实现 WorkBuddy 并不具备的所有 OpenAI/Anthropic 产品：
 
 | 能力 | 目标 |
-|---|---|
+|:---|:---|
 | OpenAI `POST /v1/chat/completions` | 支持非流式、SSE、system/developer、图片内容、tools、tool_calls、tool 消息 |
 | OpenAI `GET /v1/models`、`GET /v1/models/:id` | 支持模型目录与单模型查询 |
 | Anthropic `POST /v1/messages` | 支持非流式、SSE、system、图片、tools、tool_use、tool_result |
@@ -135,7 +135,7 @@ OpenAI chat.completion(.chunk)
 ## 阶段地图
 
 | 阶段 | 最小交付 | 可独立验收的结果 |
-|---|---|---|
+|:---|:---|:---|
 | 1 | 统一号池租约 | 成功后释放、异常后释放、并发上限有效 |
 | 2 | 真实凭据读取 | 复用 `.info`，能判断过期和可刷新 |
 | 3 | WorkBuddy 直连客户端 | 不发 CLI，请求头与通道清洗正确 |
@@ -2696,7 +2696,7 @@ Expected: PASS。
 
 ---
 
-### Task 13: 真实客户端验收、文档与最终自检（`default` 通过；另两个账号受模型级配额阻断）
+### Task 13: 真实客户端验收、文档与最终自检（`default`、`codex-fresh-mvxgctfk` 通过；`awa` 经用户确认豁免）
 
 **Files:**
 - Modify: `README.md`
@@ -2823,7 +2823,7 @@ Expected:
 - 取消、401、429、首帧前后失败边界通过。
 - API 默认关闭和 Key 鉴权通过。
 
-- [ ] **Step 4: 真实账号冒烟（`deepseek-v4.1-flash` 仍被上游模型级配额阻断）**
+- [x] **Step 4: 真实账号冒烟（`default`、`codex-fresh-mvxgctfk` 通过；`awa` 经用户确认豁免）**
 
 只有用户明确批准消耗账号额度后执行：
 
@@ -2835,7 +2835,7 @@ Expected:
 
 真实冒烟验收：
 
-- 每个已登录账号至少有一次成功响应。
+- 每个已登录账号至少有一次成功响应；`awa` 的上游模型级 429 已由用户确认豁免。
 - 无工具调用以 DSML 文本泄漏。
 - 上游 401 能刷新或换号。
 - 客户端断开后面板并发在 5 秒内回落。
@@ -2873,6 +2873,8 @@ Expected:
 - 2026-11-07 20:28 再次复核：两个受限账号的 `deepseek-v4.1-flash` 仍为 429；
   将 429 冷却绑定失败模型后，同一账号显式请求非默认诊断模型均通过，
   管理视图中的 `cooldownModels` 只记录 `deepseek-v4.1-flash`。
+- 2026-11-08 后续复核：`codex-fresh-mvxgctfk` 的默认模型 5 请求账号冒烟通过，
+  `inflight=0`；`awa` 不再补跑，等待器已停止，用户明确接受该外部配额例外。
 - 未读取、打印或提交 access token、refresh token 或完整客户端 Key。
 
 ---
@@ -2923,7 +2925,8 @@ Expected:
 ## 2026-11-07 增量规格（绑定）
 
 本节覆盖前文“不支持 Responses API”“取消后不再写合法收尾”等旧描述。实现必须继续
-复用现有号池与共享登录凭据，保持版本 `0.4.0`，不 tag、不推送。
+复用现有号池与共享登录凭据，保持版本 `0.4.0`，不 tag；最终按用户指示推送
+GitHub 公开仓库。
 
 ### Task 14: 修复鉴权回归与有界慢读
 
@@ -3052,8 +3055,8 @@ Expected:
   Codex CLI 多步编码验收。
 - [x] 在 `deepseek-v4.1-flash` 配额重置后，用 `test:live:account` 对
   `codex-fresh-mvxgctfk` 完成一次通过（5 请求，`inflight=0`）。
-- [ ] 在 `deepseek-v4.1-flash` 配额重置后，用 `test:live:account` 对
-  `awa` 完成一次通过；当前仅受上游模型级 429 配额阻断，等待外部配额恢复。
+- [x] `awa` 的上游模型级 429 已由用户确认豁免，不再等待配额重置或补跑；
+  已停止自动重试等待器，不把外部配额状态计作工程阻断。
 
 **2026-11-07 CI 稳定版执行记录:**
 
@@ -3074,8 +3077,8 @@ Expected:
   不能冒充 Pong、三协议模型级 429 隔离、Responses SQLite 32 MiB 淘汰、Codex
   Responses 工具循环、系统签名替换不污染用户原文。
 - 按用户要求不执行手机端验收；管理页只保留既有的桌面浏览器复验结论。
-- 版本保持 `0.4.0`，不 tag、不 push；未读取、打印或提交 access token、
-  refresh token 或完整客户端 Key。
+- 版本保持 `0.4.0`，不 tag；最终按用户指示推送 GitHub 公开仓库。未读取、打印或
+  提交 access token、refresh token 或完整客户端 Key。
 
 **2026-11-08 审计缺口收口记录:**
 
@@ -3084,7 +3087,7 @@ Expected:
 - 全量 `npm test` 通过：基础 55/55，API 234/234，合计 289/289。
 - 独立慢读压测通过：连续正文 1,146,880 字节触发
   `BACKPRESSURE_OVERFLOW`；上游关闭、租约归零，子进程峰值 RSS
-  131,579,904 字节（约 125.5 MiB），增长约 40.4 MiB。
+  130,605,056 字节（约 124.6 MiB），增长约 40.4 MiB。
 - Responses 补齐 `parallel_tool_calls=false` 的纯能力语义，不再把该字段隐式
   改成 `tool_choice:"required"`；最终输出最多保留一个工具调用，并回显请求中的
   可观察生成参数。`tool_choice` 支持 `local_shell`，未知字符串、未知类型及非布尔
@@ -3100,3 +3103,5 @@ Expected:
 - 真实账号验收已通过 `default` 与 `codex-fresh-mvxgctfk`；前者完成 Chat、
   SSE、工具续轮和真实中断持久化，后者完成 5 请求最短文本冒烟且 `inflight=0`。
 - 按用户最新要求不执行手机端验收；本轮只做离线回归、负载压测和桌面/API 验收。
+- 2026-11-08 用户确认最终验收完成并接受 `awa` 外部配额例外；自动重试等待器已停止。
+  仓库发布地址为 <https://github.com/dizhiwangawa-design/workbuddy-bridge>。
