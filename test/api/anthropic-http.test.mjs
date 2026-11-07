@@ -799,6 +799,7 @@ test('Anthropic 主动取消先持久化，再用合法 canceled 收尾', async 
   controller.abort('test interrupt');
   const result = await run;
   assert.equal(result.canceled, true);
+  assert.equal(result.persistence?.ok, true, JSON.stringify(result.persistence));
   const raw = writes.join('');
   assert.equal((raw.match(/event: message_stop/g) || []).length, 1);
   assert.match(raw, /"stop_reason":"canceled"/);

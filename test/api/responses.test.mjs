@@ -529,7 +529,7 @@ test('Responses 续接 SSE 使用当前 item ID 与 prior 之后的 output_index
 test('Responses 取消片段可通过 HTTP GET 查询并用于续接', async (t) => {
   let requestCount = 0;
   const upstreamBodies = [];
-  const { baseUrl } = await fixture(t, async (req, res) => {
+  const { baseUrl, store } = await fixture(t, async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
@@ -568,14 +568,11 @@ test('Responses 取消片段可通过 HTTP GET 查询并用于续接', async (t)
   assert.ok(created?.response?.id, raw);
   const responseId = created.response.id;
   controller.abort();
-  let fetched;
-  const deadline = Date.now() + 2000;
-  while (Date.now() < deadline) {
-    fetched = await fetch(`${baseUrl}/v1/responses/${responseId}`);
-    if (fetched.status === 200) break;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.equal(fetched?.status, 200);
+  await waitFor(() => store.memoryView().some((record) => (
+    record.id === responseId && record.status === 'incomplete'
+  )), 2000);
+  const fetched = await fetch(`${baseUrl}/v1/responses/${responseId}`);
+  assert.equal(fetched.status, 200);
   const canceled = await fetched.json();
   assert.equal(canceled.status, 'incomplete');
   assert.equal(canceled.incomplete_details.reason, 'canceled');

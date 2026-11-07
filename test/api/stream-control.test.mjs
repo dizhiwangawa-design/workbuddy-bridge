@@ -5,6 +5,7 @@ import { Writable } from 'node:stream';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import {
   PRODUCTION_KEEPALIVE_MS,
   canWriteHttp,
@@ -203,6 +204,104 @@ test('死信启动重试仅一次，已有记录可安全删除', async () => {
   assert.equal(second.attempted, 0);
   assert.equal(attempts, 1);
   assert.equal(dead.exists('resp_retry_2'), true);
+});
+
+test('Responses SQLite 精确保留 256 条且内存历史最多 64 条', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-responses-retention-'));
+  const store = createResponsesStore({ directory });
+  const createdAtBase = Date.now() - 60_000;
+  for (let index = 0; index < 300; index += 1) {
+    const id = `resp_retention_${String(index).padStart(3, '0')}`;
+    const saved = await store.save({
+      id,
+      createdAt: createdAtBase + index,
+      status: 'completed',
+      body: { id, status: 'completed', output: [] },
+    });
+    assert.equal(saved.ok, true);
+  }
+
+  const memoryIds = store.memoryView().map((record) => record.id);
+  assert.equal(memoryIds.length, 64);
+  assert.equal(memoryIds[0], 'resp_retention_236');
+  assert.equal(memoryIds.at(-1), 'resp_retention_299');
+
+  await store.close();
+  const database = new DatabaseSync(path.join(directory, 'responses.sqlite'), { readOnly: true });
+  try {
+    const count = database.prepare('SELECT COUNT(*) AS count FROM responses').get().count;
+    const oldest = database.prepare(
+      'SELECT id FROM responses ORDER BY created_at ASC, rowid ASC LIMIT 1',
+    ).get();
+    assert.equal(count, 256);
+    assert.equal(oldest.id, 'resp_retention_044');
+  } finally {
+    database.close();
+  }
+});
+
+test('SQLite 同步停顿不阻塞主线程，超时后可重启 worker 保存', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-responses-timeout-'));
+  const store = createResponsesStore({
+    directory,
+    writeTimeoutMs: 60,
+    slowForTestMs: 500,
+  });
+  const started = Date.now();
+  let timerFiredAfter = null;
+  const timer = setTimeout(() => {
+    timerFiredAfter = Date.now() - started;
+  }, 20);
+  const timedOut = await store.save({
+    id: 'resp_timeout',
+    status: 'completed',
+    body: { id: 'resp_timeout', status: 'completed', output: [] },
+  });
+  clearTimeout(timer);
+  assert.equal(timedOut.ok, false);
+  assert.equal(timedOut.error.code, 'ETIMEDOUT');
+  assert.ok(timerFiredAfter !== null && timerFiredAfter < 200, `timer fired after ${timerFiredAfter}ms`);
+  assert.ok(Date.now() - started < 350, 'save waited for the blocked worker');
+
+  const recovered = await store.save({
+    id: 'resp_after_timeout',
+    status: 'completed',
+    body: { id: 'resp_after_timeout', status: 'completed', output: [] },
+  }, { slowForTestMs: 0 });
+  assert.equal(recovered.ok, true);
+  assert.equal((await store.get('resp_after_timeout')).body.status, 'completed');
+  await store.close();
+});
+
+test('死信重复写入幂等、字段完整且已有文件权限会被收紧为 0600', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-dead-letter-idempotent-'));
+  const file = path.join(directory, 'dead.jsonl');
+  fs.writeFileSync(file, '', { mode: 0o644 });
+  fs.chmodSync(file, 0o644);
+  const dead = createDeadLetter({ file, now: () => Date.UTC(2026, 10, 7, 9, 30) });
+  const entry = {
+    response_id: 'resp_dead_once',
+    partial: { content: 'visible text' },
+    cancelReason: 'network_reset',
+    phase: 'streaming',
+    usage: { input_tokens: 3, output_tokens: 2 },
+    error: { code: 'DB_FAILED' },
+  };
+  assert.equal(dead.append(entry), true);
+  assert.equal(dead.append(entry), false);
+  const rows = dead.entries();
+  assert.equal(rows.length, 1);
+  assert.deepEqual(rows[0], {
+    response_id: 'resp_dead_once',
+    partial: { content: 'visible text' },
+    cancel_reason: 'network_reset',
+    phase: 'streaming',
+    usage: { input_tokens: 3, output_tokens: 2 },
+    save_status: 'failed',
+    db_error: 'DB_FAILED',
+    created_at: '2026-11-07T09:30:00.000Z',
+  });
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 });
 
 test('非 observer WS 不启用 Responses 心跳，observer 启用后发 Ping', async () => {
