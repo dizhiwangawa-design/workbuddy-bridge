@@ -334,9 +334,9 @@ export async function startHttpServer({
         });
       },
       onClose(info) {
-        session?.close();
         activeWebSockets.delete(ws);
         warn(`Responses WebSocket closed: ${info.kind}`);
+        return session?.close(info);
       },
     });
     activeWebSockets.add(ws);

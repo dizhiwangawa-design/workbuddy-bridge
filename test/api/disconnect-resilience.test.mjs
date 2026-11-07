@@ -367,11 +367,13 @@ test('WEB_SOCKET 重复 Close、Pong 与中断不会重复取消或释放', asyn
 });
 
 test('WEB_SOCKET Ping/Pong 发现 TCP 假死并释放租约', async (t) => {
+  let requestCount = 0;
   let upstreamClosed;
   const closed = new Promise((resolve) => {
     upstreamClosed = resolve;
   });
   const { bridge, account } = await fixture(t, (_req, res) => {
+    requestCount += 1;
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.flushHeaders();
     res.once('close', upstreamClosed);
@@ -386,6 +388,8 @@ test('WEB_SOCKET Ping/Pong 发现 TCP 假死并释放租约', async (t) => {
   const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}/v1/responses`, {
     autoPong: false,
   });
+  const events = [];
+  ws.on('message', (raw) => events.push(JSON.parse(raw.toString())));
   await once(ws, 'open');
   ws.send(JSON.stringify({
     type: 'response.create',
@@ -394,16 +398,42 @@ test('WEB_SOCKET Ping/Pong 发现 TCP 假死并释放租约', async (t) => {
   }));
   await waitFor(() => inflight(account) === 1);
   await new Promise((resolve) => setTimeout(resolve, 20));
+  const heartbeatStartedAt = Date.now();
   ws._socket.pause();
-  await Promise.race([
-    closed,
-    new Promise((_, reject) => setTimeout(
-      () => reject(new Error('server did not cancel the unresponsive websocket')),
-      3000,
-    )),
-  ]);
+  let cancelTimeout;
+  try {
+    await Promise.race([
+      closed,
+      new Promise((_, reject) => {
+        cancelTimeout = setTimeout(
+          () => reject(new Error('server did not cancel the unresponsive websocket')),
+          3000,
+        );
+        cancelTimeout.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(cancelTimeout);
+  }
   await waitFor(() => inflight(account) === 0, 6000);
-  ws.terminate();
+  assert.ok(Date.now() - heartbeatStartedAt < 2000, 'heartbeat timeout must beat the 5s upstream idle timeout');
+  ws._socket.resume();
+  await once(ws, 'close');
+  await waitFor(() => events.some((event) => event.type === 'response.failed'));
+  const failed = events.find((event) => event.type === 'response.failed');
+  assert.equal(failed.data.response.error.code, 'WEB_SOCKET_HEARTBEAT_TIMEOUT');
+  assert.equal(requestCount, 1);
+  try {
+    ws.send(JSON.stringify({
+      type: 'response.create',
+      model: 'deepseek-v4.1-flash',
+      input: 'must not start after heartbeat failure',
+    }));
+  } catch {
+    // A closed transport rejects new work.
+  }
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(requestCount, 1);
 });
 
 test('WEB_SOCKET 正常 Pong 不会在后续静默周期误报心跳超时', async (t) => {

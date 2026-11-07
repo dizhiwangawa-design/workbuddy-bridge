@@ -55,6 +55,7 @@ export function createWebSocketTransport(socket, {
   let lastPongAt = 0;
   let peerClose = false;
   let pongWaiters = [];
+  let finishPromise = null;
 
   function deliverText(value) {
     if (!onMessage) return;
@@ -177,12 +178,48 @@ export function createWebSocketTransport(socket, {
   }
 
   function finish(kind, info = {}) {
-    if (closedNotified) return;
+    if (closedNotified) return finishPromise || Promise.resolve();
     closedNotified = true;
+    clearHeartbeat();
+    socket.off?.('data', onData);
+
+    const notify = () => {
+      try {
+        return onClose?.({ kind, ...info });
+      } catch {
+        // Cancellation is not allowed to fail during teardown.
+        return undefined;
+      }
+    };
+
+    if (kind === 'heartbeat_timeout' && open) {
+      // The Responses session needs the transport writable long enough to
+      // cancel the upstream, release its lease and publish response.failed.
+      // Incoming data is already detached so a late Pong cannot revive it.
+      finishPromise = Promise.resolve()
+        .then(notify)
+        .catch(() => {})
+        .finally(() => {
+          if (!open) return;
+          if (!socket.destroyed && socket.writable) {
+            try {
+              socket.write(frame(0x8, closePayload(1011, 'heartbeat timeout')));
+            } catch (error) {
+              transportError(ws, error);
+            }
+          }
+          open = false;
+          try {
+            socket.end(() => socket.destroy());
+          } catch {
+            socket.destroy();
+          }
+        });
+      return finishPromise;
+    }
+
     if (open) {
       open = false;
-      clearHeartbeat();
-      socket.off?.('data', onData);
       if (!socket.destroyed) {
         try {
           socket.destroy();
@@ -191,11 +228,8 @@ export function createWebSocketTransport(socket, {
         }
       }
     }
-    try {
-      onClose?.({ kind, ...info });
-    } catch {
-      // Cancellation is not allowed to fail during teardown.
-    }
+    Promise.resolve(notify()).catch(() => {});
+    return Promise.resolve();
   }
 
   function send(message) {

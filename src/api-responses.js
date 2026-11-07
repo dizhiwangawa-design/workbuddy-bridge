@@ -1119,6 +1119,7 @@ export function createResponsesRuntime(options = {}) {
       writer,
       streamStats: () => writer?.stats() || null,
       cancel,
+      fail: terminalFailure,
       responseId,
     };
   }
@@ -1325,6 +1326,7 @@ export function createResponsesRuntime(options = {}) {
 
     return {
       create(command) {
+        if (closed) return;
         if (!command || typeof command !== 'object') {
           send({ type: 'error', error: { code: 'invalid_command', message: 'JSON object required' } });
           return;
@@ -1344,9 +1346,20 @@ export function createResponsesRuntime(options = {}) {
           }
         });
       },
-      close() {
+      async close(info = {}) {
         closed = true;
-        void interrupt('ws close');
+        if (info.kind === 'heartbeat_timeout' && attempt?.fail) {
+          const failure = runtimeError(
+            'WebSocket heartbeat timed out',
+            'WEB_SOCKET_HEARTBEAT_TIMEOUT',
+            { status: 504 },
+          );
+          await attempt.fail('heartbeat_timeout', failure);
+          await waitForAttempt();
+          if (!running) controller = null;
+          return;
+        }
+        await interrupt('ws close');
       },
     };
   }
