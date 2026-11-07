@@ -119,10 +119,12 @@ export function createResponsesRuntime(options = {}) {
     hardBytes = 1024 * 1024,
     writerFactory = createHttpEventWriter,
     persistTimeoutMs = 2000,
+    wsCancelWaitMs = 5000,
   } = options;
   const keepaliveMs = injectedKeepaliveMs === undefined
     ? PRODUCTION_KEEPALIVE_MS
     : Number(injectedKeepaliveMs);
+  const cancelWaitMs = Math.max(1, Number(wsCancelWaitMs) || 5000);
   const store = options.store || options.cancelPersistence
     || createResponsesStore({ now });
   let retriedDeadLetters = false;
@@ -363,6 +365,16 @@ export function createResponsesRuntime(options = {}) {
       const truncation = scanned.error?.code === 'DSML_TRUNCATED';
       if (scanned.error && !truncation) {
         throw runtimeError('upstream DSML tool call is malformed', scanned.error.code);
+      }
+      if (
+        final
+        && calls.invalid?.length
+        && (calls.calls?.length || !dsmlCalls.length)
+      ) {
+        throw runtimeError(
+          'upstream produced an invalid structured tool call',
+          'UPSTREAM_INVALID_TOOL_CALL',
+        );
       }
       const arbitration = arbitrateToolCalls({
         structured: { calls: calls.calls || [], invalid: [] },
@@ -608,10 +620,12 @@ export function createResponsesRuntime(options = {}) {
             writer?.fail(error);
           }
         } else if (transport === 'ws') {
-          publishWs(cancelEvents(failed, {
-            finalDeltas: !live?.content,
-            finalReasoningDeltas: !live?.reasoning,
-          }));
+          if (ensureWsLifecycle()) {
+            publishWs(cancelEvents(failed, {
+              finalDeltas: !live?.content,
+              finalReasoningDeltas: !live?.reasoning,
+            }));
+          }
         }
         return {
           ok: false,
@@ -631,24 +645,10 @@ export function createResponsesRuntime(options = {}) {
       // even when the client is still connected. Only a response that has
       // entered its writable lifecycle can indicate a lost downstream.
       if (transport === 'http') res?.on('close', onClose);
-      response ||= baseResponse({
-          id: responseId,
-          model: prepared.model,
-          createdAt,
-          output: prior,
-          store: body.store === true,
-          previousResponseId,
-        });
+      response ||= initialResponse();
       if (!upstreamAccepted) return false;
       if (transport === 'ws') {
-        downstreamStarted = true;
-        liveEncoder = createResponsesStreamEncoder({
-          response,
-          maxBytes: hardBytes,
-          retain: 'error',
-        });
-        if (!publishWs(responseEvents({ response }).slice(0, 2))) {
-          downstreamStarted = false;
+        if (!ensureWsLifecycle()) {
           void cancel('network_disconnect', runtimeError(
             'client websocket closed before Responses lifecycle events',
             'CLIENT_DISCONNECTED',
@@ -656,6 +656,11 @@ export function createResponsesRuntime(options = {}) {
           ));
           return false;
         }
+        liveEncoder = createResponsesStreamEncoder({
+          response,
+          maxBytes: hardBytes,
+          retain: 'error',
+        });
         return true;
       }
       if (transport === 'http' && isStream) {
@@ -695,6 +700,26 @@ export function createResponsesRuntime(options = {}) {
         pingTimer.unref?.();
         return true;
       }
+      downstreamStarted = true;
+      return true;
+    }
+
+    function initialResponse() {
+      return baseResponse({
+        id: responseId,
+        model: prepared.model,
+        createdAt,
+        output: prior,
+        store: body.store === true,
+        previousResponseId,
+      });
+    }
+
+    function ensureWsLifecycle() {
+      if (transport !== 'ws') return false;
+      if (downstreamStarted) return true;
+      response ||= initialResponse();
+      if (!publishWs(responseEvents({ response }).slice(0, 2))) return false;
       downstreamStarted = true;
       return true;
     }
@@ -947,10 +972,12 @@ export function createResponsesRuntime(options = {}) {
           finished = true;
           if (transport === 'ws') {
             const live = liveEncoder?.snapshot();
-            publishWs(cancelEvents(cancelBody, {
-              finalDeltas: !live?.content,
-              finalReasoningDeltas: !live?.reasoning,
-            }));
+            if (ensureWsLifecycle()) {
+              publishWs(cancelEvents(cancelBody, {
+                finalDeltas: !live?.content,
+                finalReasoningDeltas: !live?.reasoning,
+              }));
+            }
           } else if (downstreamStarted && writer && !writer.failed && canWriteHttp(res)) {
             emit(cancelEvents(cancelBody, { finalDeltas: true }));
             if (!writer.end()) writer.fail(reason);
@@ -999,10 +1026,14 @@ export function createResponsesRuntime(options = {}) {
     };
     const onAbort = () => {
       if (finished) return;
-      void cancel('interrupt', runtimeError('response interrupted', 'CANCELED'));
+      const signalReason = interruptSignal?.reason;
+      const kind = signalReason?.cancelKind || 'interrupt';
+      const message = signalReason?.message || 'response interrupted';
+      void cancel(kind, runtimeError(String(message), 'CANCELED'));
     };
     req?.once('aborted', onClose);
     interruptSignal?.addEventListener('abort', onAbort, { once: true });
+    if (interruptSignal?.aborted) onAbort();
 
     async function consumeSse(upstream) {
       if (!upstream.body) throw runtimeError('upstream response has no body', 'UPSTREAM_PROTOCOL_ERROR');
@@ -1110,6 +1141,12 @@ export function createResponsesRuntime(options = {}) {
 
     async function run() {
       try {
+        if (cancelKind || controller.signal.aborted) {
+          return await (cancelPromise || cancel('interrupt', runtimeError(
+            'response canceled before startup',
+            'CANCELED',
+          )));
+        }
         let credentials = readCredentials(account, { now: now() });
         if (!credentials?.ok) throw runtimeError(
           'WorkBuddy account has no usable credentials',
@@ -1478,22 +1515,47 @@ export function createResponsesRuntime(options = {}) {
     let parent = Promise.resolve();
 
     async function waitForAttempt() {
-      await withTimeout(running, 3000, 'WS response cancellation timed out').catch(() => {});
+      if (!running) return true;
+      try {
+        await withTimeout(running, cancelWaitMs, 'WS response cancellation timed out');
+        return true;
+      } catch (error) {
+        warn(`WS response cancellation did not settle: ${error.message}`);
+        return false;
+      }
     }
 
-    async function interrupt(reason = 'response.interrupt') {
-      controller?.abort(reason);
-      void attempt?.cancel('interrupt', runtimeError(
+    async function interrupt(reason = 'response.interrupt', kind = 'interrupt') {
+      const hasActiveRequest = Boolean(controller || attempt || running);
+      const cancellation = attempt?.cancel(kind, runtimeError(
         String(reason),
-        'CANCELED',
+        kind === 'backpressure' ? 'BACKPRESSURE_OVERFLOW' : 'CANCELED',
       ));
-      await waitForAttempt();
-      if (!running) controller = null;
+      // Signal setup before the attempt exists as well as the active request.
+      // Cancel first so abort listeners observe the precise cancellation kind.
+      if (hasActiveRequest) {
+        controller?.abort({ cancelKind: kind, message: String(reason) });
+      }
+      void cancellation;
+      const settled = await waitForAttempt();
+      if (settled && !running) controller = null;
+      return settled;
     }
 
     async function executeCommand(command) {
       if (closed) return;
-      if (running) await interrupt('replaced response');
+      if (running && !(await interrupt('replaced response'))) {
+        closed = true;
+        send({
+          type: 'error',
+          error: {
+            code: 'cancellation_timeout',
+            message: 'previous response cancellation did not settle',
+          },
+        });
+        ws?.close?.(1011, 'cancellation timeout');
+        return;
+      }
       controller = new AbortController();
       let history;
       try {
@@ -1583,10 +1645,41 @@ export function createResponsesRuntime(options = {}) {
           send({ type: 'error', error: { code: 'unsupported_command', message: `unknown command ${type}` } });
           return;
         }
-        void interrupt('replaced response').then(() => enqueue(command));
+        void interrupt('replaced response').then((settled) => {
+          if (!settled) {
+            closed = true;
+            send({
+              type: 'error',
+              error: {
+                code: 'cancellation_timeout',
+                message: 'previous response cancellation did not settle',
+              },
+            });
+            ws?.close?.(1011, 'cancellation timeout');
+            return;
+          }
+          return enqueue(command);
+        }).catch((error) => {
+          send({
+            type: 'error',
+            error: { code: error.code || 'internal_error', message: error.message },
+          });
+        });
       },
       interrupt() {
-        void interrupt().then(() => {
+        void interrupt().then((settled) => {
+          if (!settled) {
+            closed = true;
+            send({
+              type: 'error',
+              error: {
+                code: 'cancellation_timeout',
+                message: 'response cancellation did not settle',
+              },
+            });
+            ws?.close?.(1011, 'cancellation timeout');
+            return;
+          }
           if (closed) return;
           if (ws?.send({ type: 'response.cancelled' }) === false) {
             ws.close?.(1000, 'interrupted');
@@ -1606,7 +1699,8 @@ export function createResponsesRuntime(options = {}) {
           if (!running) controller = null;
           return;
         }
-        await interrupt('ws close');
+        const kind = info.kind === 'peer_close' ? 'ws_close' : 'network_disconnect';
+        await interrupt('ws close', kind);
       },
     };
   }

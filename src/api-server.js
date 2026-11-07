@@ -252,6 +252,7 @@ function sharedResponsesRuntime(deps) {
 }
 
 function getResponsesRuntime(deps) {
+  if (deps.responsesRuntime) return deps.responsesRuntime;
   if (!responsesRuntimes.has(deps)) responsesRuntimes.set(deps, createResponsesRuntime(deps));
   return responsesRuntimes.get(deps);
 }

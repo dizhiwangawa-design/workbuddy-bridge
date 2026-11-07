@@ -630,6 +630,28 @@ test('Responses 命名空间超长名称生成不同且保留原始 namespace �
   assert.equal(second.namespace, `${longNamespace}B`);
 });
 
+test('Responses allowed_tools 与 tool_choice 支持 namespace 原始名称', () => {
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'namespace filtering',
+    tools: [{
+      type: 'namespace',
+      name: 'repo',
+      tools: [
+        { type: 'function', name: 'read' },
+        { type: 'function', name: 'write' },
+      ],
+    }],
+    allowed_tools: [{ type: 'function', name: 'read' }],
+    tool_choice: { type: 'function', name: 'read' },
+  });
+  assert.equal(prepared.body.tools.length, 1);
+  assert.equal(prepared.body.tool_choice.function.name, prepared.body.tools[0].function.name);
+  assert.equal(prepared.tools.get(prepared.body.tools[0].function.name).namespace, 'repo');
+  assert.equal(prepared.toolNames.has('read'), true);
+  assert.equal(prepared.toolNames.has('repo.read'), true);
+});
+
 test('Responses 历史支持内嵌 custom 调用及对应的 output', () => {
   const prepared = responses.prepareResponsesRequest({
     model: 'deepseek-v4.1-flash',
@@ -1241,6 +1263,51 @@ test('Responses 结构化工具参数超限发送 failed 终态且不持久化�
     .find((item) => item.name === 'responses-offline')?.inflight === 0);
 });
 
+test('Responses 拒绝同轮合法调用旁边的半截结构化工具参数', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    upstream(res, [{
+      tools: [
+        {
+          index: 0,
+          id: 'call_valid',
+          function: { name: 'write_file', arguments: '{"input":"complete"}' },
+        },
+        {
+          index: 1,
+          id: 'call_partial',
+          function: { name: 'write_file', arguments: '{"input":"' },
+        },
+      ],
+    }], 'tool_calls');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: false,
+      input: 'mixed tool states',
+      tools: [{
+        type: 'function',
+        name: 'write_file',
+        parameters: { type: 'object', properties: { input: { type: 'string' } } },
+      }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const events = parseSse(await response.text());
+  const terminal = events.find((event) => [
+    'response.completed',
+    'response.incomplete',
+    'response.failed',
+  ].includes(event.type));
+  assert.equal(terminal?.type, 'response.failed');
+  assert.equal(terminal.response.error.code, 'UPSTREAM_INVALID_TOOL_CALL');
+  assert.equal(JSON.stringify(events).includes('call_valid'), false);
+  assert.equal(JSON.stringify(events).includes('call_partial'), false);
+});
+
 test('WebSocket 心跳超时在终态不可写时仍完成本地取消与租约审计', async () => {
   let active = 0;
   const released = [];
@@ -1582,6 +1649,24 @@ test('Responses 支持 local_shell、shell 与 apply_patch 工具', async (t) =>
   assert.equal(received[0].tools.length, 3);
   assert.ok(bodies.every((body) => body.output.some((item) => item.type.includes('call'))));
   assert.equal(bodies[2].output.find((item) => item.type === 'custom_tool_call').input, '*** Begin Patch');
+});
+
+test('Responses 接受顶层 apply_patch 工具并归一为 custom tool call', () => {
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'patch it',
+    tools: [{ type: 'apply_patch' }],
+  });
+  assert.equal(prepared.body.tools.length, 1);
+  const entry = prepared.tools.get(prepared.body.tools[0].function.name);
+  assert.equal(entry.kind, 'custom');
+  const [item] = responses.responseCallItems([{
+    id: 'call_patch',
+    name: 'apply_patch',
+    input: { input: '*** Begin Patch\n*** End Patch' },
+  }], prepared.tools);
+  assert.equal(item.type, 'custom_tool_call');
+  assert.equal(item.name, 'apply_patch');
 });
 
 test('Responses 不支持工具与 file_id 使用明确 400', async (t) => {

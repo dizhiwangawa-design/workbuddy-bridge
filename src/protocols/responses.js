@@ -13,6 +13,7 @@ const SUPPORTED_TOOL_TYPES = new Set([
   'namespace',
   'local_shell',
   'shell',
+  'apply_patch',
 ]);
 
 function bad(message, code = 'invalid_request') {
@@ -203,7 +204,7 @@ export function convertResponsesTools(input) {
         throw bad(`tools[${index}] namespace needs name and tools`, 'unsupported_tool_type');
       }
       for (const [childIndex, child] of tool.tools.entries()) {
-        if (!['function', 'custom', 'shell'].includes(child?.type)) {
+        if (!['function', 'custom', 'shell', 'apply_patch'].includes(child?.type)) {
           throw bad(
             `tools[${index}].tools[${childIndex}] type is not supported`,
             'unsupported_tool_type',
@@ -213,7 +214,7 @@ export function convertResponsesTools(input) {
         const realName = String(child.name || '').trim();
         if (!realName) throw bad(`tools[${index}].tools[${childIndex}] needs a name`);
         const flattened = shorten(`${namespace}__${realName}`);
-        const custom = child.type === 'custom';
+        const custom = child.type === 'custom' || child.type === 'apply_patch';
         const parameters = custom
           ? {
               type: 'object',
@@ -247,7 +248,7 @@ export function convertResponsesTools(input) {
       ? 'apply_patch'
       : String(tool.name || type).trim();
     if (!name) throw bad(`tools[${index}] needs a name`);
-    const custom = type === 'custom';
+    const custom = type === 'custom' || type === 'apply_patch';
     const shell = type === 'shell' || type === 'local_shell';
     const parameters = custom
       ? {
@@ -460,10 +461,27 @@ export function prepareResponsesRequest(body, {
     throw bad('tool support is disabled', 'tools_disabled');
   }
   const allowed = Array.isArray(body.allowed_tools)
-    ? new Set(body.allowed_tools.map((item) => String(item?.name || item)))
+    ? new Set(body.allowed_tools.flatMap((item) => {
+        const name = String(item?.name || item);
+        if (!item?.namespace) return [name];
+        return [
+          name,
+          `${item.namespace}.${name}`,
+          `${item.namespace}__${name}`,
+        ];
+      }))
     : null;
   const tools = allowed
-    ? converted.tools.filter((item) => allowed.has(item.function.name))
+    ? converted.tools.filter((item) => {
+        const entry = converted.registry.get(item.function.name);
+        return allowed.has(item.function.name)
+          || entry && (
+            allowed.has(entry.name)
+            || allowed.has(`${entry.namespace}.${entry.name}`)
+            || allowed.has(`${entry.namespace}__${entry.name}`)
+            || allowed.has(entry.namespace)
+          );
+      })
     : converted.tools;
   const restricted = new Set(tools.map((item) => item.function.name));
   const registry = new Map([...converted.registry].filter(([name]) => restricted.has(name)));
@@ -473,10 +491,10 @@ export function prepareResponsesRequest(body, {
   if (choice === 'required' && !tools.length) throw bad('tool_choice requires at least one tool');
   if (choice && typeof choice === 'object') {
     const chosen = String(choice.name || choice.function?.name || '');
-    if (tools.length && chosen && !registry.has(chosen) && !tools.some((item) => item.function.name === chosen)) {
-      throw bad(`tool_choice references unknown tool: ${chosen}`);
-    }
-    choice = chosen ? { type: 'function', function: { name: chosen } } : choice;
+    if (!chosen) throw bad('tool_choice must name a tool');
+    const match = lookupRegistry(registry, chosen);
+    if (!match) throw bad(`tool_choice references unknown tool: ${chosen}`);
+    choice = { type: 'function', function: { name: match.key } };
   }
 
   const outbound = {
@@ -510,7 +528,14 @@ export function prepareResponsesRequest(body, {
     body: outbound,
     model,
     tools: registry,
-    toolNames: new Set([...registry.keys(), ...registry.values().map((item) => item.name)]),
+    toolNames: new Set([
+      ...registry.keys(),
+      ...registry.values().flatMap((item) => [
+        item.name,
+        item.namespace ? `${item.namespace}.${item.name}` : null,
+        item.namespace ? `${item.namespace}__${item.name}` : null,
+      ].filter(Boolean)),
+    ]),
     toolsDeclared: tools.length > 0,
     toolChoice: choice || 'auto',
     parallelToolCalls: body.parallel_tool_calls !== false,

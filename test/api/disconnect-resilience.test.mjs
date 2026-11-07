@@ -221,14 +221,29 @@ test('HTTP RST 后取消上游、写入取消片段，不产生虚假死信', as
 });
 
 test('WEB_SOCKET 主动 Close 帧释放活动租约', async (t) => {
+  let upstreamRequested = false;
+  const baseStore = createResponsesStore({
+    directory: path.join(temporary, `close-store-${Date.now()}-${Math.random()}`),
+  });
+  const saveOptions = [];
+  const store = {
+    ...baseStore,
+    async save(entry, options) {
+      saveOptions.push(options);
+      return baseStore.save(entry, options);
+    },
+  };
   const { bridge, account } = await fixture(t, (_req, res) => {
+    upstreamRequested = true;
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(encodeSseEvent('message', {
       choices: [{ delta: { content: 'still working' } }],
     }));
     res.flushHeaders();
-  });
+  }, { store });
   const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}/v1/responses`);
+  const events = [];
+  ws.on('message', (raw) => events.push(JSON.parse(raw.toString())));
   await once(ws, 'open');
   ws.send(JSON.stringify({
     type: 'response.create',
@@ -236,10 +251,17 @@ test('WEB_SOCKET 主动 Close 帧释放活动租约', async (t) => {
     input: 'close test',
   }));
   await waitFor(() => inflight(account) === 1);
+  await waitFor(() => upstreamRequested);
+  await waitFor(() => events.some((event) => event.type === 'response.created'));
   ws.close(1000, 'client leaves');
   await waitFor(() => inflight(account) === 0, 6000);
   ws.terminate();
   assert.equal(await bridge.waitForConnections((items) => items.length === 0, 1000), true);
+  assert.equal(
+    saveOptions.some((options) => options.cancelInfo?.reason === 'ws_close'),
+    true,
+    JSON.stringify(saveOptions),
+  );
 });
 
 test('WEB_SOCKET response.interrupt 释放租约并返回合法 incomplete 终态', async (t) => {
@@ -325,6 +347,218 @@ test('WEB_SOCKET 新 response.create 先取消旧响应并释放旧租约', asyn
     .includes('second done'), true);
   ws.close(1000, 'done');
   await once(ws, 'close');
+});
+
+test('WEB_SOCKET 替换请求会取消仍在准备中的旧响应', async () => {
+  let active = 0;
+  let began = 0;
+  let ended = 0;
+  let chatCalls = 0;
+  let getCalls = 0;
+  let setupWaitingResolve;
+  let releaseSetupResolve;
+  const setupWaiting = new Promise((resolve) => {
+    setupWaitingResolve = resolve;
+  });
+  const setupGate = new Promise((resolve) => {
+    releaseSetupResolve = resolve;
+  });
+  const record = {
+    status: 'completed',
+    body: {
+      output: [],
+      _bridgeInput: [],
+    },
+  };
+  const runtime = createResponsesRuntime({
+    pick: () => ({ name: 'setup-race' }),
+    begin: () => {
+      began += 1;
+      active += 1;
+    },
+    end: () => {
+      ended += 1;
+      active = Math.max(0, active - 1);
+    },
+    readCredentials: () => ({ ok: true }),
+    upstreamClient: {
+      async chat() {
+        chatCalls += 1;
+        const body = new Response([
+          encodeSseEvent('message', {
+            choices: [{ delta: { content: 'replacement complete' } }],
+          }),
+          encodeSseEvent('message', {
+            choices: [{ delta: {}, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 2, completion_tokens: 2 },
+          }),
+          'data: [DONE]\n\n',
+        ].join('')).body;
+        return {
+          status: 200,
+          ok: true,
+          headers: new Headers({ 'content-type': 'text/event-stream' }),
+          body,
+        };
+      },
+    },
+    store: {
+      async get() {
+        getCalls += 1;
+        if (getCalls === 2) {
+          setupWaitingResolve();
+          await setupGate;
+        }
+        return record;
+      },
+      async save() {
+        return { ok: true };
+      },
+    },
+  });
+  const events = [];
+  const session = runtime.wsSession({
+    ws: {
+      close() {},
+      send() { return true; },
+    },
+    send(event) {
+      events.push(event);
+      return true;
+    },
+    config: {
+      ...settings.getApiSettings(),
+      responsesPersistence: true,
+      responsesNudge: true,
+    },
+  });
+
+  session.create({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    previous_response_id: 'resp_previous',
+    input: 'must be canceled during setup',
+  });
+  await setupWaiting;
+  session.create({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    previous_response_id: 'resp_previous',
+    input: 'replacement',
+  });
+  releaseSetupResolve();
+
+  await waitFor(() => events.some((event) => (
+    event.type === 'response.completed'
+    && event.data?.response
+    && JSON.stringify(event.data.response).includes('replacement complete')
+  )), 3000);
+  assert.deepEqual(
+    events.slice(0, 2).map((event) => event.type),
+    ['response.created', 'response.in_progress'],
+  );
+  assert.equal(
+    events.findIndex((event) => event.type === 'response.incomplete')
+      > events.findIndex((event) => event.type === 'response.created'),
+    true,
+  );
+  assert.equal(chatCalls, 1);
+  assert.equal(began, 2);
+  assert.equal(ended, 2);
+  assert.equal(active, 0);
+  await session.close({ kind: 'peer_close' });
+});
+
+test('WEB_SOCKET 旧租约取消超时后拒绝启动新 response.create', async () => {
+  let active = 0;
+  let began = 0;
+  let chatCalls = 0;
+  const saves = [];
+  let finishedSaves = 0;
+  const errors = [];
+  const closed = [];
+  const runtime = createResponsesRuntime({
+    wsCancelWaitMs: 50,
+    pick: () => ({ name: 'cancel-timeout' }),
+    begin: () => {
+      began += 1;
+      active += 1;
+    },
+    end: () => {
+      active = Math.max(0, active - 1);
+    },
+    readCredentials: () => ({ ok: true }),
+    upstreamClient: {
+      async chat() {
+        chatCalls += 1;
+        return {
+          status: 200,
+          ok: true,
+          headers: new Headers({ 'content-type': 'text/event-stream' }),
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(encodeSseEvent('message', {
+                choices: [{ delta: { content: 'slow cancellation' } }],
+              })));
+            },
+          }),
+        };
+      },
+    },
+    store: {
+      async get() { return null; },
+      async save(entry, options) {
+        saves.push({ entry, options });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        finishedSaves += 1;
+        return { ok: true };
+      },
+    },
+  });
+  createAccount('cancel-timeout');
+  const events = [];
+  const session = runtime.wsSession({
+    ws: {
+      close(code, reason) {
+        closed.push({ code, reason });
+      },
+      send() { return true; },
+    },
+    send(event) {
+      events.push(event);
+      if (event.type === 'error') errors.push(event);
+      return true;
+    },
+    config: settings.getApiSettings(),
+  });
+  session.create({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'first',
+  });
+  await waitFor(() => active === 1);
+  await waitFor(() => events.some((event) => event.type === 'response.output_text.delta'));
+
+  session.create({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'must not start',
+  });
+  await waitFor(() => errors.some((event) => event.error?.code === 'cancellation_timeout'));
+  assert.equal(began, 1);
+  assert.equal(chatCalls, 1);
+  assert.equal(closed.some((item) => item.code === 1011), true);
+  await waitFor(() => finishedSaves === 1, 3000);
+  await waitFor(() => active === 0, 3000);
+  session.create({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'still must not start',
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(began, 1);
+  assert.equal(chatCalls, 1);
+  await session.close({ kind: 'peer_close' });
 });
 
 test('WEB_SOCKET 重复 Close、Pong 与中断不会重复取消或释放', async (t) => {
@@ -525,11 +759,26 @@ test('WEB_SOCKET 正常 Pong 不会在后续静默周期误报心跳超时', asy
 });
 
 test('WEB_SOCKET RST 不依赖 Close 帧，仍走统一取消并释放活动租约', async (t) => {
+  let upstreamRequested = false;
+  const baseStore = createResponsesStore({
+    directory: path.join(temporary, `rst-ws-store-${Date.now()}-${Math.random()}`),
+  });
+  const saveOptions = [];
+  const store = {
+    ...baseStore,
+    async save(entry, options) {
+      saveOptions.push(options);
+      return baseStore.save(entry, options);
+    },
+  };
   const { bridge, account } = await fixture(t, (_req, res) => {
+    upstreamRequested = true;
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.flushHeaders();
-  });
+  }, { store });
   const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}/v1/responses`);
+  const events = [];
+  ws.on('message', (raw) => events.push(JSON.parse(raw.toString())));
   await once(ws, 'open');
   ws.send(JSON.stringify({
     type: 'response.create',
@@ -537,8 +786,15 @@ test('WEB_SOCKET RST 不依赖 Close 帧，仍走统一取消并释放活动租�
     input: 'reset',
   }));
   await waitFor(() => inflight(account) === 1);
+  await waitFor(() => upstreamRequested);
+  await waitFor(() => events.some((event) => event.type === 'response.created'));
   ws._socket.resetAndDestroy();
   await waitFor(() => inflight(account) === 0, 6000);
+  await waitFor(() => saveOptions.length > 0);
+  assert.equal(
+    saveOptions.some((options) => options.cancelInfo?.reason === 'network_disconnect'),
+    true,
+  );
 });
 
 test('WEB_SOCKET 上游请求失败时发送 failed 终态且释放租约', async (t) => {
