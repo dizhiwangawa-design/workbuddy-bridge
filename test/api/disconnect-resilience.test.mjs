@@ -489,13 +489,13 @@ test('慢读取 1 秒时真实 keepalive 先于读写循环出现', async (t) =>
     res.write(encodeSseEvent('message', {
       choices: [{ delta: { content: 'first' } }],
     }));
-    res.write(encodeSseEvent('message', {
-      choices: [{ delta: { content: 'second' } }],
-    }));
-    res.write(encodeSseEvent('message', {
-      choices: [{ delta: {}, finish_reason: 'stop' }],
-    }));
-    res.end('data: [DONE]\n\n');
+    res.flushHeaders();
+    const timer = setTimeout(() => {
+      res.end(encodeSseEvent('message', {
+        choices: [{ delta: {}, finish_reason: 'stop' }],
+      }) + 'data: [DONE]\n\n');
+    }, 1200);
+    res.once('close', () => clearTimeout(timer));
   }, { keepaliveMs: 150 });
   const response = await fetch(`http://127.0.0.1:${bridge.port}/v1/responses`, {
     method: 'POST',
@@ -521,4 +521,84 @@ test('慢读取 1 秒时真实 keepalive 先于读写循环出现', async (t) =>
   }
   assert.match(content, /response.in_progress/);
   assert.match(content, /response.completed/);
+});
+
+test('Chat 上游静默 1 秒时 keepalive 可观察且只结束一次', { timeout: 5000 }, async (t) => {
+  const { bridge } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'first-chat' } }],
+    }));
+    res.flushHeaders();
+    const timer = setTimeout(() => {
+      res.end(encodeSseEvent('message', {
+        choices: [{ delta: {}, finish_reason: 'stop' }],
+      }) + 'data: [DONE]\n\n');
+    }, 1200);
+    res.once('close', () => clearTimeout(timer));
+  }, { keepaliveMs: 150 });
+  const response = await fetch(`http://127.0.0.1:${bridge.port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'slow chat' }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let content = (await reader.read()).value;
+  assert.match(content, /first-chat/);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  while (true) {
+    const read = await reader.read();
+    if (read.done) break;
+    content += read.value;
+  }
+  assert.match(content, /"choices":\[\],"usage":null/);
+  assert.equal(content.match(/"finish_reason":"stop"/g)?.length, 1);
+  assert.equal(content.match(/data: \[DONE\]/g)?.length, 1);
+  await waitFor(() => inflight('disconnect-a') === 0);
+});
+
+test('Anthropic 上游静默 1 秒时 ping keepalive 可观察且只结束一次', { timeout: 5000 }, async (t) => {
+  const { bridge } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'first-anthropic' } }],
+    }));
+    res.flushHeaders();
+    const timer = setTimeout(() => {
+      res.end(encodeSseEvent('message', {
+        choices: [{ delta: {}, finish_reason: 'stop' }],
+      }) + 'data: [DONE]\n\n');
+    }, 1200);
+    res.once('close', () => clearTimeout(timer));
+  }, { keepaliveMs: 150 });
+  const response = await fetch(`http://127.0.0.1:${bridge.port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 32,
+      stream: true,
+      messages: [{ role: 'user', content: 'slow anthropic' }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let content = (await reader.read()).value;
+  assert.match(content, /first-anthropic/);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  while (true) {
+    const read = await reader.read();
+    if (read.done) break;
+    content += read.value;
+  }
+  assert.ok((content.match(/event: ping/g) || []).length >= 1);
+  assert.ok((content.match(/"type":"ping"/g) || []).length >= 1);
+  assert.equal(content.match(/event: message_stop/g)?.length, 1);
+  assert.equal(content.match(/"stop_reason":"end_turn"/g)?.length, 1);
+  await waitFor(() => inflight('disconnect-a') === 0);
 });
