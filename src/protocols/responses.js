@@ -332,7 +332,15 @@ function toolInputForHistory(item) {
 }
 
 function toolNameForHistory(item) {
-  return String(item?.name || (item?.type === 'shell' ? 'shell' : (item?.type === 'local_shell' ? 'local_shell' : ''))).trim();
+  const explicit = String(item?.name || '').trim();
+  if (explicit) return explicit;
+  const byType = {
+    local_shell: 'local_shell',
+    local_shell_call: 'local_shell',
+    shell: 'shell',
+    shell_call: 'shell',
+  };
+  return String(byType[item?.type] || '').trim();
 }
 
 function replayHistory(input) {
@@ -522,7 +530,6 @@ export function prepareResponsesRequest(body, {
   if (tools.length) {
     outbound.tools = tools;
     if (choice !== undefined) outbound.tool_choice = choice;
-    if (body.parallel_tool_calls === false) outbound.tool_choice = 'required';
   }
   return {
     body: outbound,

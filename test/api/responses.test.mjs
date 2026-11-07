@@ -613,6 +613,55 @@ test('Responses 工具历史按 call_id 配对并修复 output 位于 call 之�
   assert.equal(prepared.body.messages.at(-1).content, 'next');
 });
 
+test('Responses 工具历史支持 local_shell_call 与 shell_call', () => {
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: [
+      {
+        type: 'local_shell_call',
+        call_id: 'call_local_shell',
+        action: {
+          type: 'exec',
+          command: ['pwd'],
+          env: {},
+        },
+      },
+      {
+        type: 'local_shell_call_output',
+        call_id: 'call_local_shell',
+        output: 'workspace',
+      },
+      {
+        type: 'shell_call',
+        call_id: 'call_shell',
+        action: {
+          commands: ['printf ok'],
+          timeout_ms: 1000,
+        },
+      },
+      {
+        type: 'shell_call_output',
+        call_id: 'call_shell',
+        output: [{ outcome: { type: 'exit', exit_code: 0 }, stdout: 'ok', stderr: '' }],
+      },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'continue' }] },
+    ],
+  });
+  const calls = prepared.body.messages.filter((item) => item.tool_calls);
+  assert.deepEqual(calls.map((item) => item.tool_calls[0].function.name), ['local_shell', 'shell']);
+  assert.deepEqual(
+    calls.map((item) => JSON.parse(item.tool_calls[0].function.arguments)),
+    [
+      { type: 'exec', command: ['pwd'], env: {} },
+      { commands: ['printf ok'], timeout_ms: 1000 },
+    ],
+  );
+  assert.deepEqual(
+    prepared.body.messages.filter((item) => item.role === 'tool').map((item) => item.tool_call_id),
+    ['call_local_shell', 'call_shell'],
+  );
+});
+
 test('Responses 命名空间超长名称生成不同且保留原始 namespace 的稳定别名', () => {
   const longNamespace = 'n'.repeat(72);
   const prepared = responses.prepareResponsesRequest({
@@ -1615,6 +1664,31 @@ test('Responses 支持 URL 图片、parallel_tool_calls=false 和 allowed_tools'
   assert.equal(received.tool_choice, 'required');
   assert.equal(received.messages[0].content[1].image_url.url, 'https://example.test/a.png');
   assert.equal(body.output.filter((item) => item.type === 'function_call').length, 1);
+});
+
+test('Responses parallel_tool_calls=false 不覆盖显式 tool_choice', () => {
+  const tools = [{ type: 'function', name: 'read', parameters: { type: 'object' } }];
+  const none = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'no tools',
+    tools,
+    parallel_tool_calls: false,
+    tool_choice: 'none',
+  });
+  assert.equal(none.body.tool_choice, 'none');
+  assert.equal(none.toolChoice, 'none');
+
+  const named = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'read only',
+    tools,
+    parallel_tool_calls: false,
+    tool_choice: { type: 'function', name: 'read' },
+  });
+  assert.deepEqual(named.body.tool_choice, {
+    type: 'function',
+    function: { name: 'read' },
+  });
 });
 
 test('Responses 支持 local_shell、shell 与 apply_patch 工具', async (t) => {

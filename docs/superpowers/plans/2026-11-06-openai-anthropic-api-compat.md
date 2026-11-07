@@ -2989,6 +2989,8 @@ Expected:
 - [x] 覆盖 `max_output_tokens` 与 `upstream_length_limit` 两种截断原因。
 - [x] 覆盖 `parallel_tool_calls:false`、`allowed_tools`、function/custom/namespace、
   `local_shell`、`shell`、`apply_patch`、URL/data URL 图片。
+- [x] `parallel_tool_calls:false` 不覆盖显式 `tool_choice`（包括 `none`）；历史中的
+  `local_shell_call`/`shell_call` 可按 `call_id` 配对并续接。
 - [x] 覆盖内嵌 item、output 早于 call、超长 namespace 哈希去歧义、不支持工具的
   `400 unsupported_tool_type` 与 `file_id` 拒绝。
 - [x] 覆盖 WS `response.interrupt`，以及新 `response.create` 前取消并等待旧租约。
@@ -3053,14 +3055,14 @@ Expected:
 **2026-11-07 CI 稳定版执行记录:**
 
 - 聚焦回归通过：`disconnect-resilience` 18/18、`stream-control` 25/25、
-  `anthropic-http` 33/33、`responses` 40/40、`failover` 11/11、
+  `anthropic-http` 33/33、`responses` 42/42、`failover` 11/11、
   `upstream` 9/9。
-- 全量 `npm test` 通过：基础 55/55，API 228/228，合计 283/283。
+- 全量 `npm test` 通过：基础 55/55，API 230/230，合计 285/285。
 - 独立慢读压测通过：约 1.12 MiB 连续正文触发 `BACKPRESSURE_OVERFLOW`，
   上游关闭、租约归零，子进程峰值 RSS 约 123 MiB。
-- Responses HTTP RST 回归覆盖“已发送可见文本 + 完整工具调用 + 半截同轮调用”
-  的取消场景：取消片段保留可见文本与完整调用，半截参数仍不可执行，SQLite
-  只写入一个取消片段且租约归零。
+- Responses HTTP RST 回归覆盖“已发送可见文本 + 完整工具调用”的取消场景：
+  取消片段保留可见文本与完整调用，SQLite 只写入一个取消片段且租约归零；
+  半截结构化工具参数仍由既有的截断与同轮完整调用用例验证为不可执行。
 - 2026-11-07 21:12 复跑真实链路：Codex CLI Responses HTTP 3 轮通过；
   Responses HTTP、SSE、原生 WS 和 `previous_response_id` 续接通过；
   `default` 的 Chat 文本、SSE、工具续轮、真实中断取消片段持久化通过，
