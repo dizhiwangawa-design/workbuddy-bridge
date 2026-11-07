@@ -191,6 +191,7 @@ export function createResponsesRuntime(options = {}) {
     let finishGraceTimer = null;
     let pingTimer = null;
     let response = null;
+    let upstreamAccepted = false;
     let leaseReleased = false;
     let cancelPromise = null;
     let cancelKind = null;
@@ -523,21 +524,25 @@ export function createResponsesRuntime(options = {}) {
     }
 
     function start() {
-      if (response) return;
+      if (response && (upstreamAccepted || transport === 'ws')) return;
       const isStream = body.stream === true || transport === 'ws';
       // ServerResponse emits 'close' once after the request has been read,
       // even when the client is still connected. Only a response that has
       // entered its writable lifecycle can indicate a lost downstream.
       if (transport === 'http') res?.on('close', onClose);
-      response = baseResponse({
-        id: responseId,
-        model: prepared.model,
-        createdAt,
-        output: prior,
-        store: body.store === true,
-        previousResponseId,
-      });
+      response ||= baseResponse({
+          id: responseId,
+          model: prepared.model,
+          createdAt,
+          output: prior,
+          store: body.store === true,
+          previousResponseId,
+        });
       if (transport === 'http' && isStream) {
+        // Do not commit a success status until the upstream has accepted the
+        // request. Before this point a retryable account failure can still be
+        // transparently retried by create().
+        if (!upstreamAccepted) return;
         res.writeHead(200, streamHeaders());
         emit(responseEvents({ response }).slice(0, 2));
         liveEncoder = createResponsesStreamEncoder({ response });
@@ -882,7 +887,7 @@ export function createResponsesRuntime(options = {}) {
 
     async function run() {
       try {
-        start();
+        if (transport === 'ws') start();
         let credentials = readCredentials(account, { now: now() });
         if (!credentials?.ok) throw runtimeError(
           'WorkBuddy account has no usable credentials',
@@ -923,6 +928,10 @@ export function createResponsesRuntime(options = {}) {
             },
           );
         }
+        upstreamAccepted = true;
+        // A streaming HTTP response becomes visible only after the upstream
+        // accepted the request, preserving pre-header failover semantics.
+        start();
         if (String(upstream.headers.get('content-type') || '').includes('text/event-stream')) {
           await consumeSse(upstream);
         } else {
@@ -1023,7 +1032,7 @@ export function createResponsesRuntime(options = {}) {
           durationMs: now() - requestStarted,
           meta: { model: prepared.model, usage: {} },
         });
-        if (response && body.stream === true) {
+        if (upstreamAccepted && body.stream === true && res?.headersSent) {
           const failed = completedResponseBody({
             id: responseId,
             model: prepared.model,
@@ -1035,7 +1044,7 @@ export function createResponsesRuntime(options = {}) {
           failed.status = 'failed';
           emit(protocolEvents(failed).slice(2));
         }
-        writer?.end();
+        if (res?.headersSent) writer?.end();
         return {
           ok: false,
           error: failure,

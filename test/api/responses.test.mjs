@@ -191,6 +191,48 @@ test('Responses 首字节超时发送失败终态且不会二次写响应头', a
   await store.close();
 });
 
+test('Responses 首帧前 429 换号后再提交 200 SSE', async (t) => {
+  const first = 'responses-failover-a';
+  const second = 'responses-failover-b';
+  createAccount(first);
+  createAccount(second);
+  let calls = 0;
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    calls += 1;
+    if (calls === 1) {
+      res.writeHead(429, { 'content-type': 'application/json' });
+      res.end('{"error":{"message":"rate limited"}}');
+      return;
+    }
+    upstream(res, 'recovered by failover');
+  }, { account: first });
+  pool.updateAccount(first, { enabled: true, maxConcurrency: 1 });
+  pool.updateAccount(second, { enabled: true, maxConcurrency: 1 });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      input: 'failover before headers',
+    }),
+  });
+  assert.equal(response.status, 200);
+  const events = parseSse(await response.text());
+  const terminal = events.find((event) => [
+    'response.completed',
+    'response.incomplete',
+    'response.failed',
+  ].includes(event.type));
+  assert.equal(terminal?.type, 'response.completed', JSON.stringify(events));
+  assert.equal(terminal.response.output[0].content[0].text, 'recovered by failover');
+  assert.equal(calls, 2);
+  await waitFor(() => pool.poolView().accounts
+    .find((item) => item.name === first)?.inflight === 0);
+  await waitFor(() => pool.poolView().accounts
+    .find((item) => item.name === second)?.inflight === 0);
+});
+
 test('Responses SSE 序号单调、done 身份与 completed output 一致，支持图片', async (t) => {
   const { baseUrl } = await fixture(t, async (req, res) => {
     let raw = '';

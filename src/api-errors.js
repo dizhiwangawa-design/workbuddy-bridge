@@ -1,9 +1,14 @@
 export class ApiError extends Error {
-  constructor(status, message, { type = 'invalid_request_error', code = '' } = {}) {
+  constructor(status, message, {
+    type = 'invalid_request_error',
+    code = '',
+    retryable = false,
+  } = {}) {
     super(message);
     this.status = status;
     this.type = type;
     this.code = code;
+    this.retryable = retryable;
   }
 }
 
