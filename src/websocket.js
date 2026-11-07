@@ -97,9 +97,7 @@ export function createWebSocketTransport(socket, {
     }
     if (opcode === 0xA) {
       lastPongAt = Date.now();
-      if (!observer) {
-        for (const waiter of pongWaiters.splice(0)) waiter();
-      }
+      for (const waiter of pongWaiters.splice(0)) waiter();
       return;
     }
     if (opcode === 0x1 || opcode === 0x2 || opcode === 0x0) {
@@ -251,6 +249,8 @@ export function createWebSocketTransport(socket, {
   function hb() {
     pingTimerRef = null;
     if (!open) return;
+    // Never stack pending pings. A healthy peer resolves the waiter before the
+    // next interval; if it did not, the grace timer owns the terminal action.
     if (pongWaiters.length) return;
     lastPongAt = 0;
     const sent = ping();
@@ -271,9 +271,11 @@ export function createWebSocketTransport(socket, {
       const waitForPong = new Promise((resolve) => {
         pongWaiters.push(resolve);
       });
-      waitForPong.then(() => clearTimeout(grace));
+      waitForPong.then(() => {
+        clearTimeout(grace);
+        if (open) startNext();
+      });
     }
-    startNext();
   }
 
   function startNext() {

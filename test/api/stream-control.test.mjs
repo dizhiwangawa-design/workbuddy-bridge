@@ -226,6 +226,56 @@ test('非 observer WS 不启用 Responses 心跳，observer 启用后发 Ping', 
   assert.equal(chunks.some((chunk) => (chunk[0] & 0x0f) === 0x9), true);
 });
 
+test('observer 收到合法 Pong 后继续周期 Ping，随后停止 Pong 会触发超时', async () => {
+  const { Duplex } = await import('node:stream');
+  const chunks = [];
+  const stream = new Duplex({
+    read() {},
+    write(chunk, _encoding, callback) {
+      chunks.push(Buffer.from(chunk));
+      callback();
+    },
+  });
+  const closes = [];
+  const ws = createWebSocketTransport(stream, {
+    observer: true,
+    requireClientPong: true,
+    pingMs: 15,
+    pongGraceMs: 40,
+    onClose: (info) => closes.push(info),
+  });
+
+  function clientFrame(opcode, payload = Buffer.alloc(0)) {
+    const body = Buffer.from(payload);
+    const mask = Buffer.from([1, 2, 3, 4]);
+    const header = Buffer.alloc(6 + body.length);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | body.length;
+    mask.copy(header, 2);
+    body.copy(header, 6);
+    for (let index = 6; index < header.length; index += 1) {
+      header[index] ^= mask[(index - 6) % 4];
+    }
+    return header;
+  }
+
+  const answeredPings = new Set();
+  const answer = setInterval(() => {
+    for (let index = 0; index < chunks.length; index += 1) {
+      if ((chunks[index][0] & 0x0f) !== 0x9 || answeredPings.has(index)) continue;
+      answeredPings.add(index);
+      stream.push(clientFrame(0xA));
+    }
+  }, 5);
+  await new Promise((resolve) => setTimeout(resolve, 85));
+  assert.ok(answeredPings.size >= 3, `expected repeated pings, got ${answeredPings.size}`);
+  assert.equal(ws.open, true);
+  clearInterval(answer);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(ws.open, false);
+  assert.equal(closes.at(-1)?.kind, 'heartbeat_timeout');
+});
+
 test('生产 WebSocket 心跳固定为 Ping 15 秒、Pong 宽限 10 秒', () => {
   assert.equal(WS_PING_MS, 15000);
   assert.equal(WS_PONG_GRACE_MS, 10000);
