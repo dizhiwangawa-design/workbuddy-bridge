@@ -768,6 +768,7 @@ npm run test:live:openai
 node test/live/openai-live.mjs --thinking
 node test/live/openai-live.mjs --tools
 npm run test:live:responses
+WB_LIVE_ACCOUNT=default npm run test:live:account
 ```
 
 第一条验证普通文本，第二条用需要分步算术分析的提示验证思考型提示返回，第三条
@@ -777,6 +778,9 @@ Responses HTTP/SSE/WS、多步工具、取消持久化、断连和慢读；CLI �
 API 路径。`test:live:responses` 使用临时响应库并在结束后无条件恢复号池开关与
 API 设置，验证 Responses HTTP、SSE、原生 WS 和 `previous_response_id` 续接；
 默认使用 `default` 号，可用 `WB_LIVE_ACCOUNT`、`WB_LIVE_MODEL` 覆盖。
+`test:live:account` 固定只启用目标账号，依次验证 Chat 非流式、流式、
+`tool_calls` / `tool` 续轮和租约归零；成功时输出脱敏 JSON。上游 429 时以退出码
+`2` 返回 `blocked:true`，不会打印上游正文或凭据。
 
 ```
 src/

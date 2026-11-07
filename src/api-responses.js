@@ -765,7 +765,12 @@ export function createResponsesRuntime(options = {}) {
         id: responseId,
         createdAt: requestStarted,
         status: finalBody.status,
-        body: { ...finalBody, store: true, _bridgeInput: storedInput },
+        body: {
+          ...finalBody,
+          store: true,
+          _bridgeInput: storedInput,
+          _bridgeMeta: { version: 1, outputOffset: prior.length },
+        },
         usage: result.usage,
         partial: { content: result.content, toolCalls: result.calls },
       }, saveOptions);
@@ -1457,7 +1462,7 @@ export function createResponsesRuntime(options = {}) {
     await ensureDeadLetterRetry();
     const record = await store.get(id);
     if (!record) throw new ApiError(404, 'response not found', { code: 'not_found' });
-    const { _bridgeInput, ...body } = record.body || {};
+    const { _bridgeInput, _bridgeMeta, ...body } = record.body || {};
     return body;
   }
 

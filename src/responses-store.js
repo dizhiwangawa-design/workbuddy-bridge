@@ -211,6 +211,8 @@ export function createDeadLetter({
         cancel_reason: entry.cancelReason || 'canceled',
         phase: entry.phase || 'generation',
         usage: entry.usage || {},
+        input: Array.isArray(entry.input) ? entry.input : [],
+        previous_response_id: entry.previousResponseId || entry.previous_response_id || null,
         save_status: 'failed',
         db_error: String(entry.error?.code || entry.error?.message || 'database write failed').slice(0, 300),
         created_at: new Date(now()).toISOString(),
@@ -473,6 +475,8 @@ export function createResponsesStore({
             cancelReason: cancelInfo.reason || 'client',
             phase: cancelInfo.phase || 'generation',
             usage: entry.usage || {},
+            input: entry.body?._bridgeInput,
+            previousResponseId: entry.body?.previous_response_id || null,
             error,
           });
         } catch (deadLetterError) {
@@ -557,6 +561,10 @@ export function createResponsesStore({
           status: 'incomplete',
           incomplete_details: { reason: 'canceled' },
           output: outputFromPartial(row.partial),
+          store: true,
+          previous_response_id: row.previous_response_id || null,
+          _bridgeInput: Array.isArray(row.input) ? row.input : [],
+          _bridgeMeta: { version: 1, outputOffset: 0 },
         },
       };
       await insert(record, { timeoutMs: writeTimeoutMs });

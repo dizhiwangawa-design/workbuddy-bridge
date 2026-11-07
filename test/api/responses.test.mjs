@@ -123,6 +123,36 @@ function parseSse(raw) {
   return events;
 }
 
+test('historyForResponse 兼容旧记录并按版本化偏移只追加当前输出', () => {
+  const input = [{ type: 'message', role: 'user', content: 'current input' }];
+  const prior = {
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'output_text', text: 'prior answer' }],
+  };
+  const current = {
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'output_text', text: 'current answer' }],
+  };
+  assert.deepEqual(
+    responses.historyForResponse({
+      body: { _bridgeInput: input, output: [prior, current] },
+    }),
+    [...input, prior, current],
+  );
+  assert.deepEqual(
+    responses.historyForResponse({
+      body: {
+        _bridgeInput: [...input, prior],
+        _bridgeMeta: { version: 1, outputOffset: 1 },
+        output: [prior, current],
+      },
+    }),
+    [...input, prior, current],
+  );
+});
+
 test('Responses 非流式输出 reasoning 与 message', async (t) => {
   const { baseUrl } = await fixture(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -557,6 +587,7 @@ test('Responses 持久化支持续接、GET 查询和取消片段查询', async 
   const fetchedBody = await fetched.json();
   assert.equal(fetchedBody.id, initial.id);
   assert.equal(Object.hasOwn(fetchedBody, '_bridgeInput'), false);
+  assert.equal(Object.hasOwn(fetchedBody, '_bridgeMeta'), false);
   const continued = await fetch(`${baseUrl}/v1/responses`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -573,6 +604,50 @@ test('Responses 持久化支持续接、GET 查询和取消片段查询', async 
     item.role === 'user' && JSON.stringify(item).includes('remember')
   )));
   assert.ok(upstreamBodies[1].messages.some((item) => item.role === 'assistant'));
+});
+
+test('Responses 多轮续接不会重复历史输出', async (t) => {
+  const upstreamBodies = [];
+  let requestCount = 0;
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    requestCount += 1;
+    upstream(res, `answer ${requestCount}`);
+  });
+  async function create(body) {
+    const response = await fetch(`${baseUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash', store: true, ...body }),
+    });
+    const raw = await response.text();
+    assert.equal(response.status, 200, raw);
+    return JSON.parse(raw);
+  }
+
+  const first = await create({ input: 'alpha' });
+  const second = await create({
+    input: 'beta',
+    previous_response_id: first.id,
+  });
+  await create({
+    input: 'gamma',
+    previous_response_id: second.id,
+  });
+
+  const messages = upstreamBodies[2].messages;
+  assert.deepEqual(
+    messages.map((item) => [item.role, item.content]),
+    [
+      ['user', 'alpha'],
+      ['assistant', 'answer 1'],
+      ['user', 'beta'],
+      ['assistant', 'answer 2'],
+      ['user', 'gamma'],
+    ],
+  );
 });
 
 test('Responses 续接 SSE 使用当前 item ID 与 prior 之后的 output_index', async (t) => {

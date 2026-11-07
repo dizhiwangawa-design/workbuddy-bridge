@@ -654,7 +654,15 @@ export function historyForResponse(record) {
   const storedInput = Array.isArray(record?.body?._bridgeInput)
     ? record.body._bridgeInput
     : [];
-  return [...storedInput, ...(record?.body?.output || []).map((item) => {
+  const output = Array.isArray(record?.body?.output) ? record.body.output : [];
+  const meta = record?.body?._bridgeMeta;
+  const outputOffset = meta?.version === 1
+    && Number.isSafeInteger(meta.outputOffset)
+    && meta.outputOffset >= 0
+    && meta.outputOffset <= output.length
+    ? meta.outputOffset
+    : 0;
+  return [...storedInput, ...output.slice(outputOffset).map((item) => {
     if (item.type === 'reasoning') return emptyCompletedReasoning();
     return item;
   })];

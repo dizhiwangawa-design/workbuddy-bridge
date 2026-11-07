@@ -2666,7 +2666,7 @@ api('/api/api-compat/keys', {
 
 连接测试只调用一个最小非流式请求，使用 `deepseek-v4.1-flash`，结果只显示 `ok`、耗时、账号名和错误码，不显示 prompt 或 token。
 
-- [x] **Step 4: 管理页结构与桌面布局验收（自动测试覆盖；交互浏览器复验待最终验收）**
+- [x] **Step 4: 管理页结构与桌面布局验收（自动测试覆盖；2026-11-07 已完成真实浏览器桌面复验，按要求不包含手机端）**
 
 Run: `node ./bin/wb.js admin --port 0`
 
@@ -2823,7 +2823,7 @@ Expected:
 - 取消、401、429、首帧前后失败边界通过。
 - API 默认关闭和 Key 鉴权通过。
 
-- [ ] **Step 4: 真实账号冒烟（部分通过；`awa` 被上游 429 阻断）**
+- [ ] **Step 4: 真实账号冒烟（`deepseek-v4.1-flash` 仍被上游模型级配额阻断）**
 
 只有用户明确批准消耗账号额度后执行：
 
@@ -2858,9 +2858,17 @@ Expected:
   `previous_response_id` 续接通过；使用临时响应库，未污染现有记录。
 - 额外真实冒烟：Chat SSE、Anthropic SSE、Anthropic `tool_use/tool_result`
   和 Responses `max_output_tokens=1` 截断均通过。
+- 管理页已用真实浏览器复验 1440×1000：OpenAI 开关会联动 Responses 持久化与续跑提示，
+  桌面布局无横向溢出；按用户要求不把手机端验收列为完成条件。
+- 新增 `test:live:account`：固定单账号执行 Chat 非流式、SSE、工具续轮和租约归零检查。
+  `default` 使用 `deepseek-v4.1-flash` 通过，4 次请求全部记账且 `inflight=0`。
 - `awa` 单独重试仍返回上游 `429 RATE_LIMITED`，因此“每个已登录账号至少成功一次”
-  未满足；已恢复临时改动的号池开关和 API 设置。`codex-fresh-mvxgctfk` 也曾返回
-  同一上游 429。该阻塞属于外部额度/限流，不是本地协议错误。
+  未满足；`codex-fresh-mvxgctfk` 返回同一上游 429。两者提示的重置时间分别为
+  2026-11-08 02:27:25 和 2026-11-07 22:40:23（UTC+8）。
+- 清除本地冷却后，`awa` 与 `codex-fresh-mvxgctfk` 使用 `deepseek-v4-flash`
+  均通过同一套 4 请求账号冒烟（文本、SSE、工具续轮、租约归零）。这证明阻塞是
+  `deepseek-v4.1-flash` 的外部模型级配额，不是凭据、号池或协议链路故障；默认模型
+  仍保持 `deepseek-v4.1-flash`，没有自动换模型掩盖 429。
 - 未读取、打印或提交 access token、refresh token 或完整客户端 Key。
 
 ---
@@ -3001,3 +3009,17 @@ Expected:
   15 秒 keepalive、RST/Close/假死、256 KiB/1 MiB 背压、`upstream_length_limit`
   和 `deepseek-v4.1-flash`。
 - [x] 运行聚焦测试、`npm test`、`git diff --check`，确认版本 `0.4.0` 后本地提交。
+
+### Task 18: 阻断修复与跨重启持久化加固
+
+- [x] 为 Responses 持久化增加版本化 `_bridgeMeta.outputOffset`，多轮
+  `previous_response_id` 只追加当前轮输出，避免重复注入历史 assistant 消息；
+  未带元数据的旧记录继续按旧格式读取。
+- [x] 死信记录保存本轮输入和 `previous_response_id`；SQLite 恢复后仍可通过
+  `previous_response_id` 续接，不再只剩可见文本。
+- [x] 增加“取消 -> 死信 -> 关闭 store -> 新 store 启动重试 -> 查询恢复记录”
+  的跨重启测试，并校验输入、输出和续接关系。
+- [x] 新增固定账号脱敏 live 冒烟脚本；429 使用独立退出码 2 和
+  `blocked:true`，不打印上游正文、token 或客户端 Key。
+- [ ] 在 `deepseek-v4.1-flash` 配额重置后，用 `test:live:account` 对
+  `awa` 和 `codex-fresh-mvxgctfk` 各完成一次通过。该步骤只能等待外部配额恢复。

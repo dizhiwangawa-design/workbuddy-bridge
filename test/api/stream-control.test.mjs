@@ -457,6 +457,12 @@ test('死信重复写入幂等、字段完整且已有文件权限会被收紧�
     cancelReason: 'network_reset',
     phase: 'streaming',
     usage: { input_tokens: 3, output_tokens: 2 },
+    input: [{
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'remember this' }],
+    }],
+    previous_response_id: 'resp_prior',
     error: { code: 'DB_FAILED' },
   };
   assert.equal(dead.append(entry), true);
@@ -469,11 +475,72 @@ test('死信重复写入幂等、字段完整且已有文件权限会被收紧�
     cancel_reason: 'network_reset',
     phase: 'streaming',
     usage: { input_tokens: 3, output_tokens: 2 },
+    input: [{
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'remember this' }],
+    }],
+    previous_response_id: 'resp_prior',
     save_status: 'failed',
     db_error: 'DB_FAILED',
     created_at: '2026-11-07T09:30:00.000Z',
   });
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+});
+
+test('取消死信跨进程重启恢复输入并保留续接关系', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-dead-letter-restart-'));
+  const file = path.join(directory, 'dead.jsonl');
+  const input = [{
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_text', text: 'remember across restart' }],
+  }];
+  const partial = { content: 'partial before crash' };
+  const first = createResponsesStore({
+    directory: path.join(directory, 'sqlite'),
+    deadLetter: createDeadLetter({ file }),
+    failPersist: () => {
+      throw Object.assign(new Error('injected database failure'), { code: 'DB_FAILED' });
+    },
+  });
+  const saved = await first.save({
+    id: 'resp_dead_restart',
+    status: 'incomplete',
+    body: {
+      id: 'resp_dead_restart',
+      status: 'incomplete',
+      incomplete_details: { reason: 'canceled' },
+      previous_response_id: 'resp_prior',
+      output: [{
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'partial before crash' }],
+      }],
+      _bridgeInput: input,
+      _bridgeMeta: { version: 1, outputOffset: 0 },
+    },
+    partial,
+  }, {
+    cancelInfo: { reason: 'network_disconnect', phase: 'generation' },
+    partial,
+  });
+  assert.equal(saved.ok, false);
+  assert.equal(saved.deadLetterWritten, true);
+  await first.close();
+
+  const second = createResponsesStore({
+    directory: path.join(directory, 'sqlite'),
+    deadLetter: createDeadLetter({ file }),
+  });
+  const recovered = await second.retryDeadLetters();
+  assert.deepEqual(recovered, { attempted: 1, recovered: 1 });
+  const record = await second.get('resp_dead_restart');
+  assert.deepEqual(record.body._bridgeInput, input);
+  assert.equal(record.body.previous_response_id, 'resp_prior');
+  assert.equal(record.body.output[0].content[0].text, 'partial before crash');
+  assert.equal(second.deadLetter.exists('resp_dead_restart'), false);
+  await second.close();
 });
 
 test('非 observer WS 不启用 Responses 心跳，observer 启用后发 Ping', async () => {

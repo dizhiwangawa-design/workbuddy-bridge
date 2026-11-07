@@ -27,6 +27,7 @@
     "test:live": "node test/live/anthropic-live.mjs",
     "test:live:openai": "node test/live/openai-live.mjs",
     "test:live:responses": "node test/live/responses-live.mjs",
+    "test:live:account": "node test/live/account-smoke.mjs",
     "test:load": "node test/load/slow-reader.mjs"
   },
   "dependencies": {
