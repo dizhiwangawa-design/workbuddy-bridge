@@ -192,6 +192,30 @@ test('结构化工具调用只在响应结束时完成，并与 DSML 完全隔�
   assert.equal(String(arbitration.warning.argumentHashes[0]).length, 64);
 });
 
+test('结构化工具参数超过字节上限后冻结且不暴露半截调用', () => {
+  const structured = createStructuredToolAssembler({ maxBytes: 16 });
+  assert.throws(
+    () => structured.push([{
+      index: 0,
+      id: 'call_large',
+      function: {
+        name: 'write_file',
+        arguments: JSON.stringify({ input: 'x'.repeat(32) }),
+      },
+    }]),
+    (error) => error.code === 'TOOL_ARGUMENT_LIMIT',
+  );
+  assert.deepEqual(structured.snapshot(), []);
+  assert.deepEqual(structured.finish(), { calls: [], invalid: [] });
+  assert.throws(
+    () => structured.push([{
+      index: 0,
+      function: { name: 'later', arguments: '{}' },
+    }]),
+    (error) => error.code === 'TOOL_ARGUMENT_LIMIT',
+  );
+});
+
 test('结构化全部无效时才回退到 DSML，未声明 tools 时永不调用', () => {
   const fallback = arbitrateToolCalls({
     structured: { calls: [], invalid: [{ index: 0, reason: 'bad json' }] },
@@ -354,6 +378,36 @@ test('SSE parser 支持任意 UTF-8 分块、CRLF 和多行 data', () => {
   assert.equal(events[0].event, 'one');
   assert.deepEqual(JSON.parse(events[0].data), { text: '你好😀' });
   assert.equal(events[1].data, 'line1\nline2');
+});
+
+test('SSE parser 对单事件、跨 data 行和残片缓存执行字节上限', () => {
+  assert.throws(
+    () => createSseParser({ maxBufferBytes: 64 }).feed(`data: ${'x'.repeat(96)}\n\n`),
+    (error) => error.code === 'SSE_BUFFER_LIMIT',
+  );
+  const manyLines = createSseParser({ maxBufferBytes: 64 });
+  assert.throws(
+    () => manyLines.feed(Array.from(
+      { length: 12 },
+      () => `data: ${'x'.repeat(8)}`,
+    ).join('\n')),
+    (error) => error.code === 'SSE_BUFFER_LIMIT',
+  );
+  const partial = createSseParser({ maxBufferBytes: 32 });
+  assert.throws(
+    () => partial.feed(`data: ${'x'.repeat(40)}`),
+    (error) => error.code === 'SSE_BUFFER_LIMIT',
+  );
+});
+
+test('SSE parser 不会因单次 feed 包含多个完整小事件而误判超限', () => {
+  const parser = createSseParser({ maxBufferBytes: 64 });
+  const events = parser.feed(Array.from(
+    { length: 20 },
+    (_, index) => `data: ${index}\n\n`,
+  ).join(''));
+  assert.equal(events.length, 20);
+  assert.equal(events[19].data, '19');
 });
 
 test('工具 ID 缺失或重复时生成稳定且唯一的 Anthropic ID', () => {

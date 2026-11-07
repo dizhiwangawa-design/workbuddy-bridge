@@ -37,6 +37,7 @@ async function fixture(t, handler, {
   apiDeps = {},
   account = 'responses-offline',
   store = null,
+  hardBytes = 1024 * 1024,
 } = {}) {
   createAccount(account);
   for (const name of Object.keys(pool.loadPool().accounts)) {
@@ -75,6 +76,7 @@ async function fixture(t, handler, {
       responsesRuntime: createResponsesRuntime({
         upstreamClient,
         store: responsesStore,
+        hardBytes,
       }),
       ...apiDeps,
     },
@@ -259,13 +261,78 @@ test('Responses SSE 序号单调、done 身份与 completed output 一致，支�
   const raw = await response.text();
   const events = parseSse(raw);
   const sequences = events.map((event) => event.sequence_number);
-  assert.deepEqual(sequences, [...sequences].sort((a, b) => a - b));
+  assert.deepEqual(sequences, events.map((_, index) => index));
   assert.ok(events.length, raw);
+  assert.equal(events.filter((event) => event.type === 'response.created').length, 1);
+  assert.equal(events.filter((event) => event.type === 'response.in_progress').length, 1);
+  const messageAdded = events.filter((event) => (
+    event.type === 'response.output_item.added'
+    && event.item?.type === 'message'
+  ));
+  assert.equal(messageAdded.length, 1, raw);
+  const contentAdded = events.filter((event) => event.type === 'response.content_part.added');
+  assert.equal(contentAdded.length, 1, raw);
   const done = events.findLast((event) => event.type === 'response.output_item.done');
   const completed = events.findLast((event) => event.type === 'response.completed');
   assert.equal(completed.type, 'response.completed', raw);
   const finalMessage = completed.response.output.find((item) => item.type === 'message');
   assert.equal(done.item.id, finalMessage.id);
+});
+
+test('Responses 成功流超过 256 KiB 时 completed output 仍等于已发 delta 拼接', async (t) => {
+  const fullText = '长'.repeat(100 * 1024);
+  const { baseUrl } = await fixture(t, (_req, res) => upstream(res, fullText), {
+    // The test isolates cache correctness from the production 1 MiB event
+    // budget; the production bound remains covered by slow-reader/workflow tests.
+    hardBytes: 2 * 1024 * 1024,
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      input: 'return a long response',
+    }),
+  });
+  assert.equal(response.status, 200);
+  const events = parseSse(await response.text());
+  const deltas = events
+    .filter((event) => event.type === 'response.output_text.delta')
+    .map((event) => event.delta)
+    .join('');
+  const completed = events.findLast((event) => event.type === 'response.completed');
+  assert.equal(deltas, fullText);
+  assert.equal(
+    completed.response.output.find((item) => item.type === 'message').content[0].text,
+    fullText,
+  );
+});
+
+test('Responses 流式 item 身份在持久化后与 completed event 一致', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => upstream(res, 'persisted identity'));
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: true,
+      input: 'persist identity',
+    }),
+  });
+  const events = parseSse(await response.text());
+  const done = events.find((event) => (
+    event.type === 'response.output_item.done'
+    && event.item?.type === 'message'
+  ));
+  const completed = events.findLast((event) => event.type === 'response.completed');
+  const finalMessage = completed.response.output.find((item) => item.type === 'message');
+  assert.equal(done.item.id, finalMessage.id);
+  const fetched = await fetch(`${baseUrl}/v1/responses/${completed.response.id}`);
+  assert.equal(fetched.status, 200);
+  const stored = await fetched.json();
+  assert.equal(stored.output.find((item) => item.type === 'message').id, finalMessage.id);
 });
 
 test('Responses SSE 仅在上游后续静默时仍发送增量正文，最终不重复 delta', async (t) => {
@@ -315,6 +382,22 @@ test('Responses SSE 仅在上游后续静默时仍发送增量正文，最终不
   const completed = events.find((item) => item.type === 'response.completed');
   assert.equal(completed.response.output.find((item) => item.type === 'message')
     .content[0].text, 'incremental');
+});
+
+test('Responses 实时编码器正文与思考缓存保持有界', () => {
+  const response = responses.baseResponse({
+    id: 'resp_bounded_encoder',
+    model: 'deepseek-v4.1-flash',
+    createdAt: 1,
+  });
+  const encoder = responses.createResponsesStreamEncoder({ response });
+  for (let index = 0; index < 400; index += 1) {
+    encoder.textDelta('t'.repeat(1024));
+    encoder.reasoningDelta('r'.repeat(1024));
+  }
+  const snapshot = encoder.snapshot();
+  assert.ok(Buffer.byteLength(snapshot.content, 'utf8') <= 256 * 1024);
+  assert.ok(Buffer.byteLength(snapshot.reasoning, 'utf8') <= 256 * 1024);
 });
 
 test('Responses custom、namespace 与 function 工具往返保留类型', async (t) => {
@@ -471,7 +554,9 @@ test('Responses 持久化支持续接、GET 查询和取消片段查询', async 
   assert.equal(initial.store, true);
   const fetched = await fetch(`${baseUrl}/v1/responses/${initial.id}`);
   assert.equal(fetched.status, 200);
-  assert.equal((await fetched.json()).id, initial.id);
+  const fetchedBody = await fetched.json();
+  assert.equal(fetchedBody.id, initial.id);
+  assert.equal(Object.hasOwn(fetchedBody, '_bridgeInput'), false);
   const continued = await fetch(`${baseUrl}/v1/responses`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -484,6 +569,9 @@ test('Responses 持久化支持续接、GET 查询和取消片段查询', async 
   });
   assert.equal(continued.status, 200);
   assert.equal((await continued.json()).previous_response_id, initial.id);
+  assert.ok(upstreamBodies[1].messages.some((item) => (
+    item.role === 'user' && JSON.stringify(item).includes('remember')
+  )));
   assert.ok(upstreamBodies[1].messages.some((item) => item.role === 'assistant'));
 });
 
@@ -595,6 +683,417 @@ test('Responses 取消片段可通过 HTTP GET 查询并用于续接', async (t)
   )));
 });
 
+test('Responses 下游 SSE 写失败按网络断连持久化并释放租约', async () => {
+  const saved = [];
+  const store = {
+    async save(entry, options) {
+      saved.push({ entry, options });
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(
+            'data: {"choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+          ));
+          controller.enqueue(encoder.encode(
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            + 'data: [DONE]\n\n',
+          ));
+          controller.close();
+        },
+      }),
+    }),
+  };
+  const runtime = createResponsesRuntime({ upstreamClient, store });
+  createAccount('responses-offline');
+  let writes = 0;
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    flushHeaders() {},
+    write(_chunk, callback) {
+      writes += 1;
+      if (writes >= 3) {
+        throw Object.assign(new Error('write after end'), {
+          code: 'ERR_STREAM_WRITE_AFTER_END',
+        });
+      }
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.create({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: true,
+      input: 'write failure',
+    },
+    config: settings.getApiSettings(),
+  });
+  assert.equal(result.canceled, true);
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].entry.status, 'incomplete');
+  assert.match(JSON.stringify(saved[0].entry.body), /visible partial/);
+  await waitFor(() => pool.poolView().accounts
+    .find((item) => item.name === 'responses-offline')?.inflight === 0);
+});
+
+test('Responses 背压取消持久化后销毁挂起连接', async () => {
+  const saved = [];
+  const store = {
+    async save(entry, options) {
+      saved.push({ entry, options });
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream(),
+    }),
+  };
+  const runtime = createResponsesRuntime({ upstreamClient, store });
+  createAccount('responses-offline');
+  let destroyError = null;
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 1024 * 1024,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    flushHeaders() {},
+    write() {
+      throw new Error('overflowed stream must not enqueue another chunk');
+    },
+    end() { this.writableEnded = true; },
+    destroy(error) {
+      this.destroyed = true;
+      this.writable = false;
+      destroyError = error;
+    },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.create({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: true,
+      input: 'force backpressure',
+    },
+    config: settings.getApiSettings(),
+  });
+  assert.equal(result.canceled, true);
+  assert.equal(result.kind, 'backpressure');
+  assert.equal(res.destroyed, true);
+  assert.equal(destroyError?.code, 'BACKPRESSURE_OVERFLOW');
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].entry.status, 'incomplete');
+  await waitFor(() => pool.poolView().accounts
+    .find((item) => item.name === 'responses-offline')?.inflight === 0);
+});
+
+test('Responses 文本硬预算超限统一进入背压取消出口', async () => {
+  const saved = [];
+  const store = {
+    async save(entry, options) {
+      saved.push({ entry, options });
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const payload = 'x'.repeat(2048);
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            choices: [{ delta: { content: payload } }],
+          })}\n\n`));
+          controller.close();
+        },
+      }),
+    }),
+  };
+  const runtime = createResponsesRuntime({
+    upstreamClient,
+    store,
+    hardBytes: 1024,
+  });
+  createAccount('responses-offline');
+  let destroyError = null;
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    flushHeaders() {},
+    write() { return true; },
+    end() { this.writableEnded = true; },
+    destroy(error) {
+      this.destroyed = true;
+      this.writable = false;
+      destroyError = error;
+    },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.create({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: true,
+      input: 'overflow the live output cache',
+    },
+    config: settings.getApiSettings(),
+  });
+  assert.equal(result.canceled, true);
+  assert.equal(result.kind, 'backpressure');
+  assert.equal(destroyError?.code, 'BACKPRESSURE_OVERFLOW');
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].entry.status, 'incomplete');
+  await waitFor(() => pool.poolView().accounts
+    .find((item) => item.name === 'responses-offline')?.inflight === 0);
+});
+
+test('Responses 非流式硬预算超限失败关闭而不是背压成功收尾', async () => {
+  const saved = [];
+  const store = {
+    async save(entry, options) {
+      saved.push({ entry, options });
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const payload = 'x'.repeat(2048);
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            choices: [{ delta: { content: payload } }],
+          })}\n\n`));
+          controller.close();
+        },
+      }),
+    }),
+  };
+  const runtime = createResponsesRuntime({
+    upstreamClient,
+    store,
+    hardBytes: 1024,
+  });
+  createAccount('responses-offline');
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    flushHeaders() {},
+    write() { return true; },
+    end() { this.writableEnded = true; },
+    destroy() { this.destroyed = true; },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.create({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: false,
+      store: true,
+      input: 'overflow the non-stream output cache',
+    },
+    config: settings.getApiSettings(),
+  }).catch((error) => ({ rejected: error }));
+  assert.equal(result.rejected?.code, 'OUTPUT_TOO_LARGE');
+  assert.equal(res.headersSent, false);
+  assert.equal(res.destroyed, false);
+  assert.equal(saved.length, 0);
+  await waitFor(() => pool.poolView().accounts
+    .find((item) => item.name === 'responses-offline')?.inflight === 0);
+});
+
+test('Responses 结构化工具参数超限发送 failed 终态且不持久化失败响应', async () => {
+  const saved = [];
+  const store = {
+    async save(entry, options) {
+      saved.push({ entry, options });
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(
+            'data: {"choices":[{"delta":{"content":"started"}}]}\n\n',
+          ));
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            choices: [{
+              delta: {
+                tool_calls: [{
+                  index: 0,
+                  id: 'call_large',
+                  function: {
+                    name: 'write_file',
+                    arguments: JSON.stringify({ input: 'x'.repeat(128) }),
+                  },
+                }],
+              },
+            }],
+          })}\n\n`));
+          controller.close();
+        },
+      }),
+    }),
+  };
+  const runtime = createResponsesRuntime({ upstreamClient, store });
+  createAccount('responses-offline');
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    flushHeaders() {},
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.create({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: true,
+      input: 'large tool arg',
+      tools: [{
+        type: 'function',
+        name: 'write_file',
+        parameters: { type: 'object', properties: { input: { type: 'string' } } },
+      }],
+    },
+    config: {
+      ...settings.getApiSettings(),
+      dsmlMaxBufferBytes: 32,
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'TOOL_ARGUMENT_LIMIT');
+  const events = parseSse(writes.join(''));
+  const terminal = events.find((event) => [
+    'response.completed',
+    'response.incomplete',
+    'response.failed',
+  ].includes(event.type));
+  assert.equal(terminal?.type, 'response.failed');
+  assert.equal(terminal.response.error.code, 'TOOL_ARGUMENT_LIMIT');
+  assert.equal(JSON.stringify(events).includes('"type":"function_call"'), false);
+  assert.deepEqual(saved, []);
+  await waitFor(() => pool.poolView().accounts
+    .find((item) => item.name === 'responses-offline')?.inflight === 0);
+});
+
+test('WebSocket 心跳超时在终态不可写时仍完成本地取消与租约审计', async () => {
+  let active = 0;
+  const released = [];
+  const sent = [];
+  let saveCalls = 0;
+  const runtime = createResponsesRuntime({
+    pick: () => ({ name: 'heartbeat-unwritable' }),
+    begin: () => { active += 1; },
+    end: (_account, result) => {
+      active -= 1;
+      released.push(result);
+    },
+    upstreamClient: {
+      chat: async () => ({
+        status: 200,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: new ReadableStream(),
+      }),
+    },
+    store: {
+      async get() { return null; },
+      async save() {
+        saveCalls += 1;
+        return { ok: true };
+      },
+    },
+  });
+  createAccount('heartbeat-unwritable');
+  const session = runtime.wsSession({
+    ws: { close() {} },
+    send(event) {
+      sent.push(event);
+      return event.type !== 'response.failed';
+    },
+    config: settings.getApiSettings(),
+  });
+  session.create({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'heartbeat without writable terminal',
+  });
+  await waitFor(() => active === 1);
+  await waitFor(() => sent.some((event) => event.type === 'response.created'));
+  await session.close({ kind: 'heartbeat_timeout' });
+  assert.equal(active, 0);
+  assert.equal(released.length, 1);
+  assert.equal(released[0].code, 'WEB_SOCKET_HEARTBEAT_TIMEOUT');
+  assert.equal(sent.some((event) => event.type === 'response.failed'), true);
+  assert.equal(saveCalls, 0);
+});
+
 test('Responses 续跑提示不把上游 length 截断误称为取消', async (t) => {
   let requestCount = 0;
   const upstreamBodies = [];
@@ -687,6 +1186,64 @@ test('Responses store:false 不保存正文且取消片段不重复拼接', asyn
   controller.abort();
   await new Promise((resolve) => setTimeout(resolve, 200));
   assert.deepEqual(store.memoryView(), []);
+});
+
+test('Responses store:false 主动中断仍发送合法 incomplete 终态', async () => {
+  const events = [];
+  let started = 0;
+  let stopped = 0;
+  const runtime = createResponsesRuntime({
+    pick: () => ({ name: 'responses-no-store' }),
+    begin: () => { started += 1; },
+    end: () => { stopped += 1; },
+    readCredentials: () => ({ ok: true }),
+    upstreamClient: {
+      async chat() {
+        return {
+          status: 200,
+          ok: true,
+          headers: new Headers({ 'content-type': 'text/event-stream' }),
+          body: new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(encodeSseEvent('message', {
+                choices: [{ delta: { content: 'partial without persistence' } }],
+              })));
+            },
+          }),
+        };
+      },
+    },
+    store: {
+      async get() { return null; },
+      async save() { throw new Error('store must not be called for store:false'); },
+    },
+  });
+  const session = runtime.wsSession({
+    ws: {
+      close() {},
+      send() { return true; },
+    },
+    send(event) {
+      events.push(event);
+      return true;
+    },
+    config: settings.getApiSettings(),
+  });
+  session.create({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'cancel without persistence',
+    store: false,
+  });
+  await waitFor(() => events.some((event) => event.type === 'response.output_text.delta'));
+  session.interrupt();
+  await waitFor(() => events.some((event) => (
+    event.type === 'response.incomplete' || event.type === 'response.failed'
+  )));
+  assert.equal(events.some((event) => event.type === 'response.failed'), false);
+  assert.equal(events.some((event) => event.type === 'response.incomplete'), true);
+  assert.equal(started, 1);
+  assert.equal(stopped, 1);
 });
 
 test('Responses 取消持久化失败时不发送正常 incomplete 收尾', async (t) => {

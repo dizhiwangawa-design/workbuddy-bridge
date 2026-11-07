@@ -7,7 +7,20 @@ const INVOKE_PREFIX = `<${BAR}DSML${BAR} invoke`;
 const INVOKE_CLOSE = `</${BAR}DSML${BAR} invoke>`;
 const PARAMETER_PREFIX = `<${BAR}DSML${BAR} parameter`;
 const PARAMETER_CLOSE = `</${BAR}DSML${BAR} parameter>`;
-const DEFAULT_MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+
+export function structuredToolArgumentLimit(configuredBytes, hardBytes = DEFAULT_MAX_BUFFER_BYTES) {
+  const configured = Number(configuredBytes);
+  const hard = Number(hardBytes);
+  return Math.max(1, Math.min(
+    Number.isSafeInteger(configured) && configured > 0
+      ? configured
+      : DEFAULT_MAX_BUFFER_BYTES,
+    Number.isSafeInteger(hard) && hard > 0
+      ? hard
+      : DEFAULT_MAX_BUFFER_BYTES,
+  ));
+}
 
 function scanError(code, message) {
   return { code, message };
@@ -294,24 +307,58 @@ export function createDsmlScanner({
   };
 }
 
-export function createStructuredToolAssembler() {
+export function createStructuredToolAssembler({
+  maxBytes = DEFAULT_MAX_BUFFER_BYTES,
+  maxCalls = 64,
+} = {}) {
+  const limit = Number(maxBytes);
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error('maxBytes must be a positive integer');
+  }
+  const callLimit = Number(maxCalls);
+  if (!Number.isSafeInteger(callLimit) || callLimit <= 0) {
+    throw new Error('maxCalls must be a positive integer');
+  }
   const pending = new Map();
+  let retainedBytes = 0;
+  let fatal = null;
+
+  function overflow() {
+    fatal = Object.assign(new Error(`structured tool arguments exceeded ${limit} bytes`), {
+      code: 'TOOL_ARGUMENT_LIMIT',
+    });
+    pending.clear();
+    retainedBytes = 0;
+    return fatal;
+  }
 
   return {
     push(deltas = []) {
+      if (fatal) throw fatal;
       for (const delta of deltas) {
         const index = Number.isInteger(delta?.index) ? delta.index : 0;
+        if (!pending.has(index) && pending.size >= callLimit) throw overflow();
         const current = pending.get(index) || {
           index,
           id: '',
           name: '',
           arguments: '',
         };
-        if (delta?.id) current.id += String(delta.id);
-        if (delta?.function?.name) current.name += String(delta.function.name);
+        const idPart = delta?.id ? String(delta.id) : '';
+        const namePart = delta?.function?.name ? String(delta.function.name) : '';
+        const argument = delta?.function?.arguments === undefined
+          ? ''
+          : String(delta.function.arguments ?? '');
+        const addedBytes = Buffer.byteLength(idPart, 'utf8')
+          + Buffer.byteLength(namePart, 'utf8')
+          + Buffer.byteLength(argument, 'utf8');
+        if (retainedBytes + addedBytes > limit) throw overflow();
+        current.id += idPart;
+        current.name += namePart;
         if (delta?.function?.arguments !== undefined) {
-          current.arguments += String(delta.function.arguments ?? '');
+          current.arguments += argument;
         }
+        retainedBytes += addedBytes;
         pending.set(index, current);
       }
     },
@@ -370,6 +417,7 @@ export function createStructuredToolAssembler() {
         });
       }
       pending.clear();
+      retainedBytes = 0;
       return { calls, invalid };
     },
   };

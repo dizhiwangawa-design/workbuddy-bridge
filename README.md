@@ -767,13 +767,16 @@ WS 命令和续接。`npm test` 不需要真实账号或网络。
 npm run test:live:openai
 node test/live/openai-live.mjs --thinking
 node test/live/openai-live.mjs --tools
+npm run test:live:responses
 ```
 
 第一条验证普通文本，第二条用需要分步算术分析的提示验证思考型提示返回，第三条
 用官方 SDK 验证真实上游的 `tool_calls` 与下一轮 `tool` 续传。它们均故意将
 `WB_COMMAND` 指向不存在的路径，确认请求不依赖 CLI。离线测试还包含 Chat SSE、
 Responses HTTP/SSE/WS、多步工具、取消持久化、断连和慢读；CLI 自身的工具执行不属于
-API 路径。
+API 路径。`test:live:responses` 使用临时响应库并在结束后无条件恢复号池开关与
+API 设置，验证 Responses HTTP、SSE、原生 WS 和 `previous_response_id` 续接；
+默认使用 `default` 号，可用 `WB_LIVE_ACCOUNT`、`WB_LIVE_MODEL` 覆盖。
 
 ```
 src/

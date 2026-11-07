@@ -7,7 +7,10 @@ import {
 import { beginTask, endTask, loadPool, pickAccount } from './pool.js';
 import { createUpstreamClient } from './upstream-client.js';
 import { createSseParser } from './sse.js';
-import { createDsmlScanner } from './tool-calls.js';
+import {
+  createDsmlScanner,
+  structuredToolArgumentLimit,
+} from './tool-calls.js';
 import { createStructuredToolAssembler, arbitrateToolCalls } from './protocols/normalize.js';
 import { conservativeTokenEstimate } from './protocols/anthropic.js';
 import {
@@ -21,9 +24,11 @@ import {
   resumedPrior,
 } from './protocols/responses.js';
 import {
+  HARD_WRITE_BYTES,
   PRODUCTION_KEEPALIVE_MS,
   canWriteHttp,
   createHttpEventWriter,
+  createTextCache,
   withTimeout,
 } from './stream-control.js';
 import {
@@ -32,14 +37,29 @@ import {
 } from './responses-store.js';
 import { debug, warn } from './log.js';
 
-const MAX_RETAINED_VISIBLE_BYTES = 256 * 1024;
-
 function runtimeError(message, code, {
   status = 502,
   type = 'api_error',
   retryable = false,
 } = {}) {
   return new ApiError(status, message, { type, code, retryable });
+}
+
+function createResponseTextCache({ hardBytes = HARD_WRITE_BYTES } = {}) {
+  return createTextCache({
+    // The terminal output must remain consistent with every delta already sent
+    // to a fast reader. The hard socket budget is the bounded final cache.
+    maxBytes: Math.max(1, Number(hardBytes) || HARD_WRITE_BYTES),
+    retain: 'error',
+  });
+}
+
+function appendResponseText(cache, delta) {
+  try {
+    cache.append(delta);
+  } catch (error) {
+    throw runtimeError(error.message, error.code || 'OUTPUT_TOO_LARGE');
+  }
 }
 
 function streamHeaders() {
@@ -141,6 +161,7 @@ export function createResponsesRuntime(options = {}) {
       { code: 'persistence_disabled' },
     );
     if (!store.get) return { messages: [], prior: [] };
+    await ensureDeadLetterRetry();
     const record = await store.get(previousResponseId);
     if (!record) throw new ApiError(404, 'previous response was not found or expired', {
       code: 'previous_response_not_found',
@@ -160,6 +181,7 @@ export function createResponsesRuntime(options = {}) {
     prepared,
     previousResponseId,
     prior,
+    history = [],
     transport = 'http',
     interruptSignal = null,
     sendWs = null,
@@ -180,6 +202,17 @@ export function createResponsesRuntime(options = {}) {
           softBytes,
           hardBytes,
           onOverflow: (error) => cancel('backpressure', error, { forceWriter: false }),
+          onWriteFailure: (error) => {
+            if (!finished && !canceling) {
+              void cancel('network_disconnect', error instanceof ApiError
+                ? error
+                : runtimeError(
+                    error?.message || 'client response write failed',
+                    'CLIENT_DISCONNECTED',
+                    { status: 499 },
+                  ));
+            }
+          },
         })
       : null;
     let reader = null;
@@ -192,22 +225,24 @@ export function createResponsesRuntime(options = {}) {
     let pingTimer = null;
     let response = null;
     let upstreamAccepted = false;
+    let downstreamStarted = false;
     let leaseReleased = false;
     let cancelPromise = null;
     let cancelKind = null;
     let canceling = false;
     let finished = false;
-    let sequence = 2;
+    let sequence = 0;
     let finishReason = null;
-    let visibleText = '';
-    let reasoningText = '';
     let usage = null;
     let phase = 'opening';
     let sawDone = false;
-    let lineBytes = 0;
     let parser = null;
     let liveEncoder = null;
-    const structured = createStructuredToolAssembler();
+    const visibleText = createResponseTextCache({ hardBytes });
+    const reasoningText = createResponseTextCache({ hardBytes });
+    const structured = createStructuredToolAssembler({
+      maxBytes: structuredToolArgumentLimit(config.dsmlMaxBufferBytes, hardBytes),
+    });
     const scanner = createDsmlScanner({
       maxBufferBytes: config.dsmlMaxBufferBytes,
     });
@@ -285,15 +320,41 @@ export function createResponsesRuntime(options = {}) {
       if (transport !== 'ws' || typeof sendWs !== 'function') return false;
       for (const event of (events || []).map(transform)) {
         try {
-          sendWs(event);
+          if (!sendWs(event)) return false;
         } catch (error) {
           if (['ERR_STREAM_WRITE_AFTER_END', 'EPIPE', 'ECONNRESET'].includes(error?.code)) {
             return false;
           }
-          throw error;
+          return false;
         }
       }
       return true;
+    }
+
+    function publishLive(events) {
+      if (!events?.length) return true;
+      if (transport === 'http') return emit(events);
+      if (transport !== 'ws') return true;
+      const published = publishWs(events);
+      if (!published && !canceling) {
+        void cancel('network_disconnect', runtimeError(
+          'client websocket stopped accepting Responses events',
+          'CLIENT_DISCONNECTED',
+          { status: 499 },
+        ));
+      }
+      return published;
+    }
+
+    function pushStructured(deltas) {
+      try {
+        structured.push(deltas);
+      } catch (error) {
+        throw runtimeError(
+          error?.message || 'structured tool arguments are invalid',
+          error?.code || 'UPSTREAM_INVALID_TOOL_CALL',
+        );
+      }
     }
 
     function snapshot(final = false) {
@@ -313,14 +374,17 @@ export function createResponsesRuntime(options = {}) {
         account,
         allowedToolNames: prepared.toolNames,
       });
-      const content = visibleText + (final ? scanned.visibleText : '');
+      if (final && scanned.visibleText) {
+        appendResponseText(visibleText, scanned.visibleText);
+      }
+      const content = visibleText.value();
       const completion = conservativeTokenEstimate({
         text: content,
         tools: arbitration.calls.map((call) => call.input),
       });
       return {
         content,
-        reasoning: reasoningText,
+        reasoning: reasoningText.value(),
         calls: arbitration.calls,
         callsComplete: !calls.invalid?.length,
         usage: {
@@ -425,16 +489,27 @@ export function createResponsesRuntime(options = {}) {
       finalDeltas = false,
       finalReasoningDeltas = false,
     } = {}) {
+      alignLiveOutputIds(finalBody);
       const live = liveEncoder?.snapshot();
-      const oldMessage = live?.output.find((item) => item.type === 'message');
-      const oldReasoning = live?.output.find((item) => item.type === 'reasoning');
-      finalBody.output = finalBody.output.map((item) => {
-        if (item.type === 'message' && oldMessage) return { ...item, id: oldMessage.id };
-        if (item.type === 'reasoning' && oldReasoning) return { ...item, id: oldReasoning.id };
-        return item;
-      });
       const events = protocolEvents(finalBody, false).slice(2);
       for (const event of events) {
+        const duplicateLiveItem = live
+          && event.type === 'response.output_item.added'
+          && ['message', 'reasoning'].includes(event.data.item?.type);
+        const duplicateLiveContent = live && (
+          (
+            event.type === 'response.content_part.added'
+            && live.output.some((item) => item.type === 'message')
+          )
+          || (
+            event.type === 'response.reasoning_summary_part.added'
+            && live.output.some((item) => item.type === 'reasoning')
+          )
+        );
+        if (duplicateLiveItem || duplicateLiveContent) {
+          event.markRemoved = true;
+          continue;
+        }
         if (event.data.item) {
           const liveItem = live?.output.find((item) => item.type === event.data.item.type);
           if (liveItem) event.data.item = { ...event.data.item, id: liveItem.id };
@@ -465,6 +540,20 @@ export function createResponsesRuntime(options = {}) {
           return event;
         });
     }
+
+    function alignLiveOutputIds(finalBody) {
+      const live = liveEncoder?.snapshot();
+      if (!live?.output?.length) return finalBody;
+      finalBody.output = finalBody.output.map((item, index) => {
+        if (index < prior.length || !['message', 'reasoning'].includes(item.type)) {
+          return item;
+        }
+        const liveItem = live.output.find((candidate) => candidate.type === item.type);
+        return liveItem ? { ...item, id: liveItem.id } : item;
+      });
+      return finalBody;
+    }
+
     async function terminalFailure(kind, error) {
       if (finished) return cancelPromise;
       finished = true;
@@ -475,9 +564,14 @@ export function createResponsesRuntime(options = {}) {
       cancelReader(error);
       cancelPromise = (async () => {
         const live = liveEncoder?.snapshot();
-        if (live?.content) visibleText = live.content;
-        if (live?.reasoning) reasoningText = live.reasoning;
-        let retained = { content: visibleText, reasoning: reasoningText, calls: [], usage: {} };
+        if (live?.content) visibleText.set(live.content);
+        if (live?.reasoning) reasoningText.set(live.reasoning);
+        let retained = {
+          content: visibleText.value(),
+          reasoning: reasoningText.value(),
+          calls: [],
+          usage: {},
+        };
         try {
           retained = snapshot(false);
         } catch (snapshotError) {
@@ -503,14 +597,21 @@ export function createResponsesRuntime(options = {}) {
           previousResponseId,
         });
         failed.status = 'failed';
-        if (transport === 'http' && body.stream === true && writer && !writer.failed) {
-          emit(cancelEvents(failed, {
+        if (transport === 'http' && body.stream === true) {
+          if (downstreamStarted && writer && !writer.failed) {
+            emit(cancelEvents(failed, {
+              finalDeltas: !live?.content,
+              finalReasoningDeltas: !live?.reasoning,
+            }));
+            if (!writer.end()) writer.fail(error);
+          } else {
+            writer?.fail(error);
+          }
+        } else if (transport === 'ws') {
+          publishWs(cancelEvents(failed, {
             finalDeltas: !live?.content,
             finalReasoningDeltas: !live?.reasoning,
           }));
-          writer.end();
-        } else if (transport === 'ws') {
-          publishWs(protocolEvents(failed, false));
         }
         return {
           ok: false,
@@ -524,7 +625,7 @@ export function createResponsesRuntime(options = {}) {
     }
 
     function start() {
-      if (response && (upstreamAccepted || transport === 'ws')) return;
+      if (downstreamStarted) return true;
       const isStream = body.stream === true || transport === 'ws';
       // ServerResponse emits 'close' once after the request has been read,
       // even when the client is still connected. Only a response that has
@@ -538,17 +639,64 @@ export function createResponsesRuntime(options = {}) {
           store: body.store === true,
           previousResponseId,
         });
+      if (!upstreamAccepted) return false;
+      if (transport === 'ws') {
+        downstreamStarted = true;
+        liveEncoder = createResponsesStreamEncoder({
+          response,
+          maxBytes: hardBytes,
+          retain: 'error',
+        });
+        if (!publishWs(responseEvents({ response }).slice(0, 2))) {
+          downstreamStarted = false;
+          void cancel('network_disconnect', runtimeError(
+            'client websocket closed before Responses lifecycle events',
+            'CLIENT_DISCONNECTED',
+            { status: 499 },
+          ));
+          return false;
+        }
+        return true;
+      }
       if (transport === 'http' && isStream) {
         // Do not commit a success status until the upstream has accepted the
         // request. Before this point a retryable account failure can still be
         // transparently retried by create().
         if (!upstreamAccepted) return;
-        res.writeHead(200, streamHeaders());
-        emit(responseEvents({ response }).slice(0, 2));
-        liveEncoder = createResponsesStreamEncoder({ response });
+        if (!canWriteHttp(res)) {
+          void cancel('network_disconnect', runtimeError(
+            'client disconnected before SSE response',
+            'CLIENT_DISCONNECTED',
+            { status: 499 },
+          ));
+          return false;
+        }
+        try {
+          res.writeHead(200, streamHeaders());
+        } catch (error) {
+          void cancel('network_disconnect', runtimeError(
+            error.message || 'client SSE response failed',
+            'CLIENT_DISCONNECTED',
+            { status: 499 },
+          ));
+          return false;
+        }
+        downstreamStarted = true;
+        if (!emit(responseEvents({ response }).slice(0, 2))) {
+          return false;
+        }
+        if (writer?.failed || writer?.ended || canceling) return false;
+        liveEncoder = createResponsesStreamEncoder({
+          response,
+          maxBytes: hardBytes,
+          retain: 'error',
+        });
         pingTimer = setInterval(keepalive, keepaliveMs);
         pingTimer.unref?.();
+        return true;
       }
+      downstreamStarted = true;
+      return true;
     }
 
     function timeout(kind, error) {
@@ -588,6 +736,23 @@ export function createResponsesRuntime(options = {}) {
       if (!config.responsesPersistence || body.store === false) {
         return { ok: false, skipped: true };
       }
+      const storedInput = Array.isArray(history) ? [...history] : [];
+      if (typeof body.instructions === 'string' && body.instructions) {
+        storedInput.unshift({
+          type: 'message',
+          role: 'system',
+          content: [{ type: 'input_text', text: body.instructions }],
+        });
+      }
+      if (typeof body.input === 'string') {
+        storedInput.push({
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: body.input }],
+        });
+      } else if (Array.isArray(body.input)) {
+        storedInput.push(...body.input);
+      }
       const saveOptions = {
         timeoutMs: persistTimeoutMs,
         marker: body.input,
@@ -600,7 +765,7 @@ export function createResponsesRuntime(options = {}) {
         id: responseId,
         createdAt: requestStarted,
         status: finalBody.status,
-        body: { ...finalBody, store: true },
+        body: { ...finalBody, store: true, _bridgeInput: storedInput },
         usage: result.usage,
         partial: { content: result.content, toolCalls: result.calls },
       }, saveOptions);
@@ -621,8 +786,8 @@ export function createResponsesRuntime(options = {}) {
         clearTimers();
         cancelReader(reason);
         const live = liveEncoder?.snapshot();
-        if (live?.content) visibleText = live.content;
-        if (live?.reasoning) reasoningText = live.reasoning;
+        if (live?.content) visibleText.set(live.content);
+        if (live?.reasoning) reasoningText.set(live.reasoning);
         release({
           ok: false,
           code: 'BACKPRESSURE_OVERFLOW',
@@ -651,12 +816,13 @@ export function createResponsesRuntime(options = {}) {
               previousResponseId,
             });
             cancelBody.output = mergePartialOutput(cancelBody.output, partial);
+            alignLiveOutputIds(cancelBody);
             const persisted = await persistFinal(cancelBody, retained, true);
             if (persisted.deadLetterWritten) {
               warn(`canceled Responses fragment written to dead letter: ${responseId}`);
             }
             finished = true;
-            writer?.end();
+            writer?.fail(reason || writer?.failed);
             return {
               ok: false,
               canceled: true,
@@ -667,7 +833,7 @@ export function createResponsesRuntime(options = {}) {
           } catch (error) {
             warn(`Responses backpressure persistence failed: ${error.message}`);
             finished = true;
-            writer?.end();
+            writer?.fail(error);
             return {
               ok: false,
               canceled: true,
@@ -722,8 +888,9 @@ export function createResponsesRuntime(options = {}) {
           cancelBody.reasoning = retained.reasoning || '';
           cancelBody.calls = retained.calls || [];
           cancelBody.output = mergePartialOutput(cancelBody.output, partial);
+          alignLiveOutputIds(cancelBody);
           persisted = await persistFinal(cancelBody, retained, true);
-          if (!persisted.ok) {
+          if (!persisted.ok && !persisted.skipped) {
             finished = true;
             const failed = completedResponseBody({
               id: responseId,
@@ -743,15 +910,19 @@ export function createResponsesRuntime(options = {}) {
             });
             failed.status = 'failed';
             if (transport === 'ws') {
-              publishWs(protocolEvents(failed, false));
-            } else if (canWriteHttp(res)) {
+              const live = liveEncoder?.snapshot();
+              publishWs(cancelEvents(failed, {
+                finalDeltas: !live?.content,
+                finalReasoningDeltas: !live?.reasoning,
+              }));
+            } else if (downstreamStarted && canWriteHttp(res)) {
               const failedEvents = protocolEvents(failed, false).slice(2);
               for (const event of failedEvents) {
                 emit([event]);
               }
-              writer.end();
+              if (!writer.end()) writer.fail(persisted.error);
             } else {
-              writer?.end();
+              writer?.fail(persisted.error);
             }
             return {
               ok: false,
@@ -770,12 +941,16 @@ export function createResponsesRuntime(options = {}) {
           }
           finished = true;
           if (transport === 'ws') {
-            publishWs(protocolEvents(cancelBody, false));
-          } else if (writer && !writer.failed && canWriteHttp(res)) {
+            const live = liveEncoder?.snapshot();
+            publishWs(cancelEvents(cancelBody, {
+              finalDeltas: !live?.content,
+              finalReasoningDeltas: !live?.reasoning,
+            }));
+          } else if (downstreamStarted && writer && !writer.failed && canWriteHttp(res)) {
             emit(cancelEvents(cancelBody, { finalDeltas: true }));
-            writer.end();
+            if (!writer.end()) writer.fail(reason);
           } else {
-            writer?.end();
+            writer?.fail(reason);
           }
           const callback = {
             ok: false,
@@ -891,11 +1066,13 @@ export function createResponsesRuntime(options = {}) {
       phase = 'generation';
       const payload = choice.delta || choice.message || {};
       if (typeof payload.reasoning_content === 'string') {
-        reasoningText += payload.reasoning_content;
-        if (payload.reasoning_content) emit(liveEncoder?.reasoningDelta(payload.reasoning_content));
+        appendResponseText(reasoningText, payload.reasoning_content);
+        if (payload.reasoning_content) {
+          publishLive(liveEncoder?.reasoningDelta(payload.reasoning_content));
+        }
       }
       if (Array.isArray(payload.tool_calls)) {
-        structured.push(payload.tool_calls);
+        pushStructured(payload.tool_calls);
         phase = 'tool_call';
       }
       const content = typeof payload.content === 'string'
@@ -904,7 +1081,6 @@ export function createResponsesRuntime(options = {}) {
           ? payload.content.map((part) => part?.type === 'text' ? part.text || '' : '').join('')
           : '';
       if (content) {
-        lineBytes += content.length;
         const scanned = scanner.push(content);
         if (scanned.error) throw runtimeError(
           'upstream DSML tool call is malformed',
@@ -915,12 +1091,8 @@ export function createResponsesRuntime(options = {}) {
           phase = 'tool_call';
         }
         if (scanned.visibleText) {
-          visibleText = scanner.hasPendingCall()
-            ? (visibleText + scanned.visibleText).slice(-MAX_RETAINED_VISIBLE_BYTES)
-            : `${visibleText + scanned.visibleText}`.slice(-MAX_RETAINED_VISIBLE_BYTES);
-          if (transport === 'http' && body.stream === true && liveEncoder) {
-            emit(liveEncoder.textDelta(scanned.visibleText));
-          }
+          appendResponseText(visibleText, scanned.visibleText);
+          if (liveEncoder) publishLive(liveEncoder.textDelta(scanned.visibleText));
         }
       }
       if (finishReason && !finishGraceTimer) {
@@ -933,7 +1105,6 @@ export function createResponsesRuntime(options = {}) {
 
     async function run() {
       try {
-        if (transport === 'ws') start();
         let credentials = readCredentials(account, { now: now() });
         if (!credentials?.ok) throw runtimeError(
           'WorkBuddy account has no usable credentials',
@@ -997,7 +1168,7 @@ export function createResponsesRuntime(options = {}) {
         clearTimers();
         const result = snapshot(true);
         if (liveEncoder?.snapshot().content) {
-          result.content = liveEncoder.snapshot().content.slice(-MAX_RETAINED_VISIBLE_BYTES);
+          result.content = liveEncoder.snapshot().content;
         }
         if (result.calls.length > 1 && prepared.parallelToolCalls === false) {
           result.calls = result.calls.slice(0, 1);
@@ -1017,6 +1188,7 @@ export function createResponsesRuntime(options = {}) {
           actuallyLimited: result.usage.completion_tokens >= Number(prepared.maxOutputTokens),
           previousResponseId,
         });
+        alignLiveOutputIds(finalBody);
         release({
           ok: true,
           code: 'OK',
@@ -1035,14 +1207,29 @@ export function createResponsesRuntime(options = {}) {
           else if (persisted.skipped) finalBody.store = false;
           else warn(`Responses fragment persistence failed: ${persisted.error?.code || ''}`);
         }
-        finished = true;
         if (transport === 'http') {
           if (body.stream === true) {
-            emit(cancelEvents(finalBody, {
+            const emitted = emit(cancelEvents(finalBody, {
               finalDeltas: false,
               finalReasoningDeltas: false,
             }));
-            writer.end();
+            if (cancelKind || canceling) return cancelPromise;
+            if (!emitted) {
+              return cancel('network_disconnect', runtimeError(
+                writer?.failed?.message || 'client disconnected during SSE finish',
+                'CLIENT_DISCONNECTED',
+                { status: 499 },
+              ));
+            }
+            if (!writer?.end()) {
+              if (writer?.failed || !canWriteHttp(res)) {
+                return cancel('network_disconnect', runtimeError(
+                  writer?.failed?.message || 'client disconnected during SSE finish',
+                  'CLIENT_DISCONNECTED',
+                  { status: 499 },
+                ));
+              }
+            }
           } else {
             if (!res.writable || res.destroyed || res.writableEnded) return await cancel(
               'network_disconnect',
@@ -1055,8 +1242,12 @@ export function createResponsesRuntime(options = {}) {
             res.end(JSON.stringify(finalBody));
           }
         } else {
-          publishWs(protocolEvents(finalBody));
+          publishWs(cancelEvents(finalBody, {
+            finalDeltas: false,
+            finalReasoningDeltas: false,
+          }));
         }
+        finished = true;
         const callback = { ok: true, response: finalBody, responseId };
         try {
           onDone?.(callback);
@@ -1066,9 +1257,22 @@ export function createResponsesRuntime(options = {}) {
         return callback;
       } catch (error) {
         if (cancelKind) return cancelPromise;
+        if (
+          error?.code === 'OUTPUT_TOO_LARGE'
+          && (transport === 'ws' || body.stream === true)
+        ) {
+          return cancel('backpressure', runtimeError(
+            'Responses output exceeded the hard send budget',
+            'BACKPRESSURE_OVERFLOW',
+          ));
+        }
+        const failureCode = ['SSE_BUFFER_LIMIT', 'OUTPUT_TOO_LARGE', 'TOOL_ARGUMENT_LIMIT']
+          .includes(error?.code)
+          ? error.code
+          : 'INTERNAL_ERROR';
         const failure = error instanceof ApiError
           ? error
-          : runtimeError(error.message || 'internal error', 'INTERNAL_ERROR');
+          : runtimeError(error.message || 'internal error', failureCode);
         finished = true;
         clearTimers();
         release({
@@ -1090,7 +1294,25 @@ export function createResponsesRuntime(options = {}) {
           failed.status = 'failed';
           emit(protocolEvents(failed).slice(2));
         }
-        if (res?.headersSent) writer?.end();
+        if (transport === 'ws') {
+          const failed = completedResponseBody({
+            id: responseId,
+            model: prepared.model,
+            createdAt,
+            prior,
+            error: { code: failure.code || 'internal_error', message: failure.message },
+            previousResponseId,
+          });
+          failed.status = 'failed';
+          publishWs(cancelEvents(failed, {
+            finalDeltas: !liveEncoder?.snapshot().content,
+            finalReasoningDeltas: !liveEncoder?.snapshot().reasoning,
+          }));
+        }
+        if (res?.headersSent) {
+          if (writer?.failed) writer.fail(failure);
+          else writer?.end();
+        }
         return {
           ok: false,
           error: failure,
@@ -1101,7 +1323,7 @@ export function createResponsesRuntime(options = {}) {
         clearTimers();
         req?.off('aborted', onClose);
         res?.off('close', onClose);
-        interruptSignal?.off('abort', onAbort);
+        interruptSignal?.removeEventListener?.('abort', onAbort);
         if (reader && !readerDone) cancelReader(controller.signal.reason || 'request finished');
         await withTimeout(readerCancellation, 1000, 'upstream reader close timed out').catch(() => {});
         if (!leaseReleased) release({
@@ -1144,20 +1366,34 @@ export function createResponsesRuntime(options = {}) {
       toolsEnabled: config.tools,
       history,
     });
-    const attempt = await setupAttempt({ onAttempt,
-      req,
-      res,
-      body,
-      config,
-      account,
-      prepared,
-      previousResponseId,
-      prior,
-      transport,
-      interruptSignal,
-      sendWs,
-      onDone,
-    });
+    let attempt;
+    try {
+      attempt = await setupAttempt({
+        onAttempt,
+        req,
+        res,
+        body,
+        config,
+        account,
+        prepared,
+        previousResponseId,
+        prior,
+        history,
+        transport,
+        interruptSignal,
+        sendWs,
+        onDone,
+      });
+    } catch (error) {
+      end(account, {
+        ok: false,
+        code: error?.code || 'SETUP_ERROR',
+        error: error?.message || 'Responses attempt setup failed',
+        durationMs: 0,
+        meta: { model: prepared?.model || config?.defaultModel || '', usage: {} },
+      });
+      throw error;
+    }
 
     return attempt.run();
   }
@@ -1221,7 +1457,8 @@ export function createResponsesRuntime(options = {}) {
     await ensureDeadLetterRetry();
     const record = await store.get(id);
     if (!record) throw new ApiError(404, 'response not found', { code: 'not_found' });
-    return record.body;
+    const { _bridgeInput, ...body } = record.body || {};
+    return body;
   }
 
   async function destroy() {
@@ -1285,19 +1522,31 @@ export function createResponsesRuntime(options = {}) {
         send({ type: 'error', error: { code: error.code || 'invalid_request', message: error.message } });
         return;
       }
-      const current = await setupAttempt({
-        body: command,
-        config,
-        account: picked.name,
-        prepared,
-        previousResponseId: command.previous_response_id || null,
-        prior: history.prior,
-        history: history.messages,
-        transport: 'ws',
-        interruptSignal: controller.signal,
-        sendWs: send,
-        onDone: (result) => onResponse?.(result),
-      });
+      let current;
+      try {
+        current = await setupAttempt({
+          body: command,
+          config,
+          account: picked.name,
+          prepared,
+          previousResponseId: command.previous_response_id || null,
+          prior: history.prior,
+          history: history.messages,
+          transport: 'ws',
+          interruptSignal: controller.signal,
+          sendWs: send,
+          onDone: (result) => onResponse?.(result),
+        });
+      } catch (error) {
+        end(picked.name, {
+          ok: false,
+          code: error?.code || 'SETUP_ERROR',
+          error: error?.message || 'Responses WebSocket setup failed',
+          durationMs: 0,
+          meta: { model: prepared.model, usage: {} },
+        });
+        throw error;
+      }
       attempt = current;
       const currentRun = current.run();
       running = currentRun.then((result) => {

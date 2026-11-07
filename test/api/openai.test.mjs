@@ -1004,6 +1004,155 @@ test('OpenAI Cancellation catch 路径持久化成功后仍发送合法收尾和
   assert.equal(raw.match(/data: \[DONE\]/g)?.length, 1);
 });
 
+test('Chat 下游 SSE 写失败按网络断连持久化并释放租约', async () => {
+  const saved = [];
+  const store = {
+    async save(entry, options) {
+      saved.push({ entry, options });
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(
+            'data: {"id":"chat-write-error","choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+          ));
+          controller.enqueue(encoder.encode(
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            + 'data: [DONE]\n\n',
+          ));
+          controller.close();
+        },
+      }),
+    }),
+  };
+  const runtime = createOpenAIRuntime({ upstreamClient, cancelPersistence: store });
+  createAccount('openai-a');
+  let writes = 0;
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(_chunk, callback) {
+      writes += 1;
+      if (writes >= 3) {
+        throw Object.assign(new Error('write after end'), {
+          code: 'ERR_STREAM_WRITE_AFTER_END',
+        });
+      }
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.chatWithCancellation({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'write fails' }],
+    },
+    config: settings.getApiSettings(),
+  });
+  assert.equal(result.canceled, true);
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].entry.status, 'incomplete');
+  assert.match(JSON.stringify(saved[0].entry.body), /visible partial/);
+  assert.equal(inflight('openai-a'), 0);
+});
+
+test('Chat 结构化工具参数超限失败关闭且不输出可执行调用', async () => {
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(
+            'data: {"choices":[{"delta":{"content":"started"}}]}\n\n',
+          ));
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            choices: [{
+              delta: {
+                tool_calls: [{
+                  index: 0,
+                  id: 'call_large',
+                  function: {
+                    name: 'write_file',
+                    arguments: JSON.stringify({ input: 'x'.repeat(128) }),
+                  },
+                }],
+              },
+            }],
+          })}\n\n`));
+          controller.close();
+        },
+      }),
+    }),
+  };
+  const runtime = createOpenAIRuntime({ upstreamClient });
+  createAccount('openai-a');
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.chatWithCancellation({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'large tool arg' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'write_file',
+          parameters: { type: 'object', properties: { input: { type: 'string' } } },
+        },
+      }],
+    },
+    config: {
+      ...settings.getApiSettings(),
+      dsmlMaxBufferBytes: 32,
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'TOOL_ARGUMENT_LIMIT');
+  const events = parseSse(writes.join(''));
+  assert.equal(events.some((event) => (
+    event.choices?.[0]?.delta?.tool_calls?.length > 0
+  )), false);
+  assert.equal(events.some((event) => event.error?.code === 'TOOL_ARGUMENT_LIMIT'), true);
+  assert.equal(inflight('openai-a'), 0);
+});
+
 test('OpenAI 取消顺序为停止上游、释放租约、持久化、合法收尾', async () => {
   const events = [];
   let releaseLease;

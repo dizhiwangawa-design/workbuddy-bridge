@@ -483,6 +483,77 @@ test('WEB_SOCKET RST 不依赖 Close 帧，仍走统一取消并释放活动租�
   await waitFor(() => inflight(account) === 0, 6000);
 });
 
+test('WEB_SOCKET 上游请求失败时发送 failed 终态且释放租约', async (t) => {
+  let requestCount = 0;
+  const { bridge, account } = await fixture(t, (_req, res) => {
+    requestCount += 1;
+    res.writeHead(500, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'fixture upstream failed' } }));
+  });
+  const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}/v1/responses`);
+  const events = [];
+  ws.on('message', (raw) => events.push(JSON.parse(raw.toString())));
+  await once(ws, 'open');
+  ws.send(JSON.stringify({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'fail upstream',
+  }));
+  await waitFor(() => events.some((event) => event.type === 'response.failed'), 3000);
+  await waitFor(() => inflight(account) === 0);
+  const failed = events.find((event) => event.type === 'response.failed');
+  assert.equal(failed.data.response.status, 'failed');
+  assert.equal(requestCount, 1);
+  assert.equal(events.some((event) => event.type === 'response.completed'), false);
+  ws.close(1000, 'done');
+  await once(ws, 'close');
+});
+
+test('WEB_SOCKET 原生流发送生命周期事件与实时正文增量', async (t) => {
+  const { bridge } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'ws-' } }],
+    }));
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'incremental' } }],
+    }));
+    res.end(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+    }) + 'data: [DONE]\n\n');
+  });
+  const ws = new WebSocket(`ws://127.0.0.1:${bridge.port}/v1/responses`);
+  const events = [];
+  ws.on('message', (raw) => events.push(JSON.parse(raw.toString())));
+  await once(ws, 'open');
+  ws.send(JSON.stringify({
+    type: 'response.create',
+    model: 'deepseek-v4.1-flash',
+    input: 'stream over websocket',
+  }));
+  await waitFor(() => events.some((event) => event.type === 'response.completed'), 3000);
+  assert.deepEqual(
+    events.slice(0, 2).map((event) => event.type),
+    ['response.created', 'response.in_progress'],
+  );
+  const deltas = events
+    .filter((event) => event.type === 'response.output_text.delta')
+    .map((event) => event.data.delta);
+  assert.equal(deltas.join(''), 'ws-incremental');
+  assert.equal(events.filter((event) => event.type === 'response.created').length, 1);
+  assert.equal(events.filter((event) => (
+    event.type === 'response.output_item.added'
+    && event.data.item?.type === 'message'
+  )).length, 1);
+  assert.ok(events.every((event) => event.data), JSON.stringify(events));
+  assert.deepEqual(
+    events.map((event) => event.data.sequence_number),
+    events.map((_, index) => index),
+  );
+  ws.close(1000, 'done');
+  await once(ws, 'close');
+});
+
 test('慢读取 1 秒时真实 keepalive 先于读写循环出现', async (t) => {
   const { bridge } = await fixture(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });

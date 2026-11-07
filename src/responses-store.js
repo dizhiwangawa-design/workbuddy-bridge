@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
 import { BRIDGE_HOME, ensureDir } from './paths.js';
 import { warn } from './log.js';
+import { utf8Prefix } from './stream-control.js';
 
 const MAX_RECORDS = 256;
 const MAX_BYTES = 32 * 1024 * 1024;
@@ -13,16 +14,34 @@ const MAX_PARTIAL_BYTES = 8 * 1024 * 1024;
 const WRITE_TIMEOUT_MS = 2000;
 const MAX_PERSISTED_TEXT_BYTES = 256 * 1024;
 
+function workerExecArgv(args = process.execArgv) {
+  const filtered = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--input-type' || arg === '--eval' || arg === '--print'
+      || arg === '-e' || arg === '-p') {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('--input-type=') || arg.startsWith('--eval=')
+      || arg.startsWith('--print=')) {
+      continue;
+    }
+    filtered.push(arg);
+  }
+  return filtered;
+}
+
 export function compactResponseForStore(response) {
   let textBudget = MAX_PERSISTED_TEXT_BYTES;
   const clip = (value) => {
     const text = String(value ?? '');
-    const bytes = Buffer.from(text);
-    if (bytes.length <= textBudget) {
-      textBudget -= bytes.length;
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (bytes <= textBudget) {
+      textBudget -= bytes;
       return text;
     }
-    const kept = bytes.subarray(0, textBudget).toString('utf8');
+    const kept = textBudget > 0 ? utf8Prefix(text, textBudget) : '';
     textBudget = 0;
     return kept;
   };
@@ -249,6 +268,9 @@ export function createResponsesStore({
   let queue = Promise.resolve();
 
   function pruneMemory() {
+    for (const [id, record] of memory) {
+      if (now() - Number(record?.createdAt || 0) > MAX_AGE_MS) memory.delete(id);
+    }
     while (memory.size > MAX_MEMORY) memory.delete(memory.keys().next().value);
   }
 
@@ -269,6 +291,9 @@ export function createResponsesStore({
   async function startWorker() {
     if (worker) return workerReady;
     const current = new Worker(workerScript, {
+      // A bridge may be launched from `node --eval`; that mode is not valid
+      // for a file-backed worker and would otherwise fail worker startup.
+      execArgv: workerExecArgv(),
       workerData: {
         dbPath,
         busyTimeoutMs: Math.max(1, Number(busyTimeoutMs) || WRITE_TIMEOUT_MS),
@@ -460,7 +485,13 @@ export function createResponsesStore({
 
   async function get(id) {
     const local = memory.get(id);
-    if (local) return local;
+    if (local) {
+      if (now() - Number(local.createdAt || 0) > MAX_AGE_MS) {
+        memory.delete(id);
+        return null;
+      }
+      return local;
+    }
     try {
       const row = await requestWorker('get', { id });
       if (!row) return null;
@@ -488,6 +519,7 @@ export function createResponsesStore({
   async function resolvePersistedCancel(inputOrId) {
     const deadline = now() + 750;
     while (now() <= deadline) {
+      pruneMemory();
       for (const record of memory.values()) {
         if (record.id === inputOrId) return record;
         if (record.status !== 'incomplete') continue;
@@ -498,6 +530,10 @@ export function createResponsesStore({
       try {
         const row = await requestWorker('latest-incomplete');
         if (row) {
+          if (now() - Number(row.created_at) > MAX_AGE_MS) {
+            await requestWorker('remove', { id: row.id });
+            continue;
+          }
           const record = fromDbRow(row);
           remember(record);
           return record;
@@ -548,6 +584,7 @@ export function createResponsesStore({
     save,
     get,
     memoryView() {
+      pruneMemory();
       return [...memory.values()];
     },
     remove,

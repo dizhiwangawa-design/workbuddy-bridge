@@ -14,7 +14,10 @@ import {
   arbitrateToolCalls,
   createStructuredToolAssembler,
 } from './protocols/normalize.js';
-import { createDsmlScanner } from './tool-calls.js';
+import {
+  createDsmlScanner,
+  structuredToolArgumentLimit,
+} from './tool-calls.js';
 import { createSseParser, encodeSseEvent } from './sse.js';
 import { ApiError, sendApiError } from './api-errors.js';
 import {
@@ -30,10 +33,12 @@ import {
 import { createUpstreamClient } from './upstream-client.js';
 import { debug, warn } from './log.js';
 import {
+  HARD_WRITE_BYTES,
   PRODUCTION_KEEPALIVE_MS,
   UPSTREAM_LENGTH_LIMIT,
   canWriteHttp,
   createHttpEventWriter,
+  createTextCache,
   isWriteError,
   withTimeout,
 } from './stream-control.js';
@@ -75,6 +80,47 @@ class TimeoutFailure extends RuntimeFailure {
     });
     this.timeoutKind = kind;
   }
+}
+
+function clientWriteFailure(error) {
+  if (error instanceof RuntimeFailure) return error;
+  return new RuntimeFailure('client response write failed', {
+    code: 'ABORTED',
+    retryable: false,
+  });
+}
+
+function createRuntimeTextCache({ hardBytes = HARD_WRITE_BYTES } = {}) {
+  return createTextCache({
+    // Keep the complete successful output only up to the same hard bound as
+    // the socket queue. This prevents a fast reader from receiving deltas that
+    // disappear from the terminal response while still bounding memory.
+    maxBytes: Math.max(1, Number(hardBytes) || HARD_WRITE_BYTES),
+    retain: 'error',
+  });
+}
+
+function appendRuntimeText(cache, delta) {
+  try {
+    cache.append(delta);
+  } catch (error) {
+    throw new RuntimeFailure(error.message, {
+      status: 502,
+      type: 'api_error',
+      code: error.code || 'OUTPUT_TOO_LARGE',
+      retryable: false,
+    });
+  }
+}
+
+function structuredRuntimeFailure(error) {
+  if (error instanceof RuntimeFailure) return error;
+  return new RuntimeFailure(error?.message || 'structured tool arguments are invalid', {
+    status: 502,
+    type: 'api_error',
+    code: error?.code || 'UPSTREAM_INVALID_TOOL_CALL',
+    retryable: false,
+  });
 }
 
 function sendJson(res, status, body, headers = {}) {
@@ -282,7 +328,7 @@ export function createAnthropicRuntime({
     let cancelPersistenceResult = null;
     let cancelPromise = null;
     let leaseReleased = false;
-    let visibleText = '';
+    const visibleText = createRuntimeTextCache({ hardBytes });
     let dsmlCalls = [];
     let structured;
     let scanner;
@@ -304,6 +350,9 @@ export function createAnthropicRuntime({
           softBytes,
           hardBytes,
           onOverflow: (error) => terminate('backpressure', error),
+          onWriteFailure: (error) => {
+            if (!responseEnded) terminate('client', clientWriteFailure(error));
+          },
         })
       : null;
 
@@ -314,24 +363,48 @@ export function createAnthropicRuntime({
     }
 
     function write(events) {
-      if (!stream || !events.length || responseEnded) return;
-      writer.writeEvents(events);
+      if (!stream || !events.length || responseEnded) return false;
+      return writer.writeEvents(events);
     }
 
-    function ensureStarted() {
+    function ensureStarted({ allowCanceled = false } = {}) {
       if (downstreamStarted) return;
+      if (!stream || responseEnded || (cancelKind && !allowCanceled)) return;
+      if (!canWriteHttp(res)) {
+        terminate('client', clientWriteFailure());
+        return;
+      }
+      try {
+        res.writeHead(200, streamHeaders());
+        res.flushHeaders?.();
+      } catch (error) {
+        terminate('client', clientWriteFailure(error));
+        return;
+      }
       downstreamStarted = true;
-      if (!stream) return;
-      res.writeHead(200, streamHeaders());
-      res.flushHeaders?.();
       encoder = createAnthropicEncoder({
         id: requestId,
         model: body.model,
         inputTokens: inputEstimate,
       });
       write(encoder.start());
+      if (writer?.failed || writer?.ended || cancelKind) return;
       pingTimer = setInterval(() => write(encoder.ping()), keepaliveMs);
       pingTimer.unref?.();
+    }
+
+    function closeWriter(error = null) {
+      if (!writer) return true;
+      if (writer.failed) {
+        writer.fail(error || writer.failed);
+        return false;
+      }
+      if (writer.ended) return true;
+      if (!writer.end()) {
+        writer.fail(error || clientWriteFailure());
+        return false;
+      }
+      return true;
     }
 
     function stopTimers() {
@@ -446,6 +519,14 @@ export function createAnthropicRuntime({
       });
     }
 
+    function pushStructured(deltas) {
+      try {
+        structured.push(deltas);
+      } catch (error) {
+        throw structuredRuntimeFailure(error);
+      }
+    }
+
     function feedContent(content) {
       const text = textDelta(content);
       if (!text) return;
@@ -454,10 +535,10 @@ export function createAnthropicRuntime({
       if (scanned.error) throwScannerError(scanned.error);
       if (scanned.calls.length) dsmlCalls.push(...scanned.calls);
       if (scanned.visibleText && stream) {
-        visibleText += scanned.visibleText;
+        appendRuntimeText(visibleText, scanned.visibleText);
         write(encoder.textDelta(scanned.visibleText));
       } else if (scanned.visibleText) {
-        visibleText += scanned.visibleText;
+        appendRuntimeText(visibleText, scanned.visibleText);
       }
     }
 
@@ -482,8 +563,8 @@ export function createAnthropicRuntime({
       if (choice) {
         const delta = choice.delta || {};
         const messageTools = choice.message?.tool_calls;
-        if (Array.isArray(messageTools)) structured.push(messageTools);
-        if (Array.isArray(delta.tool_calls)) structured.push(delta.tool_calls);
+        if (Array.isArray(messageTools)) pushStructured(messageTools);
+        if (Array.isArray(delta.tool_calls)) pushStructured(delta.tool_calls);
         if (delta.content !== undefined) feedContent(delta.content);
         if (choice.finish_reason) {
           finishReason = choice.finish_reason;
@@ -542,7 +623,12 @@ export function createAnthropicRuntime({
     }
 
     try {
-      structured = createStructuredToolAssembler();
+      structured = createStructuredToolAssembler({
+        maxBytes: structuredToolArgumentLimit(
+          config.dsmlMaxBufferBytes,
+          hardBytes || HARD_WRITE_BYTES,
+        ),
+      });
       scanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
       let credentials = readCredentials(account, { now: now() });
       if (!credentials?.ok) {
@@ -585,7 +671,7 @@ export function createAnthropicRuntime({
         processSseEvents(parser.feed(read.value));
       }
       if (cancelKind) {
-        ensureStarted();
+        ensureStarted({ allowCanceled: true });
         const persisted = await cancelPersistence.save({
           id: requestId,
           createdAt: startedAt,
@@ -594,30 +680,33 @@ export function createAnthropicRuntime({
             id: requestId,
             status: 'incomplete',
             incomplete_details: { reason: 'canceled' },
-            output: visibleText ? [{
+            output: visibleText.value() ? [{
               type: 'message',
               role: 'assistant',
-              content: [{ type: 'output_text', text: visibleText }],
+              content: [{ type: 'output_text', text: visibleText.value() }],
             }] : [],
           },
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         }, {
           cancelInfo: { reason: cancelKind, phase: 'generation' },
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         });
         cancelPersisted = true;
         cancelPersistenceResult = persisted;
         if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
         if (persisted.ok) {
-          writer?.writeComment('bridge-anthropic-canceled');
-          write(encoder.cancel({
-            outputTokens: conservativeTokenEstimate(visibleText),
-          }));
-        } else {
+          ensureStarted({ allowCanceled: true });
+          if (encoder && writer && !writer.failed) {
+            writer.writeComment('bridge-anthropic-canceled');
+            write(encoder.cancel({
+              outputTokens: conservativeTokenEstimate(visibleText.value()),
+            }));
+          }
+        } else if (!persisted.ok) {
           writer?.fail(persisted.error);
         }
         responseEnded = true;
-        if (res.writable && !res.destroyed && !res.writableEnded) res.end();
+        closeWriter(cancelKind === 'backpressure' ? controller.signal.reason : null);
         leaseResult = {
           ok: false,
           code: cancelKind === 'backpressure' ? 'BACKPRESSURE_OVERFLOW' : 'ABORTED',
@@ -645,7 +734,7 @@ export function createAnthropicRuntime({
       if (scannedEnd.calls.length) dsmlCalls.push(...scannedEnd.calls);
       if (scannedEnd.visibleText) {
         if (!downstreamStarted) ensureStarted();
-        visibleText += scannedEnd.visibleText;
+        appendRuntimeText(visibleText, scannedEnd.visibleText);
         if (stream) write(encoder.textDelta(scannedEnd.visibleText));
       }
       const structuredEnd = structured.finish();
@@ -682,7 +771,7 @@ export function createAnthropicRuntime({
 
       const outputTokens = usage.outputTokens
         || conservativeTokenEstimate({
-          text: visibleText,
+          text: visibleText.value(),
           tools: arbitration.calls.map((call) => call.input),
         });
       const stopReason = mapStopReason(finishReason, arbitration.calls.length > 0);
@@ -699,7 +788,9 @@ export function createAnthropicRuntime({
           output_tokens: Math.max(0, outputTokens),
         },
       };
-      if (visibleText) responseBody.content.push({ type: 'text', text: visibleText });
+      if (visibleText.value()) {
+        responseBody.content.push({ type: 'text', text: visibleText.value() });
+      }
       for (const call of arbitration.calls) {
         responseBody.content.push({
           type: 'tool_use',
@@ -714,13 +805,29 @@ export function createAnthropicRuntime({
           finishReason,
           outputTokens: Math.max(0, outputTokens),
         }));
-        if (!responseEnded) {
-          responseEnded = true;
-          res.end();
+        if (!cancelKind && !writer?.failed && writer?.ended) {
+          terminate('client', clientWriteFailure());
         }
+        if (cancelKind) {
+          throw controller.signal.reason instanceof RuntimeFailure
+            ? controller.signal.reason
+            : clientWriteFailure();
+        }
+        if (!writer?.end()) {
+          terminate('client', clientWriteFailure(writer?.failed));
+          throw controller.signal.reason instanceof RuntimeFailure
+            ? controller.signal.reason
+            : clientWriteFailure();
+        }
+        responseEnded = true;
       } else {
         sendJson(res, 200, responseBody);
         responseEnded = true;
+      }
+      if (cancelKind) {
+        throw controller.signal.reason instanceof RuntimeFailure
+          ? controller.signal.reason
+          : clientWriteFailure();
       }
 
       leaseResult = {
@@ -743,8 +850,8 @@ export function createAnthropicRuntime({
       };
     } catch (error) {
       if (cancelKind) {
-        const outputTokens = conservativeTokenEstimate(visibleText);
-        if (stream) ensureStarted();
+        const outputTokens = conservativeTokenEstimate(visibleText.value());
+        if (stream) ensureStarted({ allowCanceled: true });
         const persisted = await cancelPersistence.save({
           id: requestId,
           createdAt: startedAt,
@@ -753,32 +860,33 @@ export function createAnthropicRuntime({
             id: requestId,
             status: 'incomplete',
             incomplete_details: { reason: 'canceled' },
-            output: visibleText ? [{
+            output: visibleText.value() ? [{
               type: 'message',
               role: 'assistant',
-              content: [{ type: 'output_text', text: visibleText }],
+              content: [{ type: 'output_text', text: visibleText.value() }],
             }] : [],
           },
           usage: { input_tokens: inputEstimate, output_tokens: outputTokens },
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         }, {
           cancelInfo: { reason: cancelReason || cancelKind, phase: 'generation' },
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         });
         cancelPersisted = true;
         cancelPersistenceResult = persisted;
         if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
         if (stream && persisted.ok) {
-          writer?.writeComment('bridge-anthropic-canceled');
-          write(encoder?.cancel({ outputTokens }) || []);
-        } else if (stream) {
+          ensureStarted({ allowCanceled: true });
+          if (encoder && writer && !writer.failed) {
+            writer.writeComment('bridge-anthropic-canceled');
+            write(encoder.cancel({ outputTokens }));
+          }
+        } else if (stream && !persisted.ok) {
           writer?.fail(persisted.error);
         }
         if (!responseEnded) {
           responseEnded = true;
-          if (res.writable === true && !res.destroyed && !res.writableEnded) {
-            try { res.end(); } catch { /* The peer may close during durable persistence. */ }
-          }
+          closeWriter(cancelKind === 'backpressure' ? controller.signal.reason : null);
         }
         leaseResult = {
           ok: false,
@@ -798,7 +906,7 @@ export function createAnthropicRuntime({
       const failure = error instanceof RuntimeFailure
         ? error
         : new RuntimeFailure(error.message || 'internal error', {
-            code: 'INTERNAL_ERROR',
+            code: error?.code || 'INTERNAL_ERROR',
           });
       if (error instanceof ApiError) {
         failure.status = error.status;
@@ -816,7 +924,7 @@ export function createAnthropicRuntime({
         if (!responseEnded) {
           write(encoder.error({ type: failure.type || 'api_error', message: failure.message }));
           responseEnded = true;
-          res.end();
+          closeWriter(failure);
         }
         return { ok: false, started: true, error: failure };
       }
@@ -825,6 +933,7 @@ export function createAnthropicRuntime({
       stopTimers();
       req.off('aborted', onAborted);
       res.off('close', onClientDisconnect);
+      interruptSignal?.removeEventListener?.('abort', onInterrupt);
       if (reader && !readerDone) {
         try {
           await reader.cancel(controller.signal.reason || 'request finished');
@@ -834,7 +943,7 @@ export function createAnthropicRuntime({
       }
       await Promise.allSettled(pendingWrites);
       if (cancelKind && !cancelPersisted) {
-        const outputTokens = conservativeTokenEstimate(visibleText);
+        const outputTokens = conservativeTokenEstimate(visibleText.value());
         await cancelPersistence.save({
           id: requestId,
           createdAt: startedAt,
@@ -843,17 +952,17 @@ export function createAnthropicRuntime({
             id: requestId,
             status: 'incomplete',
             incomplete_details: { reason: 'canceled' },
-          output: visibleText ? [{
+          output: visibleText.value() ? [{
             type: 'message',
             role: 'assistant',
-            content: [{ type: 'output_text', text: visibleText }],
+            content: [{ type: 'output_text', text: visibleText.value() }],
           }] : [],
           },
           usage: { input_tokens: inputEstimate, output_tokens: outputTokens },
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         }, {
           cancelInfo: { reason: cancelReason || cancelKind, phase: 'generation' },
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         });
       }
       releaseLease(leaseResult);
@@ -1129,11 +1238,16 @@ export function createOpenAIRuntime({
     let upstreamCreated = null;
     let upstreamUsage = null;
     let sawDone = false;
-    let structured = createStructuredToolAssembler();
+    let structured = createStructuredToolAssembler({
+      maxBytes: structuredToolArgumentLimit(
+        config.dsmlMaxBufferBytes,
+        hardBytes || HARD_WRITE_BYTES,
+      ),
+    });
     let dsmlCalls = [];
-    let visibleText = '';
-    let reasoningText = '';
-    let refusalText = '';
+    const visibleText = createRuntimeTextCache({ hardBytes });
+    const reasoningText = createRuntimeTextCache({ hardBytes });
+    const refusalText = createRuntimeTextCache({ hardBytes });
     const scanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
     const writer = body.stream
       ? createHttpEventWriter(res, {
@@ -1141,6 +1255,9 @@ export function createOpenAIRuntime({
           softBytes,
           hardBytes,
           onOverflow: (error) => terminate('backpressure', error),
+          onWriteFailure: (error) => {
+            if (!responseEnded) terminate('client', clientWriteFailure(error));
+          },
         })
       : null;
     let encoder = null;
@@ -1224,18 +1341,42 @@ export function createOpenAIRuntime({
       return writer.writeEvents(events);
     }
 
-    function ensureStreamStarted() {
-      if (!body.stream || encoder) return;
-      res.writeHead(200, streamHeaders());
-      res.flushHeaders?.();
+    function ensureStreamStarted({ allowCanceled = false } = {}) {
+      if (!body.stream || encoder || responseEnded || (cancelKind && !allowCanceled)) return;
+      if (!canWriteHttp(res)) {
+        terminate('client', clientWriteFailure());
+        return;
+      }
+      try {
+        res.writeHead(200, streamHeaders());
+        res.flushHeaders?.();
+      } catch (error) {
+        terminate('client', clientWriteFailure(error));
+        return;
+      }
       encoder = createChatEncoder({
         id: upstreamId || undefined,
         model: body.model,
         created: upstreamCreated || Math.floor(now() / 1000),
       });
       emit(encoder.start());
+      if (writer?.failed || writer?.ended || cancelKind) return;
       pingTimer = setInterval(() => emit(encoder.ping()), keepaliveMs);
       pingTimer.unref?.();
+    }
+
+    function closeWriter(error = null) {
+      if (!writer) return true;
+      if (writer.failed) {
+        writer.fail(error || writer.failed);
+        return false;
+      }
+      if (writer.ended) return true;
+      if (!writer.end()) {
+        writer.fail(error || clientWriteFailure());
+        return false;
+      }
+      return true;
     }
 
     function resetIdle() {
@@ -1274,13 +1415,24 @@ export function createOpenAIRuntime({
       });
     }
 
+    function pushStructured(deltas) {
+      try {
+        structured.push(deltas);
+      } catch (error) {
+        throw structuredRuntimeFailure(error);
+      }
+    }
+
     function feedContent(content) {
       const text = textDelta(content);
-      if (!text) return;
+      if (!text) return '';
       const scanned = scanner.push(text);
       if (scanned.error) scannerError(scanned.error);
       dsmlCalls.push(...scanned.calls);
-      visibleText += scanned.visibleText;
+      if (scanned.visibleText) {
+        appendRuntimeText(visibleText, scanned.visibleText);
+      }
+      return scanned.visibleText;
     }
 
     function processDocument(document) {
@@ -1307,19 +1459,23 @@ export function createOpenAIRuntime({
       finishReason = choice.finish_reason || finishReason;
       const payload = choice.delta || choice.message || {};
       if (typeof payload.reasoning_content === 'string') {
-        reasoningText += payload.reasoning_content;
+        appendRuntimeText(reasoningText, payload.reasoning_content);
         if (body.stream) {
           ensureStreamStarted();
+          if (!encoder || cancelKind) return;
           emit(encoder.reasoningDelta(payload.reasoning_content));
         }
       }
-      if (typeof payload.refusal === 'string') refusalText += payload.refusal;
-      if (Array.isArray(payload.tool_calls)) structured.push(payload.tool_calls);
+      if (typeof payload.refusal === 'string') {
+        appendRuntimeText(refusalText, payload.refusal);
+      }
+      if (Array.isArray(payload.tool_calls)) pushStructured(payload.tool_calls);
       if (
         body.stream
         && Array.isArray(choice.message?.tool_calls)
       ) {
         ensureStreamStarted();
+        if (!encoder || cancelKind) return;
         emit(encoder.toolDelta(choice.message.tool_calls.map((call, index) => ({
           id: call.id,
           name: call.function?.name,
@@ -1328,11 +1484,11 @@ export function createOpenAIRuntime({
         }))));
       }
       if (payload.content !== undefined) {
-        const before = visibleText.length;
         ensureStreamStarted();
-        feedContent(payload.content);
-        if (body.stream && visibleText.length > before) {
-          emit(encoder.textDelta(visibleText.slice(before)));
+        if (body.stream && (!encoder || cancelKind)) return;
+        const emittedText = feedContent(payload.content);
+        if (body.stream && emittedText) {
+          emit(encoder.textDelta(emittedText));
         }
       }
     }
@@ -1454,9 +1610,9 @@ export function createOpenAIRuntime({
       const scannedEnd = scanner.finish();
       if (scannedEnd.error) scannerError(scannedEnd.error);
       dsmlCalls.push(...scannedEnd.calls);
-      visibleText += scannedEnd.visibleText;
+      appendRuntimeText(visibleText, scannedEnd.visibleText);
       if (cancelKind) {
-        const outputTokens = conservativeTokenEstimate(visibleText);
+        const outputTokens = conservativeTokenEstimate(visibleText.value());
         const usage = openAIUsage(upstreamUsage, inputEstimate, outputTokens);
         const persisted = await cancelPersistence.save({
           id: chatResponseId,
@@ -1466,37 +1622,36 @@ export function createOpenAIRuntime({
             id: chatResponseId,
             status: 'incomplete',
             incomplete_details: { reason: 'canceled' },
-            output: visibleText ? [{
+            output: visibleText.value() ? [{
               type: 'message',
               role: 'assistant',
-              content: [{ type: 'output_text', text: visibleText }],
+              content: [{ type: 'output_text', text: visibleText.value() }],
             }] : [],
           },
           usage,
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         }, {
           cancelInfo: { reason: cancelReason || cancelKind, phase: 'generation' },
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         });
         cancelPersisted = true;
         cancelPersistenceResult = persisted;
         if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
         if (body.stream && persisted.ok) {
-          ensureStreamStarted();
-          writer?.writeComment('bridge-chat-canceled');
-          emit(encoder.finalize({ finishReason, canceled: true }));
-          if (cancelKind === 'backpressure') {
-            writer.fail(controller.signal.reason);
+          ensureStreamStarted({ allowCanceled: true });
+          if (encoder && !writer.failed) {
+            writer?.writeComment('bridge-chat-canceled');
+            emit(encoder.finalize({ finishReason, canceled: true }));
           }
-          if (!responseEnded && cancelKind !== 'backpressure') {
+          if (!responseEnded) {
             responseEnded = true;
-            writer.end();
+            closeWriter(controller.signal.reason);
           }
-        } else if (body.stream) {
+        } else if (body.stream && !persisted.ok) {
           writer?.fail(persisted.error);
           if (!responseEnded) {
             responseEnded = true;
-            writer?.end();
+            closeWriter(persisted.error);
           }
         }
         leaseResult = {
@@ -1553,16 +1708,16 @@ export function createOpenAIRuntime({
         upstreamUsage,
         inputEstimate,
         conservativeTokenEstimate({
-          text: visibleText,
+          text: visibleText.value(),
           tools: arbitration.calls.map((call) => call.input),
         }),
       );
       const responseBody = toOpenAIResponse({
         id: upstreamId,
         created: upstreamCreated,
-        content: visibleText,
-        reasoning: reasoningText,
-        refusal: refusalText,
+        content: visibleText.value(),
+        reasoning: reasoningText.value(),
+        refusal: refusalText.value(),
         toolCalls: new Map(arbitration.calls.map((call, index) => [
           index,
           {
@@ -1576,15 +1731,31 @@ export function createOpenAIRuntime({
       }, body.model, { now });
       if (body.stream) {
         ensureStreamStarted();
+        if (!encoder || cancelKind) {
+          throw controller.signal.reason instanceof RuntimeFailure
+            ? controller.signal.reason
+            : clientWriteFailure();
+        }
         emit(encoder.finalize({
           calls: arbitration.calls,
           finishReason,
           usage,
         }));
-        if (!responseEnded) {
-          responseEnded = true;
-          writer.end();
+        if (!cancelKind && !writer?.failed && writer?.ended) {
+          terminate('client', clientWriteFailure());
         }
+        if (cancelKind) {
+          throw controller.signal.reason instanceof RuntimeFailure
+            ? controller.signal.reason
+            : clientWriteFailure();
+        }
+        if (!writer.end()) {
+          terminate('client', clientWriteFailure(writer?.failed));
+          throw controller.signal.reason instanceof RuntimeFailure
+            ? controller.signal.reason
+            : clientWriteFailure();
+        }
+        responseEnded = true;
       } else {
         sendJson(res, 200, responseBody);
       }
@@ -1613,7 +1784,7 @@ export function createOpenAIRuntime({
       const failure = error instanceof RuntimeFailure
         ? error
         : new RuntimeFailure(error.message || 'internal error', {
-            code: 'INTERNAL_ERROR',
+            code: error?.code || 'INTERNAL_ERROR',
           });
       if (error instanceof ApiError) {
         failure.status = error.status;
@@ -1645,7 +1816,7 @@ export function createOpenAIRuntime({
       if (body.stream && res.headersSent && !responseEnded && failure.code !== 'ABORTED') {
         emit(encoder?.error(failure));
         responseEnded = true;
-        writer?.end();
+        closeWriter(failure);
         return { ok: false, started: true, error: failure };
       }
       return { ok: false, started: false, error: failure };
@@ -1663,10 +1834,10 @@ export function createOpenAIRuntime({
       }
       await Promise.allSettled(pendingWrites);
       if (cancelKind && !cancelPersisted) {
-        const output = visibleText ? [{
+        const output = visibleText.value() ? [{
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'output_text', text: visibleText }],
+          content: [{ type: 'output_text', text: visibleText.value() }],
         }] : [];
         const persisted = await cancelPersistence.save({
           id: chatResponseId,
@@ -1678,23 +1849,25 @@ export function createOpenAIRuntime({
             incomplete_details: { reason: 'canceled' },
             output,
           },
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         }, {
           cancelInfo: { reason: cancelReason || cancelKind, phase: 'generation' },
-          partial: { content: visibleText },
+          partial: { content: visibleText.value() },
         });
         cancelPersisted = true;
         cancelPersistenceResult = persisted;
         if (body.stream && !responseEnded) {
           if (persisted.ok) {
-            ensureStreamStarted();
-            writer?.writeComment('bridge-chat-canceled');
-            emit(encoder.finalize({ finishReason, canceled: true }));
-          } else {
+            ensureStreamStarted({ allowCanceled: true });
+            if (encoder && !writer.failed) {
+              writer?.writeComment('bridge-chat-canceled');
+              emit(encoder.finalize({ finishReason, canceled: true }));
+            }
+          } else if (!persisted.ok) {
             writer?.fail(persisted.error);
           }
           responseEnded = true;
-          writer?.end();
+          closeWriter(cancelKind === 'backpressure' ? controller.signal.reason : null);
         }
       }
       if (cancelPersistenceResult?.deadLetterWritten) {

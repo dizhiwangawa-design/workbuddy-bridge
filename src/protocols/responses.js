@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { ApiError } from '../api-errors.js';
-import { UPSTREAM_LENGTH_LIMIT } from '../stream-control.js';
+import {
+  UPSTREAM_LENGTH_LIMIT,
+  MAX_RETAINED_TEXT_BYTES,
+  createTextCache,
+} from '../stream-control.js';
 import { outputFromPartial } from '../responses-store.js';
 
 const SUPPORTED_TOOL_TYPES = new Set([
@@ -647,20 +651,27 @@ export function resumedPrior(record) {
 }
 
 export function historyForResponse(record) {
-  return (record?.body?.output || []).map((item) => {
+  const storedInput = Array.isArray(record?.body?._bridgeInput)
+    ? record.body._bridgeInput
+    : [];
+  return [...storedInput, ...(record?.body?.output || []).map((item) => {
     if (item.type === 'reasoning') return emptyCompletedReasoning();
     return item;
-  });
+  })];
 }
 
 /** Live stdout lifecycle for Responses SSE. Final output is emitted only at
  * completion so a partial tool argument can never become executable. */
-export function createResponsesStreamEncoder({ response }) {
+export function createResponsesStreamEncoder({
+  response,
+  maxBytes = MAX_RETAINED_TEXT_BYTES,
+  retain = 'tail',
+}) {
   let sequence = 2;
   let reasoningItem = null;
   let messageItem = null;
-  let reasoningText = '';
-  let outputText = '';
+  const reasoningText = createTextCache({ maxBytes, retain });
+  const outputText = createTextCache({ maxBytes, retain });
   let outputIndex = Array.isArray(response.output) ? response.output.length : 0;
   const output = [];
   const event = (type, data) => ({
@@ -670,7 +681,7 @@ export function createResponsesStreamEncoder({ response }) {
 
   function reasoningDelta(delta) {
     if (!delta) return [];
-    reasoningText += delta;
+    reasoningText.append(delta);
     if (!reasoningItem) {
       reasoningItem = reasoningItemFor(response.id);
       output.push(reasoningItem);
@@ -703,7 +714,7 @@ export function createResponsesStreamEncoder({ response }) {
 
   function textDelta(delta) {
     if (!delta) return [];
-    outputText += delta;
+    outputText.append(delta);
     if (!messageItem) {
       messageItem = responseMessage('', 'in_progress');
       output.push(messageItem);
@@ -740,8 +751,8 @@ export function createResponsesStreamEncoder({ response }) {
     textDelta,
     snapshot() {
       return {
-        reasoning: reasoningText,
-        content: outputText,
+        reasoning: reasoningText.value(),
+        content: outputText.value(),
         output: output.map((item) => ({ ...item })),
       };
     },

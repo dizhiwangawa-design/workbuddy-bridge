@@ -2823,7 +2823,7 @@ Expected:
 - 取消、401、429、首帧前后失败边界通过。
 - API 默认关闭和 Key 鉴权通过。
 
-- [ ] **Step 4: 真实账号冒烟（未执行：未获用户额度授权）**
+- [ ] **Step 4: 真实账号冒烟（部分通过；`awa` 被上游 429 阻断）**
 
 只有用户明确批准消耗账号额度后执行：
 
@@ -2847,6 +2847,21 @@ Expected:
 - README 的能力声明与实际实现一致。
 - 关闭功能后所有 `/v1/*` 明确不可用。
 - 真实服务和测试日志中没有凭据泄漏。
+
+**2026-11-07 执行记录:**
+
+- `npm run test:live`：Anthropic 非流式通过；`default` 返回可见文本。
+- `npm run test:live:openai`：OpenAI Chat 非流式通过。
+- `node test/live/openai-live.mjs --thinking`：思考提示通过。
+- `node test/live/openai-live.mjs --tools`：真实 `tool_calls` + `tool` 续传通过。
+- `npm run test:live:responses`：`default` 的 Responses HTTP、SSE、原生 WS、
+  `previous_response_id` 续接通过；使用临时响应库，未污染现有记录。
+- 额外真实冒烟：Chat SSE、Anthropic SSE、Anthropic `tool_use/tool_result`
+  和 Responses `max_output_tokens=1` 截断均通过。
+- `awa` 单独重试仍返回上游 `429 RATE_LIMITED`，因此“每个已登录账号至少成功一次”
+  未满足；已恢复临时改动的号池开关和 API 设置。`codex-fresh-mvxgctfk` 也曾返回
+  同一上游 429。该阻塞属于外部额度/限流，不是本地协议错误。
+- 未读取、打印或提交 access token、refresh token 或完整客户端 Key。
 
 ---
 

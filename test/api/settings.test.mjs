@@ -56,6 +56,24 @@ test('API 兼容默认开启 Anthropic，并保留 OpenAI 关闭', async () => {
   });
 });
 
+test('仅将已确认缺失的旧默认模型迁移到 deepseek-v4.1-flash', () => {
+  const original = paths.loadConfig();
+  const oldDefault = {
+    ...original,
+    apiCompat: { ...original.apiCompat, defaultModel: 'deepseek-v4-flash' },
+  };
+  paths.saveConfig(oldDefault);
+  assert.equal(paths.loadConfig().apiCompat.defaultModel, 'deepseek-v4.1-flash');
+
+  const custom = {
+    ...original,
+    apiCompat: { ...original.apiCompat, defaultModel: 'my-custom-model' },
+  };
+  paths.saveConfig(custom);
+  assert.equal(paths.loadConfig().apiCompat.defaultModel, 'my-custom-model');
+  paths.saveConfig(original);
+});
+
 test('回环免 Key；非回环或可信代理强制 Key', () => {
   const config = {
     requireApiKey: false,

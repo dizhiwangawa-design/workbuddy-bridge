@@ -3,11 +3,30 @@ export function encodeSseEvent(event, data) {
   return `event: ${event}\ndata: ${payload}\n\n`;
 }
 
-export function createSseParser() {
+export function createSseParser({ maxBufferBytes = 2 * 1024 * 1024 } = {}) {
+  const limit = Number(maxBufferBytes);
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error('maxBufferBytes must be a positive integer');
+  }
   const decoder = new TextDecoder('utf-8');
   let textBuffer = '';
+  let textBytes = 0;
   let eventName = '';
   let dataLines = [];
+  let dataBytes = 0;
+
+  function limitError() {
+    return Object.assign(
+      new Error(`SSE event exceeded ${limit} bytes`),
+      { code: 'SSE_BUFFER_LIMIT' },
+    );
+  }
+
+  function enforceLimit() {
+    if (textBytes > limit || dataBytes > limit) {
+      throw limitError();
+    }
+  }
 
   function dispatch(events) {
     if (dataLines.length) {
@@ -35,6 +54,7 @@ export function createSseParser() {
     }
     eventName = '';
     dataLines = [];
+    dataBytes = 0;
   }
 
   function consumeLines(events, final = false) {
@@ -46,6 +66,10 @@ export function createSseParser() {
       const separatorLength = textBuffer.startsWith('\r\n', newline) ? 2 : 1;
       let line = textBuffer.slice(0, newline);
       textBuffer = textBuffer.slice(newline + separatorLength);
+      textBytes = Math.max(
+        0,
+        textBytes - Buffer.byteLength(line, 'utf8') - separatorLength,
+      );
       if (line.endsWith('\r')) line = line.slice(0, -1);
       if (line === '') {
         dispatch(events);
@@ -55,9 +79,17 @@ export function createSseParser() {
         let value = colon < 0 ? '' : line.slice(colon + 1);
         if (value.startsWith(' ')) value = value.slice(1);
         if (field === 'event') eventName = value;
-        else if (field === 'data') dataLines.push(value);
+        else if (field === 'data') {
+          dataLines.push(value);
+          dataBytes += Buffer.byteLength(value, 'utf8') + 1;
+          if (dataBytes > limit) throw limitError();
+        }
       }
     }
+    // A single feed may contain many complete events. Do not reject the
+    // chunk merely because its transient aggregate exceeds the per-event
+    // budget; only retained partial data must stay bounded.
+    enforceLimit();
     if (final) {
       if (textBuffer.endsWith('\r')) textBuffer = textBuffer.slice(0, -1);
       if (textBuffer) {
@@ -66,9 +98,14 @@ export function createSseParser() {
         let value = colon < 0 ? '' : textBuffer.slice(colon + 1);
         if (value.startsWith(' ')) value = value.slice(1);
         if (field === 'event') eventName = value;
-        else if (field === 'data') dataLines.push(value);
+        else if (field === 'data') {
+          dataLines.push(value);
+          dataBytes += Buffer.byteLength(value, 'utf8') + 1;
+        }
         textBuffer = '';
+        textBytes = 0;
       }
+      enforceLimit();
       dispatch(events);
     }
   }
@@ -76,9 +113,11 @@ export function createSseParser() {
   const parser = {
     feed(chunk) {
       const events = [];
-      textBuffer += typeof chunk === 'string'
+      const added = typeof chunk === 'string'
         ? chunk
         : decoder.decode(chunk, { stream: true });
+      textBytes += Buffer.byteLength(added, 'utf8');
+      textBuffer += added;
       consumeLines(events);
       Object.defineProperty(events, 'finished', {
         configurable: true,
@@ -90,7 +129,9 @@ export function createSseParser() {
 
     finished() {
       const events = [];
-      textBuffer += decoder.decode();
+      const tail = decoder.decode();
+      textBytes += Buffer.byteLength(tail, 'utf8');
+      textBuffer += tail;
       consumeLines(events, true);
       return events;
     },

@@ -897,6 +897,229 @@ test('Anthropic 取消顺序为停止上游、释放租约、持久化、合法�
   assert.equal(writes.join('').match(/^: bridge-anthropic-canceled$/gm)?.length, 1);
 });
 
+test('Anthropic 下游 SSE 写失败按网络断连持久化并释放租约', async () => {
+  const saved = [];
+  const store = {
+    async save(entry, options) {
+      saved.push({ entry, options });
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(
+            'data: {"id":"anthropic-write-error","choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+          ));
+          controller.enqueue(encoder.encode(
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            + 'data: [DONE]\n\n',
+          ));
+          controller.close();
+        },
+      }),
+    }),
+  };
+  const { createAnthropicRuntime } = await import('../../src/api-runtime.js');
+  const runtime = createAnthropicRuntime({ upstreamClient, cancelPersistence: store });
+  createAccount('api-a');
+  let writes = 0;
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(_chunk, callback) {
+      writes += 1;
+      if (writes >= 3) {
+        throw Object.assign(new Error('write after end'), {
+          code: 'ERR_STREAM_WRITE_AFTER_END',
+        });
+      }
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.messages({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 32,
+      stream: true,
+      messages: [{ role: 'user', content: 'write fails' }],
+    },
+    config: settings.getApiSettings(),
+  });
+  assert.equal(result.canceled, true);
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].entry.status, 'incomplete');
+  assert.match(JSON.stringify(saved[0].entry.body), /visible partial/);
+  assert.equal(inflight('api-a'), 0);
+});
+
+test('Anthropic 结构化工具参数超限失败关闭且不输出 tool_use', async () => {
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode(
+            'data: {"choices":[{"delta":{"content":"started"}}]}\n\n',
+          ));
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            choices: [{
+              delta: {
+                tool_calls: [{
+                  index: 0,
+                  id: 'call_large',
+                  function: {
+                    name: 'write_file',
+                    arguments: JSON.stringify({ input: 'x'.repeat(128) }),
+                  },
+                }],
+              },
+            }],
+          })}\n\n`));
+          controller.close();
+        },
+      }),
+    }),
+  };
+  const { createAnthropicRuntime } = await import('../../src/api-runtime.js');
+  const runtime = createAnthropicRuntime({ upstreamClient });
+  createAccount('api-a');
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.messages({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      stream: true,
+      messages: [{ role: 'user', content: 'large tool arg' }],
+      tools: [{
+        name: 'write_file',
+        input_schema: { type: 'object', properties: { input: { type: 'string' } } },
+      }],
+    },
+    config: {
+      ...settings.getApiSettings(),
+      dsmlMaxBufferBytes: 32,
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'TOOL_ARGUMENT_LIMIT');
+  const { events } = await parseResponse({
+    text: async () => writes.join(''),
+  });
+  assert.equal(events.some((event) => (
+    event.data?.content_block?.type === 'tool_use'
+  )), false);
+  assert.match(writes.join(''), /structured tool arguments exceeded/);
+  assert.equal(inflight('api-a'), 0);
+});
+
+test('Anthropic 背压取消持久化后销毁挂起连接', async () => {
+  const saved = [];
+  const store = {
+    async save(entry, options) {
+      saved.push({ entry, options });
+      return { ok: true, deadLetterWritten: false };
+    },
+  };
+  const upstreamClient = {
+    chat: async () => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"choices":[{"delta":{"content":"started"}}]}\n\n',
+          ));
+        },
+      }),
+    }),
+  };
+  const { createAnthropicRuntime } = await import('../../src/api-runtime.js');
+  const runtime = createAnthropicRuntime({
+    upstreamClient,
+    cancelPersistence: store,
+    softBytes: 32,
+    hardBytes: 64,
+  });
+  createAccount('api-a');
+  let destroyError = null;
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 128,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    flushHeaders() {},
+    write() {
+      throw new Error('overflowed stream must not enqueue another chunk');
+    },
+    end() { this.writableEnded = true; },
+    destroy(error) {
+      this.destroyed = true;
+      this.writable = false;
+      destroyError = error;
+    },
+    on() {},
+    off() {},
+  };
+  const result = await runtime.messages({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      stream: true,
+      messages: [{ role: 'user', content: 'force backpressure' }],
+    },
+    config: settings.getApiSettings(),
+  });
+  assert.equal(result.canceled, true);
+  assert.equal(result.kind, 'backpressure');
+  assert.equal(res.destroyed, true);
+  assert.equal(destroyError?.code, 'BACKPRESSURE_OVERFLOW');
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].entry.status, 'incomplete');
+  assert.equal(inflight('api-a'), 0);
+});
+
 test('Anthropic 取消片段持久化失败时不发送成功收尾', async () => {
   const store = {
     async save() {

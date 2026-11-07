@@ -121,6 +121,11 @@ export function loadConfig() {
   if (Object.hasOwn(savedApi, 'anthropic') && !Object.hasOwn(savedApi, 'anthropicEnabled')) {
     apiCompat.anthropicEnabled = savedApi.anthropic;
   }
+  // The old built-in default is known to be unavailable. Migrate only that
+  // exact value; a user-selected model must never be overwritten.
+  if (apiCompat.defaultModel === 'deepseek-v4-flash') {
+    apiCompat.defaultModel = 'deepseek-v4.1-flash';
+  }
   return {
     ...base,
     ...saved,

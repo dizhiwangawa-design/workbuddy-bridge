@@ -4,6 +4,7 @@ import { warn } from './log.js';
 export const PRODUCTION_KEEPALIVE_MS = Object.freeze(15000);
 export const SOFT_WRITE_BYTES = 256 * 1024;
 export const HARD_WRITE_BYTES = 1024 * 1024;
+export const MAX_RETAINED_TEXT_BYTES = 256 * 1024;
 export const UPSTREAM_LENGTH_LIMIT = 'upstream_length_limit';
 
 const WRITE_ERROR_CODES = new Set([
@@ -26,6 +27,140 @@ export function canWriteHttp(res) {
   );
 }
 
+/** Keep a bounded trailing window without starting with a broken UTF-8 code point. */
+export function utf8Tail(value, maxBytes = MAX_RETAINED_TEXT_BYTES) {
+  const text = String(value ?? '');
+  const limit = Number(maxBytes);
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error('maxBytes must be a positive integer');
+  }
+  const encoded = Buffer.from(text, 'utf8');
+  if (encoded.length <= limit) return text;
+  let start = encoded.length - limit;
+  while (start < encoded.length && (encoded[start] & 0xc0) === 0x80) start += 1;
+  return encoded.subarray(start).toString('utf8');
+}
+
+/** Keep a bounded leading window without splitting a UTF-8 code point. */
+export function utf8Prefix(value, maxBytes = MAX_RETAINED_TEXT_BYTES) {
+  const text = String(value ?? '');
+  const limit = Number(maxBytes);
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error('maxBytes must be a positive integer');
+  }
+  const encoded = Buffer.from(text, 'utf8');
+  if (encoded.length <= limit) return text;
+  let end = 0;
+  while (end < encoded.length) {
+    const first = encoded[end];
+    const width = first < 0x80
+      ? 1
+      : first < 0xe0
+        ? 2
+        : first < 0xf0
+          ? 3
+          : 4;
+    if (end + width > limit) break;
+    end += width;
+  }
+  return encoded.subarray(0, end).toString('utf8');
+}
+
+export function appendTextWithinLimit(current, delta, {
+  maxBytes = MAX_RETAINED_TEXT_BYTES,
+  retain = 'tail',
+} = {}) {
+  const limit = Number(maxBytes);
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error('maxBytes must be a positive integer');
+  }
+  const next = `${current || ''}${delta || ''}`;
+  if (Buffer.byteLength(next, 'utf8') <= limit) return next;
+  if (retain === 'tail') return utf8Tail(next, limit);
+  if (retain === 'error') {
+    throw Object.assign(new Error(`output exceeded ${limit} bytes`), {
+      code: 'OUTPUT_TOO_LARGE',
+    });
+  }
+  throw new Error(`unsupported retain mode: ${retain}`);
+}
+
+/** Incremental output cache. Tail mode keeps memory bounded without copying
+ * the retained window on every token; error mode fails closed on overflow. */
+export function createTextCache({
+  maxBytes = MAX_RETAINED_TEXT_BYTES,
+  retain = 'tail',
+} = {}) {
+  const limit = Number(maxBytes);
+  if (!Number.isSafeInteger(limit) || limit <= 0) {
+    throw new Error('maxBytes must be a positive integer');
+  }
+  if (retain !== 'tail' && retain !== 'error') {
+    throw new Error(`unsupported retain mode: ${retain}`);
+  }
+  let chunks = [];
+  let head = 0;
+  let bytes = 0;
+  let cached = null;
+
+  function compact() {
+    if (head > 1024 && head * 2 > chunks.length) {
+      chunks = chunks.slice(head);
+      head = 0;
+    }
+  }
+
+  function trimTail() {
+    while (head < chunks.length && bytes - chunks[head].bytes >= limit) {
+      bytes -= chunks[head].bytes;
+      head += 1;
+    }
+    if (bytes > limit) {
+      const first = chunks[head];
+      const keep = Math.max(0, limit - (bytes - first.bytes));
+      const text = utf8Tail(first.text, Math.max(1, keep));
+      chunks[head] = { text, bytes: Buffer.byteLength(text, 'utf8') };
+      bytes = chunks.slice(head).reduce((total, item) => total + item.bytes, 0);
+    }
+    compact();
+  }
+
+  function append(delta) {
+    const text = String(delta ?? '');
+    if (!text) return;
+    const length = Buffer.byteLength(text, 'utf8');
+    if (retain === 'error' && bytes + length > limit) {
+      throw Object.assign(new Error(`output exceeded ${limit} bytes`), {
+        code: 'OUTPUT_TOO_LARGE',
+      });
+    }
+    chunks.push({ text, bytes: length });
+    bytes += length;
+    cached = null;
+    if (retain === 'tail') trimTail();
+  }
+
+  return {
+    append,
+    set(value) {
+      chunks = [];
+      head = 0;
+      bytes = 0;
+      cached = null;
+      append(value);
+    },
+    value() {
+      if (cached === null) {
+        cached = chunks.slice(head).map((item) => item.text).join('');
+      }
+      return cached;
+    },
+    get bytes() {
+      return bytes;
+    },
+  };
+}
+
 export function protocolIncompleteReason(finishReason, requestedLimit, atLimit = false) {
   if (finishReason !== 'length') return null;
   return requestedLimit && atLimit ? 'max_output_tokens' : UPSTREAM_LENGTH_LIMIT;
@@ -36,6 +171,7 @@ export function createHttpEventWriter(res, {
   softBytes = SOFT_WRITE_BYTES,
   hardBytes = HARD_WRITE_BYTES,
   onOverflow = null,
+  onWriteFailure = null,
   canWrite = () => canWriteHttp(res),
 } = {}) {
   let ended = false;
@@ -48,12 +184,35 @@ export function createHttpEventWriter(res, {
   let backpressureSeen = false;
   let overflowReported = false;
   let timer = null;
+  let writeFailureNotified = false;
 
-  function onStreamError(error) {
-    if (!isWriteError(error)) warn(`${protocol} stream write failed: ${error.message}`);
+  function notifyWriteFailure(error) {
+    if (writeFailureNotified || !error) return;
+    writeFailureNotified = true;
+    try {
+      onWriteFailure?.(error);
+    } catch (cause) {
+      warn(`${protocol} write failure callback failed: ${cause.message}`);
+    }
+  }
+
+  function markFailure(error) {
+    if (!error) return;
     failed ||= error;
     ended = true;
     stopTimer();
+    notifyWriteFailure(failed);
+  }
+
+  function clientDisconnectedError() {
+    return Object.assign(new Error('client response is no longer writable'), {
+      code: 'CLIENT_DISCONNECTED',
+    });
+  }
+
+  function onStreamError(error) {
+    if (!isWriteError(error)) warn(`${protocol} stream write failed: ${error.message}`);
+    markFailure(error);
   }
 
   res.on?.('error', onStreamError);
@@ -95,7 +254,7 @@ export function createHttpEventWriter(res, {
   function writeRaw(raw) {
     if (ended || failed) return false;
     if (!canWrite()) {
-      ended = true;
+      markFailure(clientDisconnectedError());
       return false;
     }
     const length = Buffer.byteLength(raw);
@@ -113,7 +272,8 @@ export function createHttpEventWriter(res, {
     pendingBytes += length;
     if (!oldestPendingAt) oldestPendingAt = Date.now();
     try {
-      const accepted = res.write(raw, () => {
+      const accepted = res.write(raw, (error) => {
+        if (error) markFailure(error);
         pendingBytes = Math.max(0, pendingBytes - length);
         if (!pendingBytes) {
           oldestPendingAt = 0;
@@ -139,9 +299,7 @@ export function createHttpEventWriter(res, {
       pendingBytes = Math.max(0, pendingBytes - length);
       if (!pendingBytes) oldestPendingAt = 0;
       if (!isWriteError(error)) warn(`${protocol} stream write failed: ${error.message}`);
-      failed ||= error;
-      stopTimer();
-      ended = true;
+      markFailure(error);
       return false;
     }
   }
@@ -223,7 +381,7 @@ export function createHttpEventWriter(res, {
       res.end();
       return !failed;
     } catch (error) {
-      failed ||= error;
+      markFailure(error);
       return false;
     }
   }

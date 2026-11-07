@@ -1,19 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
 import { Writable } from 'node:stream';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
+  MAX_RETAINED_TEXT_BYTES,
   PRODUCTION_KEEPALIVE_MS,
+  appendTextWithinLimit,
   canWriteHttp,
   createHttpEventWriter,
 } from '../../src/stream-control.js';
 import { createChatEncoder } from '../../src/protocols/openai.js';
 import { createAnthropicEncoder } from '../../src/protocols/anthropic.js';
-import { createDeadLetter, createResponsesStore } from '../../src/responses-store.js';
+import {
+  compactResponseForStore,
+  createDeadLetter,
+  createResponsesStore,
+} from '../../src/responses-store.js';
 import {
   WS_PING_MS,
   WS_PONG_GRACE_MS,
@@ -62,6 +69,20 @@ test('写入竞态中的 WRITE_AFTER_END 被吸收且不泄漏原始异常', () 
   assert.equal(writer.writeData('{}'), false);
 });
 
+test('writer 把同步写失败通知给取消出口，且同一失败只通知一次', async () => {
+  const failures = [];
+  const res = fakeResponse({ fail: true });
+  const writer = createHttpEventWriter(res, {
+    onWriteFailure: (error) => failures.push(error),
+  });
+  assert.equal(writer.writeData('{}'), false);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].code, 'ERR_STREAM_WRITE_AFTER_END');
+  res.emit('error', Object.assign(new Error('late reset'), { code: 'ECONNRESET' }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(failures.length, 1);
+});
+
 test('异步 EPIPE 与 ECONNRESET 被 writer 吸收且不产生未处理异常', async () => {
   const unhandled = [];
   const capture = (error) => unhandled.push(error);
@@ -89,6 +110,26 @@ test('异步 EPIPE 与 ECONNRESET 被 writer 吸收且不产生未处理异常',
     process.off('unhandledRejection', capture);
   }
   assert.deepEqual(unhandled, []);
+});
+
+test('writer 捕获写回调错误并只通知一次取消出口', async () => {
+  const res = fakeResponse();
+  const failures = [];
+  res.write = function write(_value, callback) {
+    setImmediate(() => callback(Object.assign(new Error('peer reset'), {
+      code: 'ECONNRESET',
+    })));
+    return true;
+  };
+  const writer = createHttpEventWriter(res, {
+    onWriteFailure: (error) => failures.push(error),
+  });
+  assert.equal(writer.writeData('{}'), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(writer.failed.code, 'ECONNRESET');
+  assert.equal(failures.length, 1);
+  assert.equal(writer.writeData('{}'), false);
 });
 
 test('writer.fail 销毁已提交响应的 SSE 连接，避免持久化失败后挂起', () => {
@@ -127,6 +168,43 @@ test('流写入超过硬阈值触发背压并且不无限缓存在 writer 中', 
   assert.equal(writer.writeData('x'.repeat(100)), false);
   assert.equal(overflow.code, 'BACKPRESSURE_OVERFLOW');
   assert.equal(overflow.code, 'BACKPRESSURE_OVERFLOW');
+});
+
+test('流式输出缓存只保留有界 UTF-8 尾部且不切断多字节字符', () => {
+  let retained = '';
+  for (let index = 0; index < 600; index += 1) {
+    retained = appendTextWithinLimit(retained, `${index}:可见😀\n`, {
+      maxBytes: 4096,
+      retain: 'tail',
+    });
+  }
+  assert.ok(Buffer.byteLength(retained, 'utf8') <= 4096);
+  assert.match(retained, /599:可见😀\n$/);
+  assert.equal(retained.includes('\uFFFD'), false);
+  assert.equal(MAX_RETAINED_TEXT_BYTES, 256 * 1024);
+});
+
+test('持久化文本截断保持完整 UTF-8 字符且不产生替换字符', () => {
+  const text = `${'a'.repeat(256 * 1024 - 1)}😀`;
+  const output = compactResponseForStore({
+    output: [{
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text }],
+    }],
+  }).output[0].content[0].text;
+  assert.equal(output.includes('\uFFFD'), false);
+  assert.ok(Buffer.byteLength(output, 'utf8') <= 256 * 1024);
+});
+
+test('非流式输出超过硬上限时失败而不是静默截断', () => {
+  assert.throws(
+    () => appendTextWithinLimit('a'.repeat(15), 'b'.repeat(8), {
+      maxBytes: 16,
+      retain: 'error',
+    }),
+    (error) => error.code === 'OUTPUT_TOO_LARGE',
+  );
 });
 
 test('慢但有进度的读取不因纯时间超过软阈值而取消', async () => {
@@ -219,6 +297,28 @@ test('SQLite 片段存储、过期续接和死信独立写入', async () => {
   assert.equal(small.deadLetter.exists('resp_normal'), false);
   await store.close();
   await small.close();
+});
+
+test('SQLite 内存热缓存也严格执行 24 小时过期', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-responses-memory-expiry-'));
+  let clock = Date.now();
+  const store = createResponsesStore({ directory, now: () => clock });
+  const saved = await store.save({
+    id: 'resp_memory_expiry',
+    createdAt: clock,
+    status: 'completed',
+    body: {
+      id: 'resp_memory_expiry',
+      status: 'completed',
+      output: [],
+    },
+  });
+  assert.equal(saved.ok, true);
+  assert.equal((await store.get('resp_memory_expiry'))?.id, 'resp_memory_expiry');
+  clock += 24 * 60 * 60 * 1000 + 1;
+  assert.equal(await store.get('resp_memory_expiry'), null);
+  assert.deepEqual(store.memoryView(), []);
+  await store.close();
 });
 
 test('死信启动重试仅一次，已有记录可安全删除', async () => {
@@ -316,6 +416,33 @@ test('SQLite 同步停顿不阻塞主线程，超时后可重启 worker 保存',
   assert.equal(recovered.ok, true);
   assert.equal((await store.get('resp_after_timeout')).body.status, 'completed');
   await store.close();
+});
+
+test('SQLite worker 不从 node --eval 继承无效启动参数', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-responses-eval-'));
+  const moduleUrl = new URL('../../src/responses-store.js', import.meta.url).href;
+  const script = `
+    import { createResponsesStore } from ${JSON.stringify(moduleUrl)};
+    const store = createResponsesStore({ directory: ${JSON.stringify(directory)} });
+    const result = await store.save({
+      id: 'resp_eval_worker',
+      status: 'completed',
+      body: { id: 'resp_eval_worker', status: 'completed', output: [] },
+    });
+    await store.close();
+    if (!result.ok) {
+      console.error(result.error?.code || result.error?.message);
+      process.exitCode = 1;
+    }
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', script], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    env: { ...process.env, WB_DEBUG: '' },
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  const code = await new Promise((resolve) => child.once('exit', resolve));
+  assert.equal(code, 0, stderr);
 });
 
 test('死信重复写入幂等、字段完整且已有文件权限会被收紧为 0600', () => {

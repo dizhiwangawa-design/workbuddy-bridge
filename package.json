@@ -26,6 +26,7 @@
     "test:api": "node test/api/run.mjs",
     "test:live": "node test/live/anthropic-live.mjs",
     "test:live:openai": "node test/live/openai-live.mjs",
+    "test:live:responses": "node test/live/responses-live.mjs",
     "test:load": "node test/load/slow-reader.mjs"
   },
   "dependencies": {
