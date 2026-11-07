@@ -894,6 +894,77 @@ test('Anthropic 取消顺序为停止上游、释放租约、持久化、合法�
   assert.match(writes.join(''), /"stop_reason":"canceled"/);
 });
 
+test('Anthropic 取消片段持久化失败时不发送成功收尾', async () => {
+  const store = {
+    async save() {
+      return {
+        ok: false,
+        error: Object.assign(new Error('injected database failure'), { code: 'DB_FAILED' }),
+        deadLetterWritten: true,
+      };
+    },
+  };
+  const upstreamClient = {
+    chat: async ({ signal }) => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+          ));
+          signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+        },
+      }),
+    }),
+  };
+  const { createAnthropicRuntime } = await import('../../src/api-runtime.js');
+  const runtime = createAnthropicRuntime({ upstreamClient, cancelPersistence: store });
+  createAccount('api-a');
+  const controller = new AbortController();
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const run = runtime.messages({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'failed cancel persistence' }],
+      stream: true,
+    },
+    config: settings.getApiSettings(),
+    interruptSignal: controller.signal,
+  });
+  const abort = setInterval(() => {
+    if (writes.join('').includes('visible partial')) {
+      clearInterval(abort);
+      controller.abort('ordering test');
+    }
+  }, 5);
+  const result = await run;
+  assert.equal(result.canceled, true);
+  assert.equal(result.persistence.ok, false);
+  assert.doesNotMatch(writes.join(''), /"stop_reason":"canceled"/);
+  assert.doesNotMatch(writes.join(''), /event: message_stop/);
+});
+
 test('Anthropic 真实内核 RST 保存片段且不伪造 message_stop', async (t) => {
   const store = createResponsesStore({
     directory: path.join(tmp, `anthropic-rst-store-${Date.now()}`),

@@ -608,9 +608,13 @@ export function createAnthropicRuntime({
         cancelPersisted = true;
         cancelPersistenceResult = persisted;
         if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
-        write(encoder.cancel({
-          outputTokens: conservativeTokenEstimate(visibleText),
-        }));
+        if (persisted.ok) {
+          write(encoder.cancel({
+            outputTokens: conservativeTokenEstimate(visibleText),
+          }));
+        } else {
+          writer?.fail(persisted.error);
+        }
         responseEnded = true;
         if (res.writable && !res.destroyed && !res.writableEnded) res.end();
         leaseResult = {
@@ -625,6 +629,7 @@ export function createAnthropicRuntime({
           started: true,
           canceled: true,
           kind: cancelKind,
+          persistence: persisted,
         };
       }
 
@@ -783,6 +788,7 @@ export function createAnthropicRuntime({
           started: true,
           canceled: true,
           kind: cancelReason || cancelKind,
+          persistence: persisted,
         };
       }
       const failure = error instanceof RuntimeFailure
