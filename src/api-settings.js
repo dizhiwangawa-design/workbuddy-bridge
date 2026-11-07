@@ -13,6 +13,8 @@ const BOOLEAN_FIELDS = [
   'anthropicEnabled',
   'streaming',
   'tools',
+  'responsesPersistence',
+  'responsesNudge',
   'channelSanitize',
   'requireApiKey',
   'remoteRequireKey',
@@ -64,6 +66,19 @@ export function updateApiSettings(patch = {}) {
         && !Object.hasOwn(patch, 'enabled')
       ) {
         next.enabled = true;
+      }
+      if (field === 'responsesPersistence' && patch[field] && !next.openai) {
+        throw new Error('responsesPersistence requires OpenAI to be enabled');
+      }
+      if (field === 'openai' && !patch[field] && !Object.hasOwn(patch, 'responsesPersistence')) {
+        next.responsesPersistence = false;
+        next.responsesNudge = false;
+      }
+      if (field === 'responsesPersistence' && !patch[field]) {
+        next.responsesNudge = false;
+      }
+      if (field === 'responsesNudge' && patch[field] && !next.responsesPersistence) {
+        throw new Error('responsesNudge requires Responses persistence to be enabled');
       }
     }
   }

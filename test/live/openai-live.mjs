@@ -2,7 +2,7 @@
 import os from 'node:os';
 import path from 'node:path';
 
-const model = process.env.WB_LIVE_MODEL?.trim() || 'deepseek-v4-flash';
+const model = process.env.WB_LIVE_MODEL?.trim() || 'deepseek-v4.1-flash';
 const baseUrl = process.env.WB_LIVE_BASE_URL?.trim();
 const apiKey = process.env.WB_LIVE_API_KEY?.trim() || 'wb-live-loopback';
 let bridge = null;

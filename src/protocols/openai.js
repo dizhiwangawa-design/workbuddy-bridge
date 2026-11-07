@@ -15,13 +15,26 @@ function textContent(content, messageIndex) {
     throw requestError(`messages[${messageIndex}].content must be text`);
   }
   const parts = [];
+  let hasImage = false;
   for (const part of content) {
-    if (part?.type !== 'text' || typeof part.text !== 'string') {
-      throw requestError(`messages[${messageIndex}] only supports text content`);
+    if (part?.type === 'image_url') {
+      if (part.file_id !== undefined) throw requestError('file_id images are not supported', 'file_id_not_supported');
+      const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+      if (typeof url !== 'string' || !url) {
+        throw requestError(`messages[${messageIndex}] image_url needs a URL`);
+      }
+      hasImage = true;
+      parts.push({ type: 'image_url', image_url: { url } });
+      continue;
     }
-    parts.push(part.text);
+    if (part?.type !== 'text' || typeof part.text !== 'string') {
+      throw requestError(`messages[${messageIndex}] only supports text or image_url content`);
+    }
+    parts.push({ type: 'text', text: part.text });
   }
-  return parts.join('\n');
+  return hasImage
+    ? parts
+    : parts.map((part) => part.text).join('\n');
 }
 
 function normalizeMessages(messages) {
@@ -114,7 +127,7 @@ function normalizeToolChoice(choice, tools) {
 }
 
 export function prepareOpenAIRequest(body, {
-  defaultModel = 'deepseek-v4-flash',
+  defaultModel = 'deepseek-v4.1-flash',
   toolsEnabled = true,
 } = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -123,19 +136,12 @@ export function prepareOpenAIRequest(body, {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw requestError('messages must be a non-empty array');
   }
-  if (body.stream === true) {
-    throw requestError(
-      'streaming is not supported by the current minimal OpenAI adapter',
-      'stream_not_supported',
-    );
-  }
   if (body.n !== undefined && body.n !== 1) {
     throw requestError('only n=1 is supported');
   }
   if (
     body.functions !== undefined
     || body.function_call !== undefined
-    || body.parallel_tool_calls !== undefined
   ) {
     throw requestError(
       'legacy functions are not supported by the current minimal OpenAI adapter',
@@ -185,6 +191,7 @@ export function prepareOpenAIRequest(body, {
   return {
     body: outbound,
     model,
+    stream: body.stream === true,
     toolsDeclared: tools.length > 0,
     toolChoice: toolChoice || 'auto',
     toolNames: names,
@@ -353,6 +360,97 @@ export function toOpenAIResponse(aggregate, model, { now = Date.now } = {}) {
   };
 }
 
+export function createChatEncoder({ id, model, created = Math.floor(Date.now() / 1000) }) {
+  const responseId = id || `chatcmpl-${randomUUID().replaceAll('-', '')}`;
+  let started = false;
+  let finished = false;
+  let toolIndex = null;
+  let lastToolCount = 0;
+  function chunk(delta, finishReason = null, usage) {
+    const data = {
+      id: responseId,
+      object: 'chat.completion.chunk',
+      created,
+      model,
+      choices: finishReason || Object.keys(delta || {}).length
+        ? [{ index: 0, delta, logprobs: null, finish_reason: finishReason }]
+        : [],
+    };
+    if (usage !== undefined) data.usage = usage;
+    return { type: 'message', data };
+  }
+  return {
+    get id() {
+      return responseId;
+    },
+    start() {
+      if (started) return [];
+      started = true;
+      return [chunk({ role: 'assistant', content: '' })];
+    },
+    textDelta(text) {
+      if (!started || finished || !text) return [];
+      return [chunk({ content: String(text) })];
+    },
+    reasoningDelta(text) {
+      if (!started || finished || !text) return [];
+      return [chunk({ reasoning_content: String(text) })];
+    },
+    toolDelta(calls = []) {
+      if (!started || finished || !calls.length) return [];
+      if (toolIndex === null) toolIndex = 0;
+      const offset = toolIndex;
+      toolIndex += calls.length;
+      lastToolCount = calls.length;
+      return [chunk({
+        tool_calls: calls.map((call, index) => ({
+          index: offset + index,
+          id: call.id,
+          type: 'function',
+          function: { name: call.name, arguments: JSON.stringify(call.input ?? {}) },
+        })),
+      })];
+    },
+    ping() {
+      if (!started || finished) return [];
+      return [chunk({}, null, null)];
+    },
+    finalize({ calls = [], finishReason, usage = null, canceled = false } = {}) {
+      if (finished) return [];
+      const events = started ? [] : this.start();
+      for (const call of calls) {
+        const deltas = this.toolDelta([call]);
+        events.push(...deltas);
+      }
+      finished = true;
+      const reason = calls.length || lastToolCount ? 'tool_calls' : finishReason === 'length'
+        ? 'length'
+        : finishReason === 'content_filter' || finishReason === 'refusal'
+          ? 'content_filter'
+          : 'stop';
+      events.push(chunk({}, canceled ? 'stop' : reason, usage || undefined));
+      // Client interruption closes with one legal stop and one sentinel;
+      // timeouts are encoded separately and never use this path.
+      events.push({ type: 'data', data: '[DONE]' });
+      return events;
+    },
+    error(error) {
+      if (finished) return [];
+      finished = true;
+      return [chunk({}, null, null), {
+        type: 'message',
+        data: {
+          error: {
+            type: error?.type || 'api_error',
+            message: error?.message || 'upstream error',
+            code: error?.code || null,
+          },
+        },
+      }];
+    },
+  };
+}
+
 function modelRow(model) {
   const id = String(model.id || '').trim();
   if (!id || id === 'undefined') return null;
@@ -368,7 +466,7 @@ function modelRow(model) {
 }
 
 export function mapModelCatalogue(payload, {
-  defaultModel = 'deepseek-v4-flash',
+  defaultModel = 'deepseek-v4.1-flash',
 } = {}) {
   const rows = payload?.data?.models
     || payload?.models
@@ -383,7 +481,7 @@ export function mapModelCatalogue(payload, {
     });
   }
 
-  const ids = ['auto', defaultModel || 'deepseek-v4-flash', 'hy3'];
+  const ids = ['auto', defaultModel || 'deepseek-v4.1-flash', 'hy3'];
   return [...new Set(ids)].map((id) => ({
     id,
     object: 'model',

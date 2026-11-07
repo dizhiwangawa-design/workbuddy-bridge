@@ -237,6 +237,11 @@ export function adminPage({ home = '', token = '' } = {}) {
   .api-endpoint code{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
   .api-meta{display:flex;gap:14px;flex-wrap:wrap;margin-top:9px;font-size:10.5px;color:var(--sub)}
   .api-meta b{color:var(--fg);font-weight:600}
+  .api-option{display:flex;align-items:center;gap:10px;margin-top:9px;padding-top:9px;border-top:1px dashed var(--line)}
+  .api-option>div{min-width:0;flex:1;display:flex;flex-direction:column;gap:2px;font-size:11px}
+  .api-option small{color:var(--muted);font-size:10px}
+  .api-option .switch:disabled{opacity:.35;cursor:not-allowed}
+  .api-option>div>small{display:block}
   .key-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px dashed var(--line)}
   .key-row:last-child{border-bottom:0}
   .key-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 13%,transparent)}
@@ -450,7 +455,7 @@ export function adminPage({ home = '', token = '' } = {}) {
           <div class="api-icon">O</div>
           <div class="api-copy">
             <div class="api-name">OpenAI 协议</div>
-            <div class="api-desc">非流式文本与模型目录（最小实现）</div>
+            <div class="api-desc">Chat SSE、Responses HTTP/WS、工具与模型目录</div>
           </div>
           <span class="api-state" id="api-openai-state">关闭</span>
           <button class="switch" id="api-openai-switch" role="switch" aria-checked="false" data-act="api-openai-toggle" title="启用/停用 OpenAI API"></button>
@@ -460,6 +465,14 @@ export function adminPage({ home = '', token = '' } = {}) {
           <button class="mini" data-act="api-copy-openai-endpoint" title="复制 OpenAI 接口地址">复制</button>
         </div>
         <div class="api-meta" id="api-openai-meta"></div>
+        <div class="api-option">
+          <div><b>Responses 持久化</b><small>保存已完成的响应，允许 previous_response_id 续接</small></div>
+          <button class="switch" id="api-responses-persistence-switch" role="switch" aria-checked="false" data-act="api-responses-persistence-toggle" title="启用/停用 Responses 持久化"></button>
+        </div>
+        <div class="api-option">
+          <div><b>续跑提示</b><small>在 Responses 请求中提示模型可续接取消片段</small></div>
+          <button class="switch" id="api-responses-nudge-switch" role="switch" aria-checked="false" data-act="api-responses-nudge-toggle" title="启用/停用 Responses 续跑提示"></button>
+        </div>
       </div>
     </div>
   </section>
@@ -905,9 +918,16 @@ function renderApi(){
   $('api-openai-switch').setAttribute('aria-checked',openaiEnabled?'true':'false');
   $('api-openai-endpoint').textContent=location.origin+'/v1/chat/completions';
   $('api-openai-meta').innerHTML=
-    '<span>文本 <b>非流式</b></span>'+
+    '<span>Chat <b>SSE / JSON</b></span>'+
+    '<span>Responses <b>HTTP / WS</b></span>'+
     '<span>模型目录 <b>/v1/models</b></span>'+
-    '<span>Tools <b>未开放</b></span>';
+    '<span>Tools <b>'+(s.tools?'已开放':'已关闭')+'</b></span>';
+  var persistenceEnabled=!!(openaiEnabled&&s.responsesPersistence);
+  $('api-responses-persistence-switch').setAttribute('aria-checked',persistenceEnabled?'true':'false');
+  $('api-responses-persistence-switch').disabled=!openaiEnabled;
+  var nudgeEnabled=!!(persistenceEnabled&&s.responsesNudge);
+  $('api-responses-nudge-switch').setAttribute('aria-checked',nudgeEnabled?'true':'false');
+  $('api-responses-nudge-switch').disabled=!persistenceEnabled;
   var authMode=s.requireApiKey?'所有连接强制 Key':
     !s.remoteRequireKey?'不强制 Key':
     s.trustProxy?'可信代理强制 Key':'回环免 Key · 远程强制 Key';
@@ -1035,6 +1055,20 @@ document.addEventListener('click',function(ev){
     return act(function(){
       return api('/api/api-compat',{method:'PATCH',body:JSON.stringify({openai:!openaiOn})})
         .then(function(){toast(!openaiOn?'OpenAI API 已启用':'OpenAI API 已关闭')});
+    });
+  }
+  if(a==='api-responses-persistence-toggle'){
+    var persistenceOn=el.getAttribute('aria-checked')==='true';
+    return act(function(){
+      return api('/api/api-compat',{method:'PATCH',body:JSON.stringify({responsesPersistence:!persistenceOn})})
+        .then(function(){toast(!persistenceOn?'Responses 持久化已启用':'Responses 持久化已关闭')});
+    });
+  }
+  if(a==='api-responses-nudge-toggle'){
+    var nudgeOn=el.getAttribute('aria-checked')==='true';
+    return act(function(){
+      return api('/api/api-compat',{method:'PATCH',body:JSON.stringify({responsesNudge:!nudgeOn})})
+        .then(function(){toast(!nudgeOn?'Responses 续跑提示已启用':'Responses 续跑提示已关闭')});
     });
   }
   if(a==='api-key-create'){

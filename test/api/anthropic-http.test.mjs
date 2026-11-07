@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
@@ -15,6 +16,7 @@ const settings = await import('../../src/api-settings.js');
 const { startHttpServer } = await import('../../src/http.js');
 const { createUpstreamClient } = await import('../../src/upstream-client.js');
 const { createSseParser } = await import('../../src/sse.js');
+const { createResponsesStore } = await import('../../src/responses-store.js');
 
 function createAccount(name) {
   accounts.ensureAccount(name);
@@ -35,6 +37,7 @@ function createAccount(name) {
 async function startFixture(t, upstreamHandler, {
   accountNames = ['api-a'],
   config = {},
+  store = null,
 } = {}) {
   const currentPool = pool.loadPool();
   for (const name of Object.keys(currentPool.accounts)) {
@@ -56,7 +59,7 @@ async function startFixture(t, upstreamHandler, {
     requireApiKey: false,
     remoteRequireKey: true,
     trustProxy: false,
-    defaultModel: 'deepseek-v4-flash',
+    defaultModel: 'deepseek-v4.1-flash',
     dsmlMaxBufferBytes: 2 * 1024 * 1024,
     firstByteTimeoutMs: 2000,
     idleTimeoutMs: 3000,
@@ -70,7 +73,7 @@ async function startFixture(t, upstreamHandler, {
   const bridge = await startHttpServer({
     port: 0,
     host: '127.0.0.1',
-    apiDeps: { upstreamClient },
+    apiDeps: store ? { upstreamClient, cancelPersistence: store } : { upstreamClient },
   });
 
   t.after(async () => {
@@ -101,6 +104,47 @@ function inflight(name) {
   return pool.poolView().accounts.find((item) => item.name === name)?.inflight;
 }
 
+function sendKernelRst(url, body) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const socket = net.createConnection({ host: parsed.hostname, port: Number(parsed.port) });
+    const raw = JSON.stringify(body);
+    let bytes = '';
+    let settled = false;
+    function finish() {
+      if (settled) return;
+      settled = true;
+      resolve(bytes);
+    }
+    socket.once('connect', () => {
+      socket.write(
+        `POST ${parsed.pathname} HTTP/1.1\r\nHost: ${parsed.host}\r\n`
+        + 'Content-Type: application/json\r\nConnection: keep-alive\r\n'
+        + `Content-Length: ${Buffer.byteLength(raw)}\r\n\r\n${raw}`,
+      );
+    });
+    socket.on('data', (chunk) => {
+      bytes += chunk.toString('utf8');
+      if (bytes.includes('visible partial') && socket.resetAndDestroy) {
+        socket.resetAndDestroy();
+        finish();
+      }
+    });
+    socket.once('error', (error) => {
+      if (!settled) {
+        socket.destroy();
+        reject(error);
+      }
+    });
+    setTimeout(() => {
+      if (!settled) {
+        socket.resetAndDestroy?.();
+        finish();
+      }
+    }, 3000).unref();
+  });
+}
+
 test('POST /v1/messages 实时流式转发文本并在末尾追加结构化 tool_use', async (t) => {
   let received;
   const { baseUrl } = await startFixture(t, async (req, res) => {
@@ -119,7 +163,7 @@ test('POST /v1/messages 实时流式转发文本并在末尾追加结构化 tool
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 128,
       messages: [{ role: 'user', content: 'weather?' }],
       stream: true,
@@ -137,7 +181,7 @@ test('POST /v1/messages 实时流式转发文本并在末尾追加结构化 tool
   const { events } = await parseResponse(response);
 
   assert.equal(received.stream, true);
-  assert.equal(received.model, 'deepseek-v4-flash');
+  assert.equal(received.model, 'deepseek-v4.1-flash');
   assert.equal(received.tools[0].function.name, 'get_weather');
   assert.equal(events.filter((event) => event.event === 'message_start').length, 1);
   assert.equal(events.filter((event) => event.event === 'message_stop').length, 1);
@@ -184,7 +228,7 @@ test('DSML fallback 清洗正文；未声明 tools 时只清洗不生成 tool_us
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 128,
       messages: [{ role: 'user', content: 'search' }],
       stream: true,
@@ -218,7 +262,7 @@ test('最终没有工具块时非流式 stop_reason 不使用 tool_use', async (
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'no final tools' }],
     }),
@@ -243,7 +287,7 @@ test('DSML 缓冲超限后发送 error、不发送 message_stop 并释放 inflig
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 128,
       messages: [{ role: 'user', content: 'go' }],
       stream: true,
@@ -271,7 +315,7 @@ test('首字节超时在发送 message_start 前结束并释放账号租约', as
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 128,
       messages: [{ role: 'user', content: 'hang' }],
       stream: true,
@@ -297,7 +341,7 @@ test('收到 finish_reason 后无需等待 [DONE]，宽限到期即正常结束'
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 128,
       messages: [{ role: 'user', content: 'finish' }],
       stream: true,
@@ -320,7 +364,7 @@ test('count_tokens 不调用上游并明确返回保守估算标记', async (t) 
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: '你好 hello 😀' }],
     }),
@@ -374,7 +418,7 @@ test('发出 message_start 前的 429 会使首号冷却并自动切换下一账
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'failover' }],
       stream: true,
@@ -422,7 +466,7 @@ test('上游 401 会刷新 Token、0600 回写凭据后重试同一请求', asyn
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'refresh' }],
       stream: true,
@@ -458,7 +502,7 @@ test('流已开始后空闲超时发送 error、无 message_stop 并释放租约
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'idle' }],
       stream: true,
@@ -487,7 +531,7 @@ test('首字节和空闲都未触发时，总超时仍中止请求并释放租�
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'total' }],
     }),
@@ -510,7 +554,7 @@ test('[DONE] 缺少 finish_reason 且工具片段完整时推断正常结束', a
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'done' }],
       stream: true,
@@ -536,7 +580,7 @@ test('有 finish_reason 的干净 EOF 不依赖 [DONE] 也能正常结束', asyn
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'eof' }],
       stream: true,
@@ -562,7 +606,7 @@ test('上游缺少 usage 时按可见输出估算非零 output_tokens', async (t
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'estimate output usage' }],
       stream: true,
@@ -587,7 +631,7 @@ test('TCP 中断在 message_start 后发送 error、不发送 message_stop 并�
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'interrupt' }],
       stream: true,
@@ -623,7 +667,7 @@ test('客户端断开后取消上游读取并释放 inflight', async (t) => {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'cancel' }],
       stream: true,
@@ -644,6 +688,177 @@ test('客户端断开后取消上游读取并释放 inflight', async (t) => {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(inflight('api-a'), 0);
+});
+
+test('Anthropic 主动取消先持久化，再用合法 canceled 收尾', async (t) => {
+  const store = createResponsesStore({ directory: path.join(tmp, `anthropic-signal-${Date.now()}`) });
+  await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.flushHeaders();
+  }, { store });
+  const { createAnthropicRuntime } = await import('../../src/api-runtime.js');
+  const upstreamClient = {
+    chat: async ({ signal }) => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+          ));
+          signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+        },
+      }),
+    }),
+  };
+  const runtime = createAnthropicRuntime({ upstreamClient, cancelPersistence: store });
+  const controller = new AbortController();
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() {
+      this.headersSent = true;
+    },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() {
+      this.writableEnded = true;
+    },
+    on() {},
+    off() {},
+  };
+  const run = runtime.messages({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 32,
+      messages: [{ role: 'user', content: 'cancel' }],
+      stream: true,
+    },
+    config: settings.getApiSettings(),
+    interruptSignal: controller.signal,
+  });
+  const visibleDeadline = Date.now() + 1000;
+  while (!writes.join('').includes('visible partial')) {
+    assert.ok(Date.now() < visibleDeadline, JSON.stringify({ writes, inflight: inflight('api-a') }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  controller.abort('test interrupt');
+  const result = await run;
+  assert.equal(result.canceled, true);
+  const raw = writes.join('');
+  assert.equal((raw.match(/event: message_stop/g) || []).length, 1);
+  assert.match(raw, /"stop_reason":"canceled"/);
+  const record = store.memoryView()[0];
+  assert.equal(record.status, 'incomplete');
+  assert.equal(record.body.output[0].content[0].text, 'visible partial');
+});
+
+test('Anthropic 真实内核 RST 保存片段且不伪造 message_stop', async (t) => {
+  const store = createResponsesStore({
+    directory: path.join(tmp, `anthropic-rst-store-${Date.now()}`),
+  });
+  let upstreamClosed = false;
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"content":"visible partial"}}]}\n\n');
+    res.flushHeaders();
+    res.once('close', () => {
+      upstreamClosed = true;
+    });
+  }, { store });
+  const received = await sendKernelRst(`${baseUrl}/v1/messages`, {
+    model: 'deepseek-v4.1-flash',
+    max_tokens: 64,
+    messages: [{ role: 'user', content: 'reset' }],
+    stream: true,
+  });
+  assert.match(received, /visible partial/);
+  assert.doesNotMatch(received, /event: message_stop/);
+  const deadline = Date.now() + 1500;
+  while ((!upstreamClosed || inflight('api-a') !== 0 || store.memoryView().length === 0)
+    && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(upstreamClosed, true);
+  assert.equal(inflight('api-a'), 0);
+  assert.equal(store.memoryView().length, 1);
+  const record = store.memoryView()[0];
+  assert.equal(record.status, 'incomplete');
+  assert.equal(record.body.output[0].content[0].text, 'visible partial');
+  assert.equal((await store.get(record.id))?.status, 'incomplete');
+});
+
+test('Anthropic 主动取消时半截工具参数不可执行', async (t) => {
+  const store = createResponsesStore({ directory: path.join(tmp, `anthropic-tool-cancel-${Date.now()}`) });
+  await startFixture(t, async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.flushHeaders();
+  }, { store });
+  const { createAnthropicRuntime } = await import('../../src/api-runtime.js');
+  const upstreamClient = {
+    chat: async ({ signal }) => ({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_partial",'
+            + '"function":{"name":"write_file","arguments":"{\\"path\\":\\"/tmp/x\\","}}]}}]}\n\n',
+          ));
+          signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+        },
+      }),
+    }),
+  };
+  const runtime = createAnthropicRuntime({ upstreamClient, cancelPersistence: store });
+  const controller = new AbortController();
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+  const run = runtime.messages({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'partial tool' }],
+      stream: true,
+      tools: [{ name: 'write_file', input_schema: { type: 'object', properties: {} } }],
+    },
+    config: settings.getApiSettings(),
+    interruptSignal: controller.signal,
+  });
+  controller.abort('interrupt at partial tool');
+  const result = await run;
+  assert.equal(result.canceled, true);
+  assert.doesNotMatch(writes.join(''), /"type":"tool_use"/);
+  assert.equal(store.memoryView().length, 1);
+  assert.equal(JSON.stringify(store.memoryView()[0].body).includes('call_partial'), false);
 });
 
 test('不存在 codebuddy 命令时 Anthropic API 仍可完成请求', async (t) => {
@@ -668,7 +883,7 @@ test('不存在 codebuddy 命令时 Anthropic API 仍可完成请求', async (t)
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'no cli' }],
       stream: true,
@@ -710,7 +925,7 @@ test('并发流不会突破账号 maxConcurrency，第二个请求在租约满�
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'first' }],
       stream: true,
@@ -722,7 +937,7 @@ test('并发流不会突破账号 maxConcurrency，第二个请求在租约满�
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'second' }],
       stream: true,
@@ -754,7 +969,7 @@ test('结构化工具参数截断且无 DSML fallback 时失败关闭', async (t
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'broken tool' }],
       stream: true,
@@ -803,7 +1018,7 @@ test('结构化调用全无效但文本中含完整 DSML 时使用 DSML fallback
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 64,
       messages: [{ role: 'user', content: 'fallback' }],
       stream: true,

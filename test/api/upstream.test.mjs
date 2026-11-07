@@ -40,9 +40,9 @@ test('直连 /v2/chat/completions 并发送 WorkBuddy 请求头', async (t) => {
   const response = await client.chat({
     accountId: 'account-A',
     credentials: credentials(),
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     body: {
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       stream: false,
       stream_options: { include_usage: true },
       messages: [{ role: 'user', content: 'ping' }],
@@ -52,7 +52,7 @@ test('直连 /v2/chat/completions 并发送 WorkBuddy 请求头', async (t) => {
   assert.equal(response.status, 200);
   assert.equal(seen.url, '/v2/chat/completions');
   assert.equal(seen.headers.authorization, 'Bearer fixture-access');
-  assert.equal(seen.headers['x-model-id'], 'deepseek-v4-flash');
+  assert.equal(seen.headers['x-model-id'], 'deepseek-v4.1-flash');
   assert.equal(seen.headers['x-user-id'], 'uid-a');
   assert.equal(seen.headers['x-product'], 'WorkBuddy');
   assert.equal(seen.headers['x-agent-intent'], 'craft');
@@ -77,7 +77,7 @@ test('WorkBuddy 上游的指定工具选择编码为字符串', async (t) => {
   await client.chat({
     accountId: 'tools',
     credentials: credentials(),
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     body: {
       messages: [{ role: 'user', content: 'use tool' }],
       tool_choice: {
@@ -130,7 +130,7 @@ test('上游请求在指定时间内未返回响应头时中止', async () => {
     client.chat({
       accountId: 'timeout',
       credentials: credentials(),
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       body: { messages: [] },
     }),
     /upstream timeout/,
@@ -152,7 +152,7 @@ test('调用方取消时中止上游请求并保留取消原因', async () => {
   const pending = client.chat({
     accountId: 'cancel',
     credentials: credentials(),
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     body: { messages: [] },
     signal: controller.signal,
   });
@@ -175,7 +175,7 @@ test('刷新和模型目录使用 WorkBuddy 专用路径及请求头', async (t)
       }));
       return;
     }
-    res.end(JSON.stringify({ data: [{ id: 'deepseek-v4-flash' }] }));
+    res.end(JSON.stringify({ data: [{ id: 'deepseek-v4.1-flash' }] }));
   });
   t.after(() => server.close());
 
@@ -189,7 +189,7 @@ test('刷新和模型目录使用 WorkBuddy 专用路径及请求头', async (t)
     expiresIn: 3600,
     refreshExpiresIn: undefined,
   });
-  assert.deepEqual(models, { data: [{ id: 'deepseek-v4-flash' }] });
+  assert.deepEqual(models, { data: [{ id: 'deepseek-v4.1-flash' }] });
   assert.equal(requests[0].url, '/v2/plugin/auth/token/refresh');
   assert.equal(requests[0].headers['x-refresh-token'], 'fixture-refresh');
   assert.equal(requests[0].headers['x-auth-refresh-source'], 'plugin');

@@ -117,7 +117,7 @@ test('官方 Anthropic SDK 连续完成 3 次 tool_use/tool_result 往返', asyn
 
   for (let round = 1; round <= 3; round += 1) {
     const response = await client.messages.create({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 128,
       messages,
       tools,
@@ -141,7 +141,7 @@ test('官方 Anthropic SDK 连续完成 3 次 tool_use/tool_result 往返', asyn
   }
 
   const final = await client.messages.create({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     max_tokens: 128,
     messages,
     tools,
@@ -222,7 +222,7 @@ test('官方 Anthropic SDK 流式重组文本与 tool_use 输入', async (t) => 
     maxRetries: 0,
   });
   const stream = client.messages.stream({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     max_tokens: 128,
     messages: [{ role: 'user', content: 'write a note' }],
     tools: [{

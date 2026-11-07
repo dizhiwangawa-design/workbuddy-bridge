@@ -198,6 +198,15 @@ export function createDsmlScanner({
     return fail(result, 'DSML_BUFFER_LIMIT', `DSML buffer exceeded ${limit} bytes`);
   }
 
+  function hasPartialCallMarker() {
+    if (mode !== 'text') return true;
+    for (let index = buffer.lastIndexOf('<'); index >= 0;) {
+      if (CALLS_OPEN.startsWith(buffer.slice(index))) return true;
+      index = index === 0 ? -1 : buffer.lastIndexOf('<', index - 1);
+    }
+    return false;
+  }
+
   return {
     push(chunk) {
       const result = { visibleText: '', calls: [], error: null };
@@ -241,6 +250,10 @@ export function createDsmlScanner({
       }
       if (result.error) return result;
       return enforceLimit(result) || result;
+    },
+
+    hasPendingCall() {
+      return hasPartialCallMarker();
     },
 
     finish() {
@@ -305,6 +318,26 @@ export function createStructuredToolAssembler() {
 
     hasPending() {
       return pending.size > 0;
+    },
+
+    snapshot() {
+      const calls = [];
+      for (const item of [...pending.values()].sort((a, b) => a.index - b.index)) {
+        if (!item.name || !item.arguments.trim()) continue;
+        try {
+          const input = JSON.parse(item.arguments);
+          if (input && typeof input === 'object' && !Array.isArray(input)) {
+            calls.push({ id: item.id, name: item.name, input });
+          }
+        } catch {
+          // A partial JSON argument is intentionally not executable.
+        }
+      }
+      return calls;
+    },
+
+    retain() {
+      return [...pending.values()].map((item) => ({ ...item }));
     },
 
     finish() {

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { once } from 'node:events';
+import WebSocket from 'ws';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-settings-'));
 process.env.WB_BRIDGE_HOME = path.join(tmp, 'bridge');
@@ -189,6 +191,23 @@ test('管理 API 校验令牌并按白名单更新配置', async () => {
   });
 });
 
+test('Responses 持久化和续跑提示在 OpenAI 关闭时不可开启', () => {
+  settings.updateApiSettings({ openai: false, responsesPersistence: false, responsesNudge: false });
+  assert.throws(
+    () => settings.updateApiSettings({ responsesPersistence: true }),
+    /requires OpenAI/,
+  );
+  settings.updateApiSettings({ openai: true, responsesPersistence: true });
+  assert.throws(
+    () => settings.updateApiSettings({ openai: false, responsesPersistence: true }),
+    /requires OpenAI/,
+  );
+  const updated = settings.updateApiSettings({ openai: false, responsesPersistence: false });
+  assert.equal(updated.openai, false);
+  assert.equal(updated.responsesPersistence, false);
+  assert.equal(updated.responsesNudge, false);
+});
+
 test('Bearer 与 x-api-key 共用同一套客户端 Key', async () => {
   settings.updateApiSettings({
     enabled: true,
@@ -265,3 +284,25 @@ test('/health 只返回状态且现有管理页仍可访问', async () => {
     assert.match(await admin.text(), /WorkBuddy/);
   });
 });
+
+for (const [name, header, status] of [
+  ['缺失', null, 401],
+  ['错误', 'Bearer sk-wb_invalid', 401],
+]) {
+  test(`Responses WS ${name} Key 在握手阶段拒绝`, async () => {
+    settings.updateApiSettings({
+      enabled: true,
+      openai: true,
+      requireApiKey: true,
+    });
+    await withServer(async (baseUrl) => {
+      const ws = new WebSocket(
+        `${baseUrl.replace(/^http/, 'ws')}/v1/responses`,
+        header ? { headers: { authorization: header } } : {},
+      );
+      const [, response] = await once(ws, 'unexpected-response');
+      assert.equal(response.statusCode, status);
+      assert.equal(response.headers.connection, 'close');
+    });
+  });
+}

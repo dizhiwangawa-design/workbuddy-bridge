@@ -66,7 +66,7 @@ if (isPrint) {
         output_tokens: 200,
         cache_read_input_tokens: 300,
       },
-      modelUsage: { 'deepseek-v4-flash': { inputTokens: 1200, outputTokens: 200, contextWindow: 256000 } },
+      modelUsage: { 'deepseek-v4.1-flash': { inputTokens: 1200, outputTokens: 200, contextWindow: 256000 } },
     },
     0,
   );

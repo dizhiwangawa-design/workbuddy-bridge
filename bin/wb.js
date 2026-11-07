@@ -93,7 +93,7 @@ ${C.bold('Anthropic API')}
       baseURL: 'http://127.0.0.1:7666',
     });
     await client.messages.create({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       max_tokens: 256,
       messages: [{ role: 'user', content: '你好' }],
     });

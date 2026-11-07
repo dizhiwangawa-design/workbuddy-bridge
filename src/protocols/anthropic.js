@@ -385,6 +385,19 @@ export function createAnthropicEncoder({
       return [event('ping', { type: 'ping' })];
     },
 
+    cancel({ outputTokens = 0 } = {}) {
+      if (finished) return [];
+      finished = true;
+      const events = started ? closeText() : this.start();
+      events.push(event('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'canceled', stop_sequence: null },
+        usage: { output_tokens: Math.max(0, Number(outputTokens) || 0) },
+      }));
+      events.push(event('message_stop', { type: 'message_stop' }));
+      return events;
+    },
+
     error(error) {
       if (finished) return [];
       finished = true;

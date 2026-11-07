@@ -159,7 +159,7 @@ test('官方 OpenAI SDK 连续完成 3 次 tool_calls/tool 往返', async (t) =>
   const seenIds = new Set();
   for (let round = 1; round <= 3; round += 1) {
     const response = await client.chat.completions.create({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       messages,
       tools,
     });
@@ -179,7 +179,7 @@ test('官方 OpenAI SDK 连续完成 3 次 tool_calls/tool 往返', async (t) =>
   }
 
   const final = await client.chat.completions.create({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     messages,
     tools,
   });
@@ -208,7 +208,7 @@ test('OpenAI tools 可从文本 DSML 还原，并保留同轮文本', async (t) 
     }) + 'data: [DONE]\n\n');
   });
   const response = await client.chat.completions.create({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     messages: [{ role: 'user', content: '北京天气' }],
     tools: [{
       type: 'function',

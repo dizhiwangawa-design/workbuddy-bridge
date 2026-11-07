@@ -26,9 +26,24 @@ import {
 } from './pool.js';
 import { createUpstreamClient } from './upstream-client.js';
 import { debug, warn } from './log.js';
+import {
+  PRODUCTION_KEEPALIVE_MS,
+  UPSTREAM_LENGTH_LIMIT,
+  canWriteHttp,
+  createHttpEventWriter,
+  isWriteError,
+  withTimeout,
+} from './stream-control.js';
+import { createDeadLetter, createResponsesStore } from './responses-store.js';
+import { createChatEncoder } from './protocols/openai.js';
 
 const ANTHROPIC_ESTIMATOR = 'wb-conservative-v1';
-const PING_INTERVAL_MS = 15000;
+const PING_INTERVAL_MS = PRODUCTION_KEEPALIVE_MS;
+
+/** The runtime keeps the production interval unless a test fixture explicitly replaces it. */
+export function effectiveKeepaliveMs(injected) {
+  return injected === undefined || injected === null ? PING_INTERVAL_MS : Number(injected);
+}
 
 class RuntimeFailure extends Error {
   constructor(message, {
@@ -76,7 +91,8 @@ function sendSseEvents(res, events) {
   }
 }
 
-function mapStopReason(finishReason, hasTools) {
+function mapStopReason(finishReason, hasTools, canceled = false) {
+  if (canceled) return 'canceled';
   if (hasTools) return 'tool_use';
   if (finishReason === 'length') return 'max_tokens';
   if (finishReason === 'refusal' || finishReason === 'content_filter') return 'refusal';
@@ -217,7 +233,12 @@ export function createAnthropicRuntime({
   end = endTask,
   poolLoader = loadPool,
   now = Date.now,
+  keepaliveMs: injectedKeepaliveMs,
+  softBytes,
+  hardBytes,
+  cancelPersistence = createResponsesStore({ now }),
 } = {}) {
+  const keepaliveMs = effectiveKeepaliveMs(injectedKeepaliveMs);
   async function executeAttempt({
     req,
     res,
@@ -225,6 +246,7 @@ export function createAnthropicRuntime({
     config,
     stream,
     account,
+    interruptSignal = null,
   }) {
     const requestId = `msg_${randomUUID()}`;
     const inputEstimate = estimateAnthropicInputTokens(body);
@@ -239,6 +261,11 @@ export function createAnthropicRuntime({
     let pingTimer = null;
     let downstreamStarted = false;
     let responseEnded = false;
+    let cancelKind = null;
+    let cancelReason = null;
+    let cancelPersisted = false;
+    let cancelPersistenceResult = null;
+    let cancelPromise = null;
     let visibleText = '';
     let dsmlCalls = [];
     let structured;
@@ -255,10 +282,18 @@ export function createAnthropicRuntime({
     };
     const startedAt = now();
     const pendingWrites = [];
+    const writer = stream
+      ? createHttpEventWriter(res, {
+          protocol: 'anthropic',
+          softBytes,
+          hardBytes,
+          onOverflow: (error) => terminate('backpressure', error),
+        })
+      : null;
 
     function write(events) {
       if (!stream || !events.length || responseEnded) return;
-      sendSseEvents(res, events);
+      writer.writeEvents(events);
     }
 
     function ensureStarted() {
@@ -266,13 +301,14 @@ export function createAnthropicRuntime({
       downstreamStarted = true;
       if (!stream) return;
       res.writeHead(200, streamHeaders());
+      res.flushHeaders?.();
       encoder = createAnthropicEncoder({
         id: requestId,
         model: body.model,
         inputTokens: inputEstimate,
       });
       write(encoder.start());
-      pingTimer = setInterval(() => write(encoder.ping()), PING_INTERVAL_MS);
+      pingTimer = setInterval(() => write(encoder.ping()), keepaliveMs);
       pingTimer.unref?.();
     }
 
@@ -287,6 +323,8 @@ export function createAnthropicRuntime({
     function terminate(kind, error) {
       if (timeoutKind) return;
       timeoutKind = kind;
+      if (['interrupt', 'client', 'backpressure'].includes(kind)) cancelKind = kind;
+      if (kind === 'client' && !cancelReason) cancelReason = 'network_disconnect';
       const reason = error || new TimeoutFailure(
         kind,
         kind === 'first_byte'
@@ -297,7 +335,10 @@ export function createAnthropicRuntime({
               ? 'upstream request exceeded the total timeout'
               : 'upstream finish grace expired',
       );
-      if (reader) pendingWrites.push(Promise.resolve(reader.cancel(reason)).catch(() => {}));
+      if (reader && !readerDone) {
+        readerDone = true;
+        pendingWrites.push(Promise.resolve(reader.cancel(reason)).catch(() => {}));
+      }
       controller.abort(reason);
     }
 
@@ -337,20 +378,34 @@ export function createAnthropicRuntime({
     }
 
     function onClientDisconnect() {
-      if (!res.writableEnded) {
-        terminate('client', new RuntimeFailure('client disconnected', {
-          code: 'ABORTED',
-          retryable: false,
-        }));
+      if (responseEnded || cancelKind) {
+        return;
       }
+      cancelKind = 'network_disconnect';
+      cancelReason = 'network_disconnect';
+      const reason = new RuntimeFailure('client disconnected', {
+        code: 'ABORTED',
+        retryable: false,
+      });
+      terminate('client', reason);
     }
 
     function onAborted() {
       onClientDisconnect();
     }
 
+    function onInterrupt() {
+      if (!responseEnded) {
+        terminate('interrupt', new RuntimeFailure('client requested cancellation', {
+          code: 'CANCELED',
+          retryable: false,
+        }));
+      }
+    }
+
     req.once('aborted', onAborted);
-    res.once('close', onClientDisconnect);
+    res.on('close', onClientDisconnect);
+    interruptSignal?.addEventListener('abort', onInterrupt, { once: true });
 
     function throwScannerError(error) {
       throw new RuntimeFailure(`DSML normalization failed: ${error.message}`, {
@@ -485,24 +540,62 @@ export function createAnthropicRuntime({
         if (read.done) {
           readerDone = true;
           cleanEof = true;
-          processSseEvents(parser.finished());
+        if (!cancelKind) processSseEvents(parser.finished());
           break;
         }
+      if (cancelKind) break;
         clearTimeout(firstByteTimer);
         resetIdle();
         processSseEvents(parser.feed(read.value));
+      }
+      if (cancelKind) {
+        ensureStarted();
+        const persisted = await cancelPersistence.save({
+          id: requestId,
+          createdAt: startedAt,
+          status: 'incomplete',
+          body: {
+            id: requestId,
+            status: 'incomplete',
+            incomplete_details: { reason: 'canceled' },
+            output: visibleText ? [{
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: visibleText }],
+            }] : [],
+          },
+          partial: { content: visibleText },
+        }, {
+          cancelInfo: { reason: cancelKind, phase: 'generation' },
+          partial: { content: visibleText },
+        });
+        cancelPersisted = true;
+        cancelPersistenceResult = persisted;
+        if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
+        write(encoder.cancel({
+          outputTokens: conservativeTokenEstimate(visibleText),
+        }));
+        responseEnded = true;
+        if (res.writable && !res.destroyed && !res.writableEnded) res.end();
+        leaseResult = {
+          ok: false,
+          code: cancelKind === 'backpressure' ? 'BACKPRESSURE_OVERFLOW' : 'ABORTED',
+          error: cancelKind,
+          durationMs: now() - startedAt,
+          meta: { model: body.requestBody.model, usage: {} },
+        };
+        return {
+          ok: false,
+          started: true,
+          canceled: true,
+          kind: cancelKind,
+        };
       }
 
       if (timeoutKind && timeoutKind !== 'finish_grace') {
         throw controller.signal.reason instanceof RuntimeFailure
           ? controller.signal.reason
           : new TimeoutFailure(timeoutKind, `upstream ${timeoutKind} timeout`);
-      }
-      if (timeoutKind === 'client') {
-        throw new RuntimeFailure('client disconnected', {
-          code: 'ABORTED',
-          retryable: false,
-        });
       }
 
       const scannedEnd = scanner.finish();
@@ -602,11 +695,65 @@ export function createAnthropicRuntime({
       };
       return { ok: true };
     } catch (error) {
+      if (cancelKind) {
+        const outputTokens = conservativeTokenEstimate(visibleText);
+        if (stream) ensureStarted();
+        const persisted = await cancelPersistence.save({
+          id: requestId,
+          createdAt: startedAt,
+          status: 'incomplete',
+          body: {
+            id: requestId,
+            status: 'incomplete',
+            incomplete_details: { reason: 'canceled' },
+            output: visibleText ? [{
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: visibleText }],
+            }] : [],
+          },
+          usage: { input_tokens: inputEstimate, output_tokens: outputTokens },
+          partial: { content: visibleText },
+        }, {
+          cancelInfo: { reason: cancelReason || cancelKind, phase: 'generation' },
+          partial: { content: visibleText },
+        });
+        cancelPersisted = true;
+        cancelPersistenceResult = persisted;
+        if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
+        if (stream) {
+          write(encoder?.cancel({ outputTokens }) || []);
+        }
+        if (!responseEnded) {
+          responseEnded = true;
+          if (res.writable === true && !res.destroyed && !res.writableEnded) {
+            try { res.end(); } catch { /* The peer may close during durable persistence. */ }
+          }
+        }
+        leaseResult = {
+          ok: false,
+          code: cancelKind === 'backpressure' ? 'BACKPRESSURE_OVERFLOW' : 'ABORTED',
+          error: cancelKind,
+          durationMs: now() - startedAt,
+          meta: { model: body.requestBody.model, usage: {} },
+        };
+        return {
+          ok: false,
+          started: true,
+          canceled: true,
+          kind: cancelReason || cancelKind,
+        };
+      }
       const failure = error instanceof RuntimeFailure
         ? error
         : new RuntimeFailure(error.message || 'internal error', {
             code: 'INTERNAL_ERROR',
           });
+      if (error instanceof ApiError) {
+        failure.status = error.status;
+        failure.type = error.type;
+        failure.code = error.code;
+      }
       leaseResult = {
         ok: false,
         code: failure.code,
@@ -614,7 +761,7 @@ export function createAnthropicRuntime({
         durationMs: now() - startedAt,
         meta: { model: body.requestBody.model, usage: {} },
       };
-      if (downstreamStarted && stream) {
+      if (downstreamStarted && stream && failure.code !== 'ABORTED') {
         if (!responseEnded) {
           write(encoder.error({ type: failure.type || 'api_error', message: failure.message }));
           responseEnded = true;
@@ -635,11 +782,34 @@ export function createAnthropicRuntime({
         }
       }
       await Promise.allSettled(pendingWrites);
+      if (cancelKind && !cancelPersisted) {
+        const outputTokens = conservativeTokenEstimate(visibleText);
+        await cancelPersistence.save({
+          id: requestId,
+          createdAt: startedAt,
+          status: 'incomplete',
+          body: {
+            id: requestId,
+            status: 'incomplete',
+            incomplete_details: { reason: 'canceled' },
+          output: visibleText ? [{
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: visibleText }],
+          }] : [],
+          },
+          usage: { input_tokens: inputEstimate, output_tokens: outputTokens },
+          partial: { content: visibleText },
+        }, {
+          cancelInfo: { reason: cancelReason || cancelKind, phase: 'generation' },
+          partial: { content: visibleText },
+        });
+      }
       end(account, leaseResult);
     }
   }
 
-  async function messages({ req, res, body, config }) {
+  async function messages({ req, res, body, config, interruptSignal = null }) {
     const normalized = normalizeBody(body, config);
     const pool = poolLoader();
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
@@ -667,6 +837,7 @@ export function createAnthropicRuntime({
         config,
         stream: normalized.stream,
         account: picked.name,
+        interruptSignal,
       });
       if (result.ok || result.started) return result;
       lastFailure = result.error;
@@ -694,6 +865,7 @@ export function createAnthropicRuntime({
   return {
     messages,
     countTokens,
+    cancelStore: cancelPersistence,
   };
 }
 
@@ -721,7 +893,12 @@ export function createOpenAIRuntime({
   end = endTask,
   poolLoader = loadPool,
   now = Date.now,
+  keepaliveMs: injectedKeepaliveMs,
+  softBytes,
+  hardBytes,
+  cancelPersistence = createResponsesStore({ now }),
 } = {}) {
+  const keepaliveMs = effectiveKeepaliveMs(injectedKeepaliveMs);
   async function refreshCredentials(credentials) {
     if (!credentials.refreshToken) return credentials;
     try {
@@ -739,6 +916,7 @@ export function createOpenAIRuntime({
     body,
     config,
     account,
+    interruptSignal = null,
   }) {
     const startedAt = now();
     const inputEstimate = conservativeTokenEstimate(body.body);
@@ -750,8 +928,13 @@ export function createOpenAIRuntime({
     let idleTimer = null;
     let totalTimer = null;
     let timeoutKind = null;
+    let cancelKind = null;
+    let cancelReason = null;
+    let cancelPersisted = false;
+    let cancelPersistenceResult = null;
     let finishReason = null;
     let upstreamId = null;
+    let chatResponseId = `chatcmpl-${randomUUID().replaceAll('-', '')}`;
     let upstreamCreated = null;
     let upstreamUsage = null;
     let sawDone = false;
@@ -761,6 +944,17 @@ export function createOpenAIRuntime({
     let reasoningText = '';
     let refusalText = '';
     const scanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
+    const writer = body.stream
+      ? createHttpEventWriter(res, {
+          protocol: 'openai',
+          softBytes,
+          hardBytes,
+          onOverflow: (error) => terminate('backpressure', error),
+        })
+      : null;
+    let encoder = null;
+    let pingTimer = null;
+    let responseEnded = false;
     let leaseResult = {
       ok: false,
       code: 'ABORTED',
@@ -771,6 +965,8 @@ export function createOpenAIRuntime({
     function terminate(kind, error) {
       if (timeoutKind) return;
       timeoutKind = kind;
+      if (['interrupt', 'client', 'backpressure'].includes(kind)) cancelKind = kind;
+      if (kind === 'client' && !cancelReason) cancelReason = 'network_disconnect';
       const reason = error || new TimeoutFailure(
         kind,
         kind === 'first_byte'
@@ -779,12 +975,16 @@ export function createOpenAIRuntime({
             ? 'upstream stream became idle'
             : 'upstream request exceeded the total timeout',
       );
-      if (reader) pendingWrites.push(Promise.resolve(reader.cancel(reason)).catch(() => {}));
+      if (reader && !readerDone) {
+        readerDone = true;
+        pendingWrites.push(Promise.resolve(reader.cancel(reason)).catch(() => {}));
+      }
       controller.abort(reason);
+      req.unpipe?.(res);
     }
 
     function onClientDisconnect() {
-      if (!res.writableEnded) {
+      if (!cancelKind) {
         terminate('client', new RuntimeFailure('client disconnected', {
           code: 'ABORTED',
           retryable: false,
@@ -796,10 +996,39 @@ export function createOpenAIRuntime({
       onClientDisconnect();
     }
 
+    function onInterrupt() {
+      if (!responseEnded) {
+        terminate('interrupt', new RuntimeFailure('client requested cancellation', {
+          code: 'CANCELED',
+          retryable: false,
+        }));
+      }
+    }
+
     function stopTimers() {
       clearTimeout(firstByteTimer);
       clearTimeout(idleTimer);
       clearTimeout(totalTimer);
+      clearInterval(pingTimer);
+    }
+
+    function emit(events) {
+      if (!writer || responseEnded || !events?.length || writer.failed) return false;
+      return writer.writeEvents(events);
+    }
+
+    function ensureStreamStarted() {
+      if (!body.stream || encoder) return;
+      res.writeHead(200, streamHeaders());
+      res.flushHeaders?.();
+      encoder = createChatEncoder({
+        id: upstreamId || undefined,
+        model: body.model,
+        created: upstreamCreated || Math.floor(now() / 1000),
+      });
+      emit(encoder.start());
+      pingTimer = setInterval(() => emit(encoder.ping()), keepaliveMs);
+      pingTimer.unref?.();
     }
 
     function resetIdle() {
@@ -860,6 +1089,7 @@ export function createOpenAIRuntime({
         );
       }
       upstreamId ||= document.id;
+      if (upstreamId) chatResponseId = upstreamId;
       if (upstreamCreated === null && Number.isFinite(Number(document.created))) {
         upstreamCreated = Number(document.created);
       }
@@ -871,10 +1101,33 @@ export function createOpenAIRuntime({
       const payload = choice.delta || choice.message || {};
       if (typeof payload.reasoning_content === 'string') {
         reasoningText += payload.reasoning_content;
+        if (body.stream) {
+          ensureStreamStarted();
+          emit(encoder.reasoningDelta(payload.reasoning_content));
+        }
       }
       if (typeof payload.refusal === 'string') refusalText += payload.refusal;
       if (Array.isArray(payload.tool_calls)) structured.push(payload.tool_calls);
-      feedContent(payload.content);
+      if (
+        body.stream
+        && Array.isArray(choice.message?.tool_calls)
+      ) {
+        ensureStreamStarted();
+        emit(encoder.toolDelta(choice.message.tool_calls.map((call, index) => ({
+          id: call.id,
+          name: call.function?.name,
+          input: JSON.parse(call.function?.arguments || '{}'),
+          index,
+        }))));
+      }
+      if (payload.content !== undefined) {
+        const before = visibleText.length;
+        ensureStreamStarted();
+        feedContent(payload.content);
+        if (body.stream && visibleText.length > before) {
+          emit(encoder.textDelta(visibleText.slice(before)));
+        }
+      }
     }
 
     async function requestUpstream(credentials) {
@@ -889,7 +1142,8 @@ export function createOpenAIRuntime({
     }
 
     req.once('aborted', onAborted);
-    res.once('close', onClientDisconnect);
+    res.on('close', onClientDisconnect);
+    interruptSignal?.addEventListener('abort', onInterrupt, { once: true });
 
     try {
       let credentials = readCredentials(account, { now: now() });
@@ -935,9 +1189,12 @@ export function createOpenAIRuntime({
           const read = await reader.read();
           if (read.done) {
             readerDone = true;
-            for (const event of parser.finished()) processDocument(event.data);
+            if (!cancelKind) {
+              for (const event of parser.finished()) processDocument(event.data);
+            }
             break;
           }
+          if (cancelKind) break;
           clearTimeout(firstByteTimer);
           resetIdle();
           for (const event of parser.feed(read.value)) {
@@ -960,6 +1217,60 @@ export function createOpenAIRuntime({
         }
       }
 
+      const scannedEnd = scanner.finish();
+      if (scannedEnd.error) scannerError(scannedEnd.error);
+      dsmlCalls.push(...scannedEnd.calls);
+      visibleText += scannedEnd.visibleText;
+      if (cancelKind) {
+        const outputTokens = conservativeTokenEstimate(visibleText);
+        const usage = openAIUsage(upstreamUsage, inputEstimate, outputTokens);
+        const persisted = await cancelPersistence.save({
+          id: chatResponseId,
+          createdAt: startedAt,
+          status: 'incomplete',
+          body: {
+            id: chatResponseId,
+            status: 'incomplete',
+            incomplete_details: { reason: 'canceled' },
+            output: visibleText ? [{
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: visibleText }],
+            }] : [],
+          },
+          usage,
+          partial: { content: visibleText },
+        }, {
+          cancelInfo: { reason: cancelReason || cancelKind, phase: 'generation' },
+          partial: { content: visibleText },
+        });
+        cancelPersisted = true;
+        if (!persisted.ok) debug(`cancel fragment not durable (${persisted.error?.message || 'storage error'})`);
+        if (body.stream) {
+          ensureStreamStarted();
+          emit(encoder.finalize({ finishReason, canceled: true }));
+          if (cancelKind === 'backpressure') {
+            writer.fail(controller.signal.reason);
+          }
+          if (!responseEnded && cancelKind !== 'backpressure') {
+            responseEnded = true;
+            writer.end();
+          }
+        }
+        leaseResult = {
+          ok: false,
+          code: cancelKind === 'backpressure' ? 'BACKPRESSURE_OVERFLOW' : 'ABORTED',
+          error: cancelKind,
+          durationMs: now() - startedAt,
+          meta: { model: body.model, usage: {} },
+        };
+        return {
+          ok: false,
+          started: true,
+          canceled: true,
+          kind: cancelReason || cancelKind,
+        };
+      }
       if (timeoutKind) {
         throw controller.signal.reason instanceof RuntimeFailure
           ? controller.signal.reason
@@ -973,10 +1284,6 @@ export function createOpenAIRuntime({
           });
         }
       }
-      const scannedEnd = scanner.finish();
-      if (scannedEnd.error) scannerError(scannedEnd.error);
-      dsmlCalls.push(...scannedEnd.calls);
-      visibleText += scannedEnd.visibleText;
       const structuredEnd = structured.finish();
       if (
         structuredEnd.invalid.length > 0
@@ -1007,24 +1314,37 @@ export function createOpenAIRuntime({
           tools: arbitration.calls.map((call) => call.input),
         }),
       );
-      const responseBody = toOpenAIResponse({
-        id: upstreamId,
-        created: upstreamCreated,
-        content: visibleText,
-        reasoning: reasoningText,
-        refusal: refusalText,
-        toolCalls: new Map(arbitration.calls.map((call, index) => [
-          index,
-          {
-            id: call.id,
-            name: call.name,
-            arguments: JSON.stringify(call.input),
-          },
-        ])),
-        finishReason,
-        usage,
-      }, body.model, { now });
-      sendJson(res, 200, responseBody);
+      if (body.stream) {
+        ensureStreamStarted();
+        emit(encoder.finalize({
+          calls: arbitration.calls,
+          finishReason,
+          usage,
+        }));
+        if (!responseEnded) {
+          responseEnded = true;
+          writer.end();
+        }
+      } else {
+        const responseBody = toOpenAIResponse({
+          id: upstreamId,
+          created: upstreamCreated,
+          content: visibleText,
+          reasoning: reasoningText,
+          refusal: refusalText,
+          toolCalls: new Map(arbitration.calls.map((call, index) => [
+            index,
+            {
+              id: call.id,
+              name: call.name,
+              arguments: JSON.stringify(call.input),
+            },
+          ])),
+          finishReason,
+          usage,
+        }, body.model, { now });
+        sendJson(res, 200, responseBody);
+      }
 
       leaseResult = {
         ok: true,
@@ -1038,13 +1358,18 @@ export function createOpenAIRuntime({
           },
         },
       };
-      return { ok: true };
+      return body.stream ? { ok: true, started: true } : { ok: true, started: false };
     } catch (error) {
       const failure = error instanceof RuntimeFailure
         ? error
         : new RuntimeFailure(error.message || 'internal error', {
             code: 'INTERNAL_ERROR',
           });
+      if (error instanceof ApiError) {
+        failure.status = error.status;
+        failure.type = error.type;
+        failure.code = error.code;
+      }
       leaseResult = {
         ok: false,
         code: failure.code,
@@ -1052,11 +1377,26 @@ export function createOpenAIRuntime({
         durationMs: now() - startedAt,
         meta: { model: body.model, usage: {} },
       };
+      if (cancelKind) {
+        return {
+          ok: false,
+          started: true,
+          canceled: true,
+          kind: cancelReason || cancelKind,
+        };
+      }
+      if (body.stream && res.headersSent && !responseEnded && failure.code !== 'ABORTED') {
+        emit(encoder?.error(failure));
+        responseEnded = true;
+        writer?.end();
+        return { ok: false, started: true, error: failure };
+      }
       return { ok: false, started: false, error: failure };
     } finally {
       stopTimers();
       req.off('aborted', onAborted);
       res.off('close', onClientDisconnect);
+      interruptSignal?.removeEventListener('abort', onInterrupt);
       if (reader && !readerDone) {
         try {
           await reader.cancel(controller.signal.reason || 'request finished');
@@ -1065,11 +1405,43 @@ export function createOpenAIRuntime({
         }
       }
       await Promise.allSettled(pendingWrites);
+      if (cancelKind && !cancelPersisted) {
+        cancelPersisted = true;
+        const output = visibleText ? [{
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: visibleText }],
+        }] : [];
+        const persisted = await cancelPersistence.save({
+          id: chatResponseId,
+          createdAt: startedAt,
+          status: 'incomplete',
+          body: {
+            id: chatResponseId,
+            status: 'incomplete',
+            incomplete_details: { reason: 'canceled' },
+            output,
+          },
+          partial: { content: visibleText },
+        }, {
+          cancelInfo: { reason: cancelReason || cancelKind, phase: 'generation' },
+          partial: { content: visibleText },
+        });
+        cancelPersisted = true;
+        cancelPersistenceResult = persisted;
+      }
+      if (cancelPersistenceResult?.deadLetterWritten) {
+        warn(`canceled Chat fragment written to dead letter: ${chatResponseId}`);
+      }
       end(account, leaseResult);
     }
   }
 
   async function chat({ req, res, body, config }) {
+    return chatWithCancellation({ req, res, body, config });
+  }
+
+  async function chatWithCancellation({ req, res, body, config, interruptSignal = null }) {
     const normalized = prepareOpenAIRequest(body, {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
@@ -1094,13 +1466,14 @@ export function createOpenAIRuntime({
       debug(`openai api → ${picked.name}（第 ${attempt + 1} 次）`);
       begin(picked.name);
       const result = await executeAttempt({
+        interruptSignal,
         req,
         res,
         body: normalized,
         config,
         account: picked.name,
       });
-      if (result.ok) return result;
+      if (result.ok || result.started) return result;
       lastFailure = result.error;
       if (!result.error?.retryable) break;
     }
@@ -1181,6 +1554,8 @@ export function createOpenAIRuntime({
 
   return {
     chat,
+    chatWithCancellation,
+    cancelStore: cancelPersistence,
     models,
     model,
   };

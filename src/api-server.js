@@ -9,6 +9,7 @@ import {
 } from './api-settings.js';
 import { ApiError, sendApiError } from './api-errors.js';
 import { createAnthropicRuntime, createOpenAIRuntime } from './api-runtime.js';
+import { createResponsesRuntime } from './api-responses.js';
 
 function sendJson(res, status, body) {
   res.writeHead(status, {
@@ -93,6 +94,12 @@ function protocolFor(pathname) {
 }
 
 function routeFor(pathname) {
+  if (pathname === '/v1/responses' || pathname === '/v1/responses/') {
+    return { method: 'POST', operation: 'openai.responses' };
+  }
+  if (/^\/v1\/responses\/[^/]+$/.test(pathname)) {
+    return { method: 'GET', operation: 'openai.response' };
+  }
   if (pathname === '/v1/chat/completions') {
     return { method: 'POST', operation: 'openai.chat' };
   }
@@ -114,6 +121,12 @@ function routeFor(pathname) {
 export async function handleApiRequest({ req, res, url, deps = {} }) {
   const pathname = url.pathname;
   const protocol = protocolFor(pathname);
+  if (pathname === '/v1/responses' || pathname === '/v1/responses/') {
+    const upgrade = String(req.headers.upgrade || '').toLowerCase();
+    if (upgrade === 'websocket') {
+      return false;
+    }
+  }
 
   try {
     const config = getApiSettings();
@@ -132,7 +145,7 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
       return true;
     }
 
-    if (clientKeyRequired(req.socket || req, config) && !verifyApiKey(readClientKey(req))) {
+    if (clientKeyRequired(req, config) && !verifyApiKey(readClientKey(req))) {
       sendApiError(res, new ApiError(401, 'invalid API key', {
         type: 'authentication_error',
         code: 'invalid_api_key',
@@ -157,19 +170,41 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
 
     if (route.operation === 'anthropic.count_tokens') {
       const body = await readBody(req);
-      const runtime = deps.anthropicRuntime || deps.runtime || createAnthropicRuntime(deps);
+      const runtime = deps.anthropicRuntime || deps.runtime || createAnthropicRuntime({
+        ...deps,
+        cancelPersistence: sharedCancelStore(deps),
+      });
       runtime.countTokens({ res, body, config });
       return true;
     }
 
     if (route.operation === 'anthropic.messages') {
       const body = await readBody(req);
-      const runtime = deps.anthropicRuntime || deps.runtime || createAnthropicRuntime(deps);
+      const runtime = deps.anthropicRuntime || deps.runtime || createAnthropicRuntime({
+        ...deps,
+        cancelPersistence: sharedCancelStore(deps),
+      });
       await runtime.messages({ req, res, body, config });
       return true;
     }
 
-    const runtime = deps.openaiRuntime || createOpenAIRuntime(deps);
+    const responses = deps.responsesRuntime || getResponsesRuntime(deps);
+    const runtime = deps.openaiRuntime || createOpenAIRuntime({
+      ...deps,
+      cancelPersistence: responses.store,
+    });
+    if (route.operation === 'openai.responses') {
+      const body = await readBody(req);
+      await responses.create({ req, res, body, config });
+      return true;
+    }
+    if (route.operation === 'openai.response') {
+      sendJson(res, 200, await responses.retrieve({
+        id: decodeURIComponent(pathname.slice('/v1/responses/'.length)),
+        config,
+      }));
+      return true;
+    }
     if (route.operation === 'openai.chat') {
       const body = await readBody(req);
       await runtime.chat({ req, res, body, config });
@@ -203,6 +238,33 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
     );
     return true;
   }
+}
+
+const responsesRuntimes = new WeakMap();
+function sharedCancelStore(deps) {
+  return deps.cancelPersistence || sharedResponsesRuntime(deps).store;
+}
+
+function sharedResponsesRuntime(deps) {
+  if (deps.responsesRuntime) return deps.responsesRuntime;
+  return getResponsesRuntime(deps);
+}
+
+function getResponsesRuntime(deps) {
+  if (!responsesRuntimes.has(deps)) responsesRuntimes.set(deps, createResponsesRuntime(deps));
+  return responsesRuntimes.get(deps);
+}
+
+export function createApiAuthCheck(deps = {}) {
+  return function check(req) {
+    const config = getApiSettings();
+    if (!config.enabled) return { ok: false, status: 404, code: 'api_disabled', message: 'API compatibility is disabled' };
+    if (!config.openai) return { ok: false, status: 404, code: 'protocol_disabled', message: 'OpenAI protocol is disabled' };
+    if (clientKeyRequired(req, config) && !verifyApiKey(readClientKey(req))) {
+      return { ok: false, status: 401, code: 'invalid_api_key', message: 'invalid API key' };
+    }
+    return { ok: true, config, responses: getResponsesRuntime(deps) };
+  };
 }
 
 export async function handleApiSettingsApi(req, res, url) {

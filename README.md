@@ -1,11 +1,13 @@
 # workbuddy-bridge
 
 > 把 WorkBuddy 接成三种标准入口：**MCP 子 Agent**、**Anthropic Messages API** 与
-> **OpenAI Chat Completions API**。
+> **OpenAI Chat Completions / Responses API**。
 >
 > Claude Code / DeepSeek Harness / Codex / Cursor / OpenCode / Windsurf / Gemini CLI / Cline 通用。
 >
-> 扫码登录一次，MCP 任务与 API 请求共享同一套账号池；API 直连 WorkBuddy 上游，不启动 CLI。
+> 扫码登录一次，MCP 任务与 API 请求共享同一套账号池和客户端 Key；API 直连
+> WorkBuddy 上游，不启动 CLI。运行时要求 Node.js `>=22.13`（Responses 持久化使用内置
+> SQLite）。
 
 ![登录页](assets/login-page.png)
 
@@ -21,9 +23,10 @@ Windsurf、Cursor 这些客户端各有各的 MCP 生态，官方没有提供「
 
 1. **MCP**：任意 MCP 客户端通过 `workbuddy_task` 把任务交给 WorkBuddy；这条路径仍用 `codebuddy -p` 执行文件类长任务。
 2. **Anthropic Messages API**：标准 Anthropic SDK / 客户端直接请求 `/v1/messages`，支持真实流式文本、`tool_use` / `tool_result` 和 `count_tokens`；这条路径直接请求 WorkBuddy 上游，不启动 CLI。
-3. **OpenAI Chat Completions API**：OpenAI 兼容客户端请求 `/v1/chat/completions`
-   和 `/v1/models`；当前最小版支持非流式文本和模型目录，并直接请求 WorkBuddy
-   上游，不启动 CLI。流式、tools 与 Responses API 尚未开放。
+3. **OpenAI Chat Completions / Responses API**：兼容客户端可使用
+   `/v1/chat/completions`、`/v1/responses`（HTTP/SSE 与原生 WebSocket）、
+   `/v1/models`；支持流式文本、function 工具、思考提示和 Responses 工具协议，
+   直接请求 WorkBuddy 上游，不启动 CLI。
 
 三个入口共享扫码凭证、多账号隔离、号池调度、并发限制、用量统计和管理界面：
 
@@ -38,7 +41,7 @@ Windsurf、Cursor 这些客户端各有各的 MCP 生态，官方没有提供「
   Claude Code / DeepSeek Harness / Codex / Cursor / OpenCode / Windsurf …
         │                                 Anthropic / OpenAI SDK 与兼容客户端
         │ MCP (stdio / HTTP)                                   │ HTTP
-        │ workbuddy_task / workbuddy_login / …          │ /v1/messages  /v1/chat/completions
+        │ workbuddy_task / workbuddy_login / …   │ /v1/messages  /v1/chat/completions  /v1/responses
         ▼                                                      ▼
   workbuddy-bridge            ← 本项目
         ├── 账号与凭证：~/.workbuddy-bridge/profiles/<name>
@@ -47,6 +50,7 @@ Windsurf、Cursor 这些客户端各有各的 MCP 生态，官方没有提供「
         ├── 管理页：账号、用量、API 开关、客户端 Key
         ├── MCP 执行：codebuddy -p --output-format stream-json
         └── API 执行：协议转换 → 上游 SSE → DSML 清洗 → 标准协议响应
+             取消/背压 → SQLite 或 0600 死信 → 审计和合法终态
                  │                                      │
                  ▼                                      ▼
        codebuddy CLI（仅 MCP / CLI）        WorkBuddy /v2/chat/completions
@@ -108,7 +112,7 @@ wb http --port 7666
 |:--|:--|
 | `POST /v1/messages` | 支持流式 / 非流式文本、图片输入、`tool_use` 和 `tool_result` |
 | `POST /v1/messages/count_tokens` | 本地保守估算，响应带 `estimated:true` 与 `estimator:"wb-conservative-v1"` |
-| `GET /admin` | 独立开关 Anthropic / OpenAI API、生成 / 删除客户端 Key、查看超时与缓冲上限 |
+| `GET /admin` | 独立开关 Anthropic / OpenAI、Responses 持久化与续跑提示，管理客户端 Key |
 
 官方 SDK 示例：
 
@@ -122,7 +126,7 @@ const client = new Anthropic({
 });
 
 const response = await client.messages.create({
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-v4.1-flash',
   max_tokens: 256,
   messages: [{ role: 'user', content: '只回答两个字：收到' }],
 });
@@ -134,7 +138,7 @@ console.log(response.content);
 
 ```js
 const first = await client.messages.create({
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-v4.1-flash',
   max_tokens: 512,
   tools: [{
     name: 'read_file',
@@ -163,7 +167,7 @@ if (toolUse) {
     },
   ];
   await client.messages.create({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     max_tokens: 512,
     tools: [/* 与上一轮相同 */],
     messages,
@@ -185,14 +189,17 @@ if (toolUse) {
 
 `count_tokens` 是确定性本地估算，不是 Anthropic 官方 tokenizer。中英文混合和长上下文可能有明显误差，**不得用于精确计费或裁剪刚好达到上下文上限的请求**；实际请求仍应处理上游的 `context_length_exceeded`。
 
-## OpenAI Chat Completions API（最小适配）
+## OpenAI Chat Completions / Responses API
 
 管理页的 **OpenAI 协议** 开关只控制 OpenAI 路由；默认保持关闭，开启后可通过
-同一端口使用以下接口：
+同一端口使用以下接口（管理页继续提供独立 OpenAI 开关）：
 
 | 方法与路径 | 当前范围 |
 |:--|:--|
-| `POST /v1/chat/completions` | 非流式文本、函数工具调用与多轮 `tool` 续传 |
+| `POST /v1/chat/completions` | 流式 / 非流式文本、图片、function 工具与多轮 `tool` 续传 |
+| `POST /v1/responses` | 非流式 JSON、SSE、`previous_response_id` 续接 |
+| `WS /v1/responses` | 原生 `response.create` / `response.interrupt` 命令 |
+| `GET /v1/responses/:id` | 查询保存的完成或取消片段 |
 | `GET /v1/models` | 优先读取 WorkBuddy 模型目录；不可用时返回带 `wb_source:"fallback"` 的稳定列表 |
 | `GET /v1/models/:id` | 查询目录中的单个模型；未找到返回 `404 model_not_found` |
 
@@ -205,7 +212,7 @@ const client = new OpenAI({
 });
 
 const response = await client.chat.completions.create({
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-v4.1-flash',
   stream: false,
   messages: [{ role: 'user', content: '只回答两个字：收到' }],
 });
@@ -231,7 +238,7 @@ const tools = [{
 }];
 const messages = [{ role: 'user', content: '读取 README.md' }];
 const first = await client.chat.completions.create({
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-v4.1-flash',
   messages,
   tools,
 });
@@ -245,39 +252,71 @@ if (call) {
     content: '客户端执行工具后的文本结果',
   });
   await client.chat.completions.create({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     messages,
     tools,
   });
 }
 ```
 
-这个最小实现具有以下明确约束（管理页 OpenAI 开关默认关闭，开启后生效）：
+OpenAI 与 Anthropic 路由共用客户端 Key，也共用现有号池和扫码登录凭据。管理页 OpenAI
+开关默认关闭，开启后生效；关闭时会同时关闭 Responses 持久化和续跑提示，这两个子开关
+不能单独越过 OpenAI 主开关。协议边界如下：
 
-- `stream: true` 返回 `400 stream_not_supported`；当前不支持 OpenAI SSE。
+> 当前适配目标是主流 SDK 的可互操作子集。Chat 旧的 `functions`、Responses 的
+> `file_id` 与未声明工具类型不会被静默接受，而是返回明确 400。
+
+- Chat `stream: true` 返回标准 SSE：文本立即转发，思考提示透传
+  `reasoning_content`，最后只发送一个合法的 `finish_reason` 和 `[DONE]`。生产环境每
+  15 秒发送不超过 15 秒间隔的 keepalive 空 `choices` chunk，不伪造完成或工具调用。
 - `tools` 支持 OpenAI function 工具；`tool_choice` 支持 `auto` / `none` /
   `required` / 指定函数。历史 assistant `tool_calls` 与 `role:"tool"` 的
   `tool_call_id` 可续传。关闭 API 配置中的工具开关时返回
-  `400 tools_disabled`；旧版 `functions` / `function_call` 与
-  `parallel_tool_calls` 仍返回 `400 tools_not_supported`。
+  `400 tools_disabled`；旧版 `functions` / `function_call` 返回
+  `400 tools_not_supported`。Chat 当前不支持 `parallel_tool_calls`；Responses
+  支持 `parallel_tool_calls:false` 和 `allowed_tools`。
 - 工具声明优先使用上游结构化 `tool_calls`；仅在结构调用无效时使用已有 DSML
   扫描器恢复文本形调用。未声明 tools 时清洗 DSML，不向客户端泄漏标记。
-- 图片等非文本 content part 返回 `400 invalid_request`；当前只接受文本和文本
-  content part。
-- OpenAI 思考型提示返回纯文本时，上游的 `reasoning_content` 会原样透传；这不等同于
-  Responses API 的 reasoning item。当前未开放 OpenAI 的声明式推理配置。
+- Chat 与 Responses 接受 URL 和 data URL 图片；`file_id` 明确返回
+  `400 file_id_not_supported`，不读取或上传文件。
+- Responses 支持 `function`、`custom`、`namespace`、`local_shell`、`shell`、
+  `apply_patch` 工具声明；不支持的工具返回 `400 unsupported_tool_type`。Response
+  的 reasoning 事件来自上游文本，不代表新增了独立的私有推理通道。
 - 上游给出 `finish_reason` 前的无完成原因断流会失败关闭并返回
-  `502 UPSTREAM_TRUNCATED`，不把半截回答伪装成正常完成。
-- `n` 只能为 `1`；`/v1/responses`、Embeddings、Audio、Batch 和 Fine-tuning
-  不在本次范围。
+  `502` / Responses failed 事件，不把半截回答伪装成正常完成。Responses 的
+  `length` 截断返回 `status:"incomplete"`：明确达到 `max_output_tokens` 时原因是
+  `max_output_tokens`，否则是扩展原因 `upstream_length_limit`。
+- Chat 的 `n` 只能为 `1`。Embeddings、Audio、Batch、Fine-tuning 不在本次范围；
+  Responses 的 `file_id`、MCP server/container 等未实现工具类型也明确拒绝。
 - 客户端 Key、协议开关、错误形状沿用共享的 API 兼容层；远程访问仍需配置 Key。
+
+Responses 的持久化和可靠性规则：
+
+- `store:true` 且管理设置开启 `responsesPersistence` 时，完成响应和主动取消/断连的
+  可见片段写入 `node:sqlite` 数据库；最多 256 条、32 MiB、24 小时，内存热缓存最多
+  64 条。`previous_response_id` 续接会按 `call_id` 配对工具历史，并支持内嵌 item 和
+  output 早于 call 的稳定排序。
+- SQLite 事务写入预算 2 秒；数据库失败时才写独立 JSONL 死信，权限固定 `0600`，
+  预写、`response_id` 幂等，进程启动只重试一次，成功保存后原子移除。普通 RST 或
+  WS 断连在 SQLite 成功时不会虚报死信成功。
+- 主动取消先停止上游读取、释放号池租约、持久化片段，成功后才发送协议收尾。Chat 使用
+  合法 `finish_reason:"stop"` + 单一 `[DONE]`；Anthropic 使用
+  `message_delta(stop_reason:"canceled")` + `message_stop`。RST 不伪造成功取消，
+  只保存已经可见的正文；半截工具参数不成为可执行调用，失败和超时也不伪装成取消。
+- SSE 生产 keepalive 为 15 秒；流控软阈值 256 KiB、硬阈值 1 MiB。硬阈值触发时立即
+  取消上游、释放租约并以 `BACKPRESSURE_OVERFLOW` 审计，writer 不保留无限原始事件或
+  已发送正文。
+- Responses WebSocket 同一连接最多持有一条活动生成租约；新 `response.create` 先中断
+  并等待旧租约释放。主动 Close、RST、连接消失和心跳超时走同一个幂等取消路径。
+  服务端协议 Ping 为 15 秒，Pong 宽限 10 秒；超时后先取消上游、释放租约，再关闭传输。
+  测试夹具可用短间隔注入这些阈值，生产固定为 15 秒 / 10 秒。
 
 Anthropic 的 thinking、文档附件、图片形式的 `tool_result` 和流式响应中的工具块
 原位交错暂不支持；遇到不支持的 content block 返回 400。
 
 ## 号池：多账号 + 自动分配负载
 
-v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调度的池子。`workbuddy_task` 不指定 `account` 时默认 `auto`，由调度器挑号；某个号挂了会自动换下一个。v0.3 补了完整用量看板；v0.4 加入 Anthropic API、DSML 安全归一化和共享号池的 API 并发控制；OpenAI Chat Completions 最小适配沿用同一号池与鉴权层。
+v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调度的池子。`workbuddy_task` 不指定 `account` 时默认 `auto`，由调度器挑号；某个号挂了会自动换下一个。v0.3 补了完整用量看板；v0.4 加入 Anthropic API、DSML 安全归一化和共享号池的 API 并发控制；OpenAI Chat Completions 与 Responses 沿用同一号池、鉴权层和持久化取消路径。
 
 ![数据看板](assets/pool-dashboard.png)
 
@@ -351,8 +390,9 @@ wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
 
 **API 兼容区**支持：
 
-- Anthropic API 与 OpenAI Chat Completions 的独立开关；
+- Anthropic API 与 OpenAI Chat Completions / Responses 的独立开关；
 - 两个协议的接口地址与复制；
+- Responses 持久化与续跑提示的独立开关；OpenAI 关闭时二者不可用，持久化关闭时续跑提示不可用；
 - 客户端 Key 生成、全部重置、明文一次性查看 / 复制、掩码列表和删除；
 - 鉴权模式、流空闲超时和 DSML 缓冲上限摘要。
 
@@ -473,7 +513,7 @@ pnpm add @deepseek-ai/dsh-mcp-client@$(dsh --version)
   "prompt": "整理 ./data 下的销售数据，输出 xlsx 和一段结论",  // 必填
   "cwd": "/path/to/project",   // WorkBuddy 读写文件的位置
   "model": "auto",             // auto / hy3 / deepseek-v4-pro …
-  "fallbackModel": "deepseek-v4-flash",  // 主模型限流时自动回退
+  "fallbackModel": "deepseek-v4.1-flash",  // 主模型限流时自动回退
   "timeoutMs": 900000,
   "account": "auto"   // 默认 auto = 号池自动挑；填具体名字则强制用该号，不做故障切换
 }
@@ -525,7 +565,7 @@ wb login --site ioa         # 腾讯内网
   "defaultAccount": "work",
   "defaults": {
     "model": "auto",
-    "fallbackModel": "deepseek-v4-flash",
+    "fallbackModel": "deepseek-v4.1-flash",
     "timeoutMs": 900000,
     "skipPermissions": true
   },
@@ -534,10 +574,12 @@ wb login --site ioa         # 腾讯内网
     "openai": false,
     "anthropic": true,
     "anthropicEnabled": true,
+    "responsesPersistence": true,
+    "responsesNudge": false,
     "requireApiKey": false,
     "remoteRequireKey": true,
     "trustProxy": false,
-    "defaultModel": "deepseek-v4-flash",
+    "defaultModel": "deepseek-v4.1-flash",
     "dsmlMaxBufferBytes": 2097152,
     "firstByteTimeoutMs": 60000,
     "idleTimeoutMs": 120000,
@@ -606,8 +648,21 @@ npm i -g node-pty
 **Anthropic / OpenAI SDK 报 401？**
 回环地址默认免 Key；如果配置了 `requireApiKey=true`、从非回环地址访问，或经过可信反向代理，就需要在 `/admin` 生成 Key，并通过 `x-api-key` / `Authorization: Bearer` 发送。
 
+**原来的 OpenAI 示例为什么还能用？**
+Chat Completions 保持兼容并新增 SSE 与图片；要使用 Responses，可直接把 base URL
+指向 `http://127.0.0.1:7666/v1`，开启管理页的 OpenAI 开关。`previous_response_id`
+只在此前请求带 `store:true` 且持久化开启时生效。
+
+**取消后还能续跑吗？**
+可以。请求带 `store:true` 且 Responses 持久化开启时，取消会保存可见文本片段；用
+`GET /v1/responses/:id` 查询该 `incomplete` 响应，再把它的 ID 作为
+`previous_response_id`。不会保存半截工具参数，也不会把失败或上游超时标成取消。
+
 **流式响应为什么只看到文本，工具块最后才出现？**
 首版优先保证安全裁决：结构化工具调用和 DSML 都要等到上游结束才能确定最终结果。可见文本仍实时输出，`tool_use` 在响应末尾统一追加。
+
+**Responses API 为什么需要 Node.js 22.13 或更高？**
+Responses 的持久化直接使用 Node 内置 `node:sqlite`，不引入原生第三方数据库依赖；低于该版本的环境无法提供所需模块，启动持久化请求时会失败。
 
 ## 开发
 
@@ -620,14 +675,23 @@ npm run test:live
 
 **测试一律用 deepseek，不用 hy4。**
 
-- 离线测试（`npm test`）不真正调用模型；假 CLI 的回包和断言里的模型名固定为 `deepseek-v4-flash`，日志里不会出现 hy4
-- 需要真实链路验证时使用 `test:live`，默认模型固定为 `deepseek-v4-flash`：
+- 离线测试（`npm test`）不真正调用模型；假 CLI 的回包和断言里的模型名固定为 `deepseek-v4.1-flash`，日志里不会出现 hy4
+- 需要真实链路验证时使用 `test:live`，默认模型固定为 `deepseek-v4.1-flash`：
 
 ```bash
 npm run test:live
 ```
 
 它会启动回环 HTTP 服务、使用现有账号池请求真实上游，并额外调用 `count_tokens`；脚本故意选择不存在的 `WB_COMMAND`，以验证 API 路径没有启动 CLI。输出只包含模型、字符数、估算标记和成功状态，不打印 token、客户端 Key、access token 或 refresh token。
+
+慢读和内存上限可单独执行：
+
+```bash
+npm run test:load
+```
+
+该命令测量 `VmRSS`、heap、external、writer 峰值 pending 字节、上游是否被取消和租约
+是否归零；子进程使用有界 V8 semi-space，硬阈值触发后必须确定退出。
 
 也可以让脚本连接已经运行的 bridge：
 
@@ -639,7 +703,12 @@ npm run test:live
 
 hy4 是旗舰模型，单价高、排队久，拿它跑测试既费额度又拖慢反馈。功能联调用 flash 足够；要看复杂推理表现时再手动单独跑，但不要写进测试脚本或 CI。
 
-默认 `npm test` 为离线测试，不联网、不消耗模型额度。旧 bridge 的 54 项和 API 相关测试全部保留；新增覆盖 DSML 字符 / UTF-8 字节切分、2 MiB 熔断、结构化与 DSML 仲裁、Anthropic 请求转换、OpenAI 非流式文本与模型目录、协议错误边界、SSE 双重 JSON 转义、官方 SDK 三轮 `tool_use/tool_result`、401 刷新、429 换号、并发上限、客户端断连、干净 EOF、TCP 中断和四层超时。管理页已做桌面端验收，不包含移动端验收。
+默认 `npm test` 为离线测试，不联网、不消耗模型额度。覆盖 DSML 字符 / UTF-8
+字节切分、2 MiB 熔断、结构化与 DSML 仲裁、Anthropic 请求转换、OpenAI Chat
+流式 / 非流式、Responses HTTP/SSE/WS、模型目录、协议错误边界、SSE 双重 JSON
+转义、官方 SDK 三轮 `tool_use/tool_result`、401 刷新、429 换号、并发上限、
+SQLite 持久化和死信、主动取消、RST、WS Close、TCP 假死、慢读 keepalive、1 MiB
+背压以及四层超时。管理页已做桌面端验收，不包含移动端验收。
 
 真实链路冒烟测试使用官方 OpenAI SDK，并由脚本自动临时开启 OpenAI 开关，结束后恢复原设置：
 
@@ -651,19 +720,25 @@ node test/live/openai-live.mjs --tools
 
 第一条验证普通文本，第二条用需要分步算术分析的提示验证思考型提示返回，第三条
 用官方 SDK 验证真实上游的 `tool_calls` 与下一轮 `tool` 续传。它们均故意将
-`WB_COMMAND` 指向不存在的路径，确认请求不依赖 CLI。离线测试还包含三轮 SDK
-往返和 DSML 恢复；这些能力不包含 OpenAI SSE、Responses API 或 CLI 自身的工具执行。
+`WB_COMMAND` 指向不存在的路径，确认请求不依赖 CLI。离线测试还包含 Chat SSE、
+Responses HTTP/SSE/WS、多步工具、取消持久化、断连和慢读；CLI 自身的工具执行不属于
+API 路径。
 
 ```
 src/
   server.js     MCP 工具定义
-  api-server.js Anthropic / OpenAI 路由、鉴权和 API 管理接口
+  api-server.js Anthropic / OpenAI / Responses 路由、鉴权和 API 管理接口
   api-runtime.js 账号选择、上游流、超时、SSE、协议编码和最终仲裁
+  api-responses.js Responses HTTP/WS、续接、取消、租约与流控
   upstream-client.js WorkBuddy 上游请求与 token 刷新
   auth-store.js 隔离凭证读取与 0600 刷新回写
   protocols/anthropic.js Anthropic 请求转换与 SSE encoder
   protocols/openai.js OpenAI 请求校验、聚合与模型目录映射
+  protocols/responses.js Responses 请求、工具、历史、事件与截断编码
   protocols/normalize.js 协议无关工具归一化出口
+  responses-store.js SQLite 响应存储、内存上限与 0600 死信
+  stream-control.js SSE writer、keepalive、背压与协议收尾
+  websocket.js 原生 WS 帧、Ping/Pong 心跳与连接生命周期
   tool-calls.js DSML 扫描器、结构化 assembler、最终仲裁
   sse.js 任意分块 UTF-8 SSE parser 与 encoder
   login.js      扫码登录状态机
@@ -676,7 +751,7 @@ src/
   transfer.js   凭证导出导入
   install.js    各客户端注册（含 dsh 的 YAML patch 与插件版本对齐）
   admin.js      号池管理界面（单文件、零外部依赖）
-  http.js       登录页 + 管理页 + 号池 API + Anthropic / OpenAI API + Streamable HTTP
+  http.js       登录页 + 管理页 + 号池 API + Anthropic / OpenAI / Responses + WS
 ```
 
 ## 参考与致谢

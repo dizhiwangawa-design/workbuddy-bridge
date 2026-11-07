@@ -39,9 +39,13 @@ export function createSseParser() {
 
   function consumeLines(events, final = false) {
     let newline;
-    while ((newline = textBuffer.indexOf('\n')) >= 0) {
+    while ((newline = textBuffer.search(/\r\n|\n|\r/)) >= 0) {
+      // A network chunk may end between CR and LF. Holding the trailing CR
+      // prevents an empty-line dispatch from clearing the current event name.
+      if (!final && textBuffer[newline] === '\r' && newline === textBuffer.length - 1) break;
+      const separatorLength = textBuffer.startsWith('\r\n', newline) ? 2 : 1;
       let line = textBuffer.slice(0, newline);
-      textBuffer = textBuffer.slice(newline + 1);
+      textBuffer = textBuffer.slice(newline + separatorLength);
       if (line.endsWith('\r')) line = line.slice(0, -1);
       if (line === '') {
         dispatch(events);

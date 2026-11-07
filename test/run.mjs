@@ -3,7 +3,7 @@
  * 零依赖测试：不联网、不真调用模型。
  * 用一个假的 codebuddy 脚本把登录 TUI 完整演一遍。
  *
- * 约定：测试数据里的模型名统一用 deepseek-v4-flash，不要写 hy4。
+ * 约定：测试数据里的模型名统一用 deepseek-v4.1-flash，不要写 hy4。
  * 真实验证也走 deepseek，旗舰模型只用于手动抽查。
  */
 import { spawn } from 'node:child_process';
@@ -693,7 +693,7 @@ await test('endTask 不重复累加缓存 token', () => {
   poolMod.endTask('w3', {
     ok: true,
     durationMs: 1000,
-    meta: { usage: { input_tokens: 10000, output_tokens: 500, cache_read_input_tokens: 8000 }, model: 'deepseek-v4-flash' },
+    meta: { usage: { input_tokens: 10000, output_tokens: 500, cache_read_input_tokens: 8000 }, model: 'deepseek-v4.1-flash' },
   });
   const after = poolMod.loadPool().accounts.w3;
   assertEqual(after.total.tokensIn - before, 10000, 'input 已含缓存，不再叠加');
@@ -707,7 +707,7 @@ await test('模型名从 modelUsage 回退解析（真实 CLI 无顶层 model）
   try {
     const res = await runTask({ prompt: 'hi', account: 'w3', timeoutMs: 30000 });
     assert(res.ok, res.error || '调用失败');
-    assertEqual(res.meta.model, 'deepseek-v4-flash', '应从 modelUsage 的 key 取模型名');
+    assertEqual(res.meta.model, 'deepseek-v4.1-flash', '应从 modelUsage 的 key 取模型名');
   } finally {
     if (prev === undefined) delete process.env.WB_FAKE_MODE;
     else process.env.WB_FAKE_MODE = prev;

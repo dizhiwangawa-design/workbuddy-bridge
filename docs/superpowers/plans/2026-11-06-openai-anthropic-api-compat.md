@@ -32,7 +32,7 @@
 - 当前 `src/pool.js` 已把 `inflight` 保存在进程内 Map，磁盘只保存统计；旧摘要中“`loadPool()` 重置并发”的问题已经不是当前缺陷。
 - 当前登录文件位于 `profiles/<account>/home/.../CodeBuddyExtension/Data/Public/auth/*.info`。
 - 实际 `.info` 顶层包含 `account`、`auth`、`accounts`；`auth` 包含 `accessToken`、`refreshToken`、`expiresAt`、`refreshExpiresAt`、`domain`。
-- 测试模型名统一使用 `deepseek-v4-flash`；旗舰模型只用于人工抽查。
+- 测试模型名统一使用 `deepseek-v4.1-flash`；旗舰模型只用于人工抽查。
 
 ## 数据流和事实来源
 
@@ -574,9 +574,9 @@ test('直连 /v2/chat/completions 并发送 WorkBuddy 请求头', async () => {
       uid: 'uid-a',
       expiresAt: Date.now() + 3600000,
     },
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     body: {
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       stream: false,
       messages: [{ role: 'user', content: 'ping' }],
     },
@@ -585,7 +585,7 @@ test('直连 /v2/chat/completions 并发送 WorkBuddy 请求头', async () => {
   assert.equal(response.status, 200);
   assert.equal(seen.url, '/v2/chat/completions');
   assert.equal(seen.headers.authorization, 'Bearer fixture-access');
-  assert.equal(seen.headers['x-model-id'], 'deepseek-v4-flash');
+  assert.equal(seen.headers['x-model-id'], 'deepseek-v4.1-flash');
   assert.equal(seen.headers['x-user-id'], 'uid-a');
   assert.equal(seen.body.stream, true);
   server.close();
@@ -848,7 +848,7 @@ apiCompat: {
   channelSanitize: true,
   requireApiKey: true,
   upstreamBaseUrl: 'https://copilot.tencent.com',
-  defaultModel: 'deepseek-v4-flash',
+  defaultModel: 'deepseek-v4.1-flash',
   timeoutMs: 900000,
   keys: [],
 },
@@ -1059,7 +1059,7 @@ const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
     authorization: `Bearer ${apiKey}`,
   },
   body: JSON.stringify({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     stream: false,
     messages: [{ role: 'user', content: 'ping' }],
   }),
@@ -1067,7 +1067,7 @@ const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
 const json = await response.json();
 assert.equal(response.status, 200);
 assert.equal(json.object, 'chat.completion');
-assert.equal(json.model, 'deepseek-v4-flash');
+assert.equal(json.model, 'deepseek-v4.1-flash');
 assert.equal(json.choices[0].message.content, 'pong');
 assert.equal(json.usage.prompt_tokens, 3);
 
@@ -1075,12 +1075,12 @@ const models = await (await fetch(`http://127.0.0.1:${port}/v1/models`, {
   headers: { authorization: `Bearer ${apiKey}` },
 })).json();
 assert.equal(models.object, 'list');
-assert(models.data.some((model) => model.id === 'deepseek-v4-flash'));
+assert(models.data.some((model) => model.id === 'deepseek-v4.1-flash'));
 const one = await (await fetch(
-  `http://127.0.0.1:${port}/v1/models/deepseek-v4-flash`,
+  `http://127.0.0.1:${port}/v1/models/deepseek-v4.1-flash`,
   { headers: { authorization: `Bearer ${apiKey}` } },
 )).json();
-assert.equal(one.id, 'deepseek-v4-flash');
+assert.equal(one.id, 'deepseek-v4.1-flash');
 ```
 
 假上游返回：
@@ -1256,7 +1256,7 @@ OpenAI 形状的 404 `model_not_found`。
   "object": "list",
   "data": [
     {"id":"auto","object":"model","created":0,"owned_by":"workbuddy"},
-    {"id":"deepseek-v4-flash","object":"model","created":0,"owned_by":"workbuddy"},
+    {"id":"deepseek-v4.1-flash","object":"model","created":0,"owned_by":"workbuddy"},
     {"id":"hy3","object":"model","created":0,"owned_by":"workbuddy"}
   ]
 }
@@ -1325,7 +1325,7 @@ OpenAI 400/404，不得误报为已支持。
 const url = `http://127.0.0.1:${bridge.port}/v1/chat/completions`;
 const headers = { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` };
 const body = JSON.stringify({
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-v4.1-flash',
   stream: true,
   messages: [{ role: 'user', content: 'ping' }],
 });
@@ -1677,7 +1677,7 @@ const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
   method: 'POST',
   headers: { 'content-type': 'application/json', 'x-api-key': apiKey },
   body: JSON.stringify({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     max_tokens: 128,
     system: [{ type: 'text', text: 'Be concise.' }],
     messages: [{ role: 'user', content: 'ping' }],
@@ -1696,7 +1696,7 @@ assert.equal(json.usage.input_tokens, 3);
 
 ```js
 const imageBody = {
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-v4.1-flash',
   max_tokens: 32,
   messages: [{
     role: 'user',
@@ -1722,7 +1722,7 @@ assert.equal(
 const count = await fetch(`http://127.0.0.1:${port}/v1/messages/count_tokens`, {
   method: 'POST',
   headers: { 'content-type': 'application/json', 'x-api-key': apiKey },
-  body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hello world' }] }),
+  body: JSON.stringify({ model: 'deepseek-v4.1-flash', messages: [{ role: 'user', content: 'hello world' }] }),
 });
 assert.ok((await count.json()).input_tokens > 0);
 ```
@@ -1960,7 +1960,7 @@ Expected: PASS。
 
 ```js
 {
-  model: 'deepseek-v4-flash',
+  model: 'deepseek-v4.1-flash',
   max_tokens: 128,
   tools: [{
     name: 'get_weather',
@@ -2291,7 +2291,7 @@ test('429 后换号并记录冷却与成功统计', async () => {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       stream: false,
       messages: [{ role: 'user', content: 'ping' }],
     }),
@@ -2328,7 +2328,7 @@ test('流式首帧后失败不重放第二个账号', async () => {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       stream: true,
       messages: [{ role: 'user', content: 'ping' }],
     }),
@@ -2364,7 +2364,7 @@ test('流式首帧前 5xx 会换号', async () => {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       stream: true,
       messages: [{ role: 'user', content: 'ping' }],
     }),
@@ -2664,7 +2664,7 @@ api('/api/api-compat/keys', {
 });
 ```
 
-连接测试只调用一个最小非流式请求，使用 `deepseek-v4-flash`，结果只显示 `ok`、耗时、账号名和错误码，不显示 prompt 或 token。
+连接测试只调用一个最小非流式请求，使用 `deepseek-v4.1-flash`，结果只显示 `ok`、耗时、账号名和错误码，不显示 prompt 或 token。
 
 - [ ] **Step 4: 浏览器验收**
 
@@ -2724,7 +2724,7 @@ README 必须包含：
 2. OpenAI SDK 的 `base_url` 和 Anthropic SDK 的 `base_url`。
 3. 不经过 CLI 的架构图。
 4. 支持与不支持矩阵。
-5. `deepseek-v4-flash` 自动测试约定。
+5. `deepseek-v4.1-flash` 自动测试约定。
 6. 本地假上游测试命令。
 7. 401、429、无可用账号、工具调用和流断开的排障。
 8. 安全警告：监听 `0.0.0.0` 时必须启用 API Key 和 TLS 反向代理。
@@ -2745,7 +2745,7 @@ OpenAI 非流式：
 curl http://127.0.0.1:7666/v1/chat/completions \
   -H "Authorization: Bearer $WB_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"只回复 ok"}],"stream":false}'
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"只回复 ok"}],"stream":false}'
 ```
 
 OpenAI 流式：
@@ -2754,7 +2754,7 @@ OpenAI 流式：
 curl -N http://127.0.0.1:7666/v1/chat/completions \
   -H "Authorization: Bearer $WB_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"数到 3"}],"stream":true}'
+  -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"数到 3"}],"stream":true}'
 ```
 
 Anthropic 非流式：
@@ -2764,7 +2764,7 @@ curl http://127.0.0.1:7666/v1/messages \
   -H "x-api-key: $WB_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"只回复 ok"}]}'
+  -d '{"model":"deepseek-v4.1-flash","max_tokens":64,"messages":[{"role":"user","content":"只回复 ok"}]}'
 ```
 
 Anthropic 工具：
@@ -2774,7 +2774,7 @@ curl http://127.0.0.1:7666/v1/messages \
   -H "x-api-key: $WB_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v4-flash","max_tokens":128,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"messages":[{"role":"user","content":"北京天气"}]}'
+  -d '{"model":"deepseek-v4.1-flash","max_tokens":128,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"messages":[{"role":"user","content":"北京天气"}]}'
 ```
 
 有官方 SDK 的验收环境再运行：
@@ -2791,7 +2791,7 @@ openai_client = OpenAI(
     api_key=key,
 )
 assert openai_client.chat.completions.create(
-    model="deepseek-v4-flash",
+    model="deepseek-v4.1-flash",
     messages=[{"role": "user", "content": "只回复 ok"}],
 ).choices[0].message.content
 
@@ -2800,7 +2800,7 @@ anthropic_client = Anthropic(
     api_key=key,
 )
 assert anthropic_client.messages.create(
-    model="deepseek-v4-flash",
+    model="deepseek-v4.1-flash",
     max_tokens=64,
     messages=[{"role": "user", "content": "只回复 ok"}],
 ).content[0].text
@@ -2827,7 +2827,7 @@ Expected:
 
 只有用户明确批准消耗账号额度后执行：
 
-1. 使用 `deepseek-v4-flash` 对 `awa` 和 `default` 各发一条最短文本。
+1. 使用 `deepseek-v4.1-flash` 对 `awa` 和 `default` 各发一条最短文本。
 2. 各发一条流式文本。
 3. 各发一次 `get_weather` 类无副作用工具调用。
 4. 人工检查管理页并发数、延迟、token 和冷却。
@@ -2890,3 +2890,99 @@ Expected:
 - 需要修改现有号池事实来源或启动第二套账号状态。
 - 必须复制 GPL 源文件才能继续。
 - 迁移真实账号时会覆盖或删除现有 `.info`。
+
+---
+
+## 2026-11-07 增量规格（绑定）
+
+本节覆盖前文“不支持 Responses API”“取消后不再写合法收尾”等旧描述。实现必须继续
+复用现有号池与共享登录凭据，保持版本 `0.4.0`，不 tag、不推送。
+
+### Task 14: 修复鉴权回归与有界慢读
+
+**Files:**
+- Modify: `src/api-server.js`
+- Modify: `src/http.js`
+- Modify: `src/stream-control.js`
+- Modify: `test/api/settings.test.mjs`
+- Modify: `test/api/stream-control.test.mjs`
+- Modify: `test/api/slow-reader.test.mjs`
+- Modify: `test/load/slow-reader.mjs`
+
+- [x] 恢复真实客户端鉴权：OpenAI `Authorization: Bearer`、Anthropic
+  `x-api-key`、Responses HTTP 与 WebSocket upgrade 共用同一套 Key 校验。
+- [x] 移除 `if (false)` 占位；缺失或错误 Key 必须返回协议对应的 401。
+- [x] 写入器在调用 `res.write()` 前检查
+  `writableLength + pendingBytes + nextBytes`，超过 1 MiB 硬阈值时不得继续接受
+  新数据；健康慢读和 256 KiB 软阈值记录仍保留。
+- [x] 慢读压测必须证明上游在 1 MiB 量级被取消、租约归零、审计为
+  `BACKPRESSURE_OVERFLOW`、子进程峰值 RSS 小于 160 MiB、子进程确定性退出。
+  测试子进程显式设置 `--max-semi-space-size=8`；Node 24 默认会按宿主资源预留较大
+  young generation，该测试参数不改生产运行时。
+- [x] 新增 WS 无 Key/错误 Key 的 401 测试。
+
+**验收:**
+
+- `node test/api/settings.test.mjs` 全部通过。
+- `node test/api/stream-control.test.mjs` 与 `node test/api/slow-reader.test.mjs`
+  全部通过。
+- 不读取、打印或提交任何 token、refresh token、客户端 Key。
+
+### Task 15: 取消、断连与截断语义回归
+
+**Files:**
+- Modify: `src/api-runtime.js`
+- Modify: `test/api/openai.test.mjs`
+- Modify: `test/api/anthropic-http.test.mjs`
+- Modify: `test/api/disconnect-resilience.test.mjs`
+
+- [x] Chat HTTP RST 保存可见正文一次；主动取消在持久化成功后发送注释、
+  `finish_reason:"stop"` 和 `[DONE]`。
+- [x] Anthropic 主动取消在持久化成功后发送合法
+  `message_delta(stop_reason:"canceled")` + `message_stop`；RST 不伪造成功取消。
+- [x] 半截工具参数不得成为可执行 tool call；失败和上游超时不报告成功取消。
+- [x] 重命名没有实际取消步骤却声称测试取消的用例，或补上真实取消步骤。
+- [x] 覆盖重复 Close/Pong/取消只释放一次租约。
+
+**验收:**
+
+- `node test/api/openai.test.mjs`
+- `node test/api/anthropic-http.test.mjs`
+- `node test/api/disconnect-resilience.test.mjs`
+
+### Task 16: Responses API 完整验收
+
+**Files:**
+- Modify: `src/protocols/responses.js`
+- Modify: `src/api-responses.js`
+- Modify: `test/api/responses.test.mjs`
+- Modify: `test/api/disconnect-resilience.test.mjs`
+
+- [x] 验证 `previous_response_id` 续接、`GET /v1/responses/:id`、取消片段查询。
+- [x] 覆盖 `max_output_tokens` 与 `upstream_length_limit` 两种截断原因。
+- [x] 覆盖 `parallel_tool_calls:false`、`allowed_tools`、function/custom/namespace、
+  `local_shell`、`shell`、`apply_patch`、URL/data URL 图片。
+- [x] 覆盖内嵌 item、output 早于 call、超长 namespace 哈希去歧义、不支持工具的
+  `400 unsupported_tool_type` 与 `file_id` 拒绝。
+- [x] 覆盖 WS `response.interrupt`，以及新 `response.create` 前取消并等待旧租约。
+- [x] HTTP/SSE 事件 `sequence_number` 单调，`output_item.done` 与 completed output
+  身份一致。
+
+**验收:**
+
+- `node test/api/responses.test.mjs` 全部通过。
+- 相关断连与租约用例全部通过。
+
+### Task 17: 管理页、文档与最终验收
+
+**Files:**
+- Modify: `src/admin.js`
+- Modify: `README.md`
+- Modify: `docs/superpowers/plans/2026-11-06-openai-anthropic-api-compat.md`
+- Modify: `package.json`
+
+- [x] 管理页验证 OpenAI 独立开关；OpenAI 关闭时 Responses 持久化与续跑提示不可用。
+- [x] 文档统一说明 Chat/Responses HTTP/WS、SQLite 与 0600 死信、取消审计、
+  15 秒 keepalive、RST/Close/假死、256 KiB/1 MiB 背压、`upstream_length_limit`
+  和 `deepseek-v4.1-flash`。
+- [x] 运行聚焦测试、`npm test`、`git diff --check`，确认版本 `0.4.0` 后本地提交。

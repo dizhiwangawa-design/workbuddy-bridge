@@ -10,7 +10,13 @@ import { buildStats, RANGES } from './stats.js';
 import { BRIDGE_HOME } from './paths.js';
 import { ensureAccount, removeAccount } from './accounts.js';
 import { info, warn } from './log.js';
-import { handleApiRequest, handleApiSettingsApi } from './api-server.js';
+import { createApiAuthCheck, handleApiRequest, handleApiSettingsApi } from './api-server.js';
+import {
+  WS_PING_MS,
+  WS_PONG_GRACE_MS,
+  assertHandshake,
+  createWebSocketTransport,
+} from './websocket.js';
 
 /** 登录页：手机上打开就能看到二维码，扫完自动跳状态。 */
 function page(sessionId, initial, embed = false) {
@@ -148,7 +154,9 @@ export async function startHttpServer({
   apiDeps = {},
 } = {}) {
   const transports = new Map();
-
+  const activeSockets = new Set();
+  const activeWebSockets = new Set();
+  // Persistence belongs to this server instance, not the process. This keeps
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const p = url.pathname;
@@ -164,8 +172,7 @@ export async function startHttpServer({
       }
 
       if (p.startsWith('/v1/')) {
-        await handleApiRequest({ req, res, url, deps: apiDeps });
-        return;
+        if (await handleApiRequest({ req, res, url, deps: apiDeps })) return;
       }
 
       if (p === '/api/api-compat' || p.startsWith('/api/api-compat/')) {
@@ -241,16 +248,127 @@ export async function startHttpServer({
     }
   });
 
+  server.on('connection', (socket) => {
+    activeSockets.add(socket);
+    socket.once('close', () => activeSockets.delete(socket));
+  });
+
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, host, resolve);
+  });
+  // Applied to every accepted TCP session, including the WebSocket upgrade.
+  server.prependListener('connection', (socket) => {
+    if (typeof socket.setNoDelay === 'function') socket.setNoDelay(true);
+  });
+
+  server.on('upgrade', (req, socket, head) => {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    if (url.pathname !== '/v1/responses' && url.pathname !== '/v1/responses/') {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    let result;
+    try {
+      const auth = createApiAuthCheck(apiDeps)(req);
+      if (!auth.ok) {
+        socket.write(`HTTP/1.1 ${auth.status} ${auth.status === 401 ? 'Unauthorized' : 'Not Found'}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+        socket.destroy();
+        return;
+      }
+      const accept = assertHandshake(req);
+      socket.write([
+        'HTTP/1.1 101 Switching Protocols',
+        'Upgrade: websocket',
+        'Connection: Upgrade',
+        `Sec-WebSocket-Accept: ${accept}`,
+        '',
+        '',
+      ].join('\r\n'));
+      result = auth;
+    } catch {
+      socket.destroy();
+      return;
+    }
+    let session;
+    const ws = createWebSocketTransport(socket, {
+      observer: true,
+      // Responses owns an upstream account lease while a generation is active.
+      // Production always requires peer liveness; fixtures may only shorten
+      // the intervals so CI does not wait for the 15s/10s defaults.
+      requireClientPong: true,
+      pingMs: apiDeps.wsPingMs ?? WS_PING_MS,
+      pongGraceMs: apiDeps.wsPongGraceMs ?? WS_PONG_GRACE_MS,
+      onMessage(message) {
+        if (message?.type === 'response.interrupt') {
+          session?.interrupt();
+          return;
+        }
+        if (message?.type === 'response.create' || message?.type === 'create') {
+          session?.create(message);
+          return;
+        }
+        ws.send({
+          type: 'error',
+          error: { code: 'unsupported_command', message: 'expected response.create or response.interrupt' },
+        });
+      },
+      onClose(info) {
+        session?.close();
+        activeWebSockets.delete(ws);
+        warn(`Responses WebSocket closed: ${info.kind}`);
+      },
+    });
+    activeWebSockets.add(ws);
+    session = result.responses.wsSession({
+      ws,
+      send: (message) => ws.send(message),
+      config: result.config,
+    });
+    if (head?.length) socket.emit('data', head);
   });
 
   const actual = server.address().port;
   info(`登录页：http://${host === '0.0.0.0' ? 'localhost' : host}:${actual}/login`);
   if (mcp) info(`MCP over HTTP：http://${host}:${actual}/mcp`);
 
-  return { server, port: actual, close: () => new Promise((r) => server.close(r)) };
+  return {
+    server,
+    port: actual,
+    sockets: activeSockets,
+    waitForConnections: (predicate = (items) => items.length === 0, timeoutMs = 3000) => (
+      waitForConnections(activeSockets, predicate, timeoutMs)
+    ),
+    close: ({ graceMs = 3000 } = {}) => closeServer({
+      server,
+      sockets: activeSockets,
+      graceMs,
+      webSockets: activeWebSockets,
+    }),
+  };
+}
+
+async function waitForConnections(sockets, predicate, timeoutMs = 3000, intervalMs = 10) {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (!predicate([...sockets])) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return true;
+}
+
+async function closeServer({ server, sockets, webSockets, graceMs }) {
+  for (const ws of webSockets) ws.close(1001, 'server shutting down');
+  let closeError = null;
+  server.close((error) => {
+    closeError = error;
+  });
+  await waitForConnections(sockets, (items) => items.length === 0, graceMs);
+  for (const socket of sockets) socket.destroy();
+  for (const ws of webSockets) ws.terminate();
+  await waitForConnections(sockets, (items) => items.length === 0, Math.min(500, graceMs));
+  if (closeError) throw closeError;
 }
 
 /** 号池 REST 接口。返回 true 表示已处理，false 交给后续路由。 */

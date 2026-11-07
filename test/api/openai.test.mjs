@@ -5,6 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
+import net from 'node:net';
 import {
   aggregateOpenAI,
   mapModelCatalogue,
@@ -21,6 +22,8 @@ const pool = await import('../../src/pool.js');
 const settings = await import('../../src/api-settings.js');
 const { startHttpServer } = await import('../../src/http.js');
 const { createUpstreamClient } = await import('../../src/upstream-client.js');
+const { createOpenAIRuntime } = await import('../../src/api-runtime.js');
+const { createResponsesStore } = await import('../../src/responses-store.js');
 
 function createAccount(name) {
   accounts.ensureAccount(name);
@@ -38,7 +41,7 @@ function createAccount(name) {
   pool.updateAccount(name, { enabled: true, maxConcurrency: 1 });
 }
 
-async function startFixture(t, upstreamHandler) {
+async function startFixture(t, upstreamHandler, overrides = {}) {
   const currentPool = pool.loadPool();
   for (const name of Object.keys(currentPool.accounts)) {
     if (name !== 'openai-a') pool.updateAccount(name, { enabled: false });
@@ -53,25 +56,31 @@ async function startFixture(t, upstreamHandler) {
     enabled: true,
     openai: true,
     anthropic: false,
-    streaming: false,
+    streaming: true,
     tools: true,
     requireApiKey: false,
     remoteRequireKey: false,
     trustProxy: false,
-    defaultModel: 'deepseek-v4-flash',
+    defaultModel: 'deepseek-v4.1-flash',
     firstByteTimeoutMs: 2000,
     idleTimeoutMs: 3000,
     finishGraceMs: 100,
     totalTimeoutMs: 5000,
+    ...overrides,
   });
 
   const upstreamClient = createUpstreamClient({
     baseUrl: `http://127.0.0.1:${upstreamServer.address().port}`,
   });
+  const store = overrides.cancelStore || createResponsesStore({
+    directory: path.join(tmp, `openai-cancel-${Date.now()}-${Math.random()}`),
+  });
+  const apiDeps = { upstreamClient, cancelPersistence: store };
+  delete overrides.cancelStore;
   const bridge = await startHttpServer({
     port: 0,
     host: '127.0.0.1',
-    apiDeps: { upstreamClient },
+    apiDeps,
   });
 
   t.after(async () => {
@@ -79,16 +88,82 @@ async function startFixture(t, upstreamHandler) {
     upstreamServer.closeAllConnections?.();
     await new Promise((resolve) => upstreamServer.close(resolve));
   });
-  return { baseUrl: `http://127.0.0.1:${bridge.port}` };
+  return { baseUrl: `http://127.0.0.1:${bridge.port}`, store, upstreamServer };
+}
+
+function parseSse(raw) {
+  const events = [];
+  for (const block of raw.split('\n\n')) {
+    const data = block.split('\n').find((line) => line.startsWith('data: '));
+    if (!data) continue;
+    try {
+      events.push(JSON.parse(data.slice(6)));
+    } catch {
+      // [DONE] and comments are not JSON events.
+    }
+  }
+  return events;
 }
 
 function inflight(name) {
   return pool.poolView().accounts.find((item) => item.name === name)?.inflight;
 }
 
+async function waitFor(predicate, timeout = 2000) {
+  const deadline = Date.now() + timeout;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('condition did not become true');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function sendKernelRst(url, body) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const socket = net.createConnection({
+      host: parsed.hostname,
+      port: Number(parsed.port),
+    });
+    const raw = JSON.stringify(body);
+    let bytes = '';
+    let settled = false;
+    function finish() {
+      if (settled) return;
+      settled = true;
+      resolve(bytes);
+    }
+    socket.once('connect', () => {
+      socket.write(
+        `POST ${parsed.pathname} HTTP/1.1\r\nHost: ${parsed.host}\r\n`
+        + 'Content-Type: application/json\r\nConnection: keep-alive\r\n'
+        + `Content-Length: ${Buffer.byteLength(raw)}\r\n\r\n${raw}`,
+      );
+    });
+    socket.on('data', (chunk) => {
+      bytes += chunk.toString('utf8');
+      if (bytes.includes('visible partial') && socket.resetAndDestroy) {
+        socket.resetAndDestroy();
+        finish();
+      }
+    });
+    socket.once('error', (error) => {
+      if (!settled) {
+        socket.destroy();
+        reject(error);
+      }
+    });
+    setTimeout(() => {
+      if (!settled) {
+        socket.resetAndDestroy?.();
+        finish();
+      }
+    }, 3000).unref();
+  });
+}
+
 test('OpenAI 请求转换为上游流式请求并保留文本消息', () => {
   const input = {
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     stream: false,
     stream_options: { include_usage: true },
     messages: [
@@ -107,7 +182,7 @@ test('OpenAI 请求转换为上游流式请求并保留文本消息', () => {
     defaultModel: 'fallback-model',
   });
 
-  assert.equal(prepared.body.model, 'deepseek-v4-flash');
+  assert.equal(prepared.body.model, 'deepseek-v4.1-flash');
   assert.equal(prepared.body.stream, true);
   assert.equal('stream_options' in prepared.body, false);
   assert.equal(prepared.body.messages[0].role, 'developer');
@@ -150,11 +225,12 @@ test('OpenAI tools、tool_choice 与历史 tool 往返可转换为上游格式',
   assert.equal(prepared.toolsDeclared, true);
 });
 
-test('OpenAI 最小适配明确拒绝流式、关闭的工具开关和非文本内容', () => {
-  assert.throws(() => prepareOpenAIRequest({
+test('OpenAI 请求接受 SSE 与图片，并明确拒绝关闭的工具和 file_id', () => {
+  const streaming = prepareOpenAIRequest({
     messages: [{ role: 'user', content: 'ping' }],
     stream: true,
-  }), (error) => error.status === 400 && error.code === 'stream_not_supported');
+  });
+  assert.equal(streaming.body.stream, true);
 
   assert.throws(() => prepareOpenAIRequest({
     messages: [{ role: 'user', content: 'ping' }],
@@ -182,12 +258,19 @@ test('OpenAI 最小适配明确拒绝流式、关闭的工具开关和非文本�
     }), (error) => error.status === 400 && error.code === 'invalid_request');
   }
 
-  assert.throws(() => prepareOpenAIRequest({
+  const image = prepareOpenAIRequest({
     messages: [{
       role: 'user',
       content: [{ type: 'image_url', image_url: { url: 'https://example.test/x.png' } }],
     }],
-  }), (error) => error.status === 400 && /text/.test(error.message));
+  });
+  assert.equal(image.body.messages[0].content[0].type, 'image_url');
+  assert.throws(() => prepareOpenAIRequest({
+    messages: [{
+      role: 'user',
+      content: [{ type: 'image_url', file_id: 'file_1' }],
+    }],
+  }), (error) => error.code === 'file_id_not_supported');
 });
 
 test('OpenAI SSE 聚合生成标准非流式响应', async () => {
@@ -201,14 +284,14 @@ test('OpenAI SSE 聚合生成标准非流式响应', async () => {
     '{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}',
     '[DONE]',
   ]);
-  const response = toOpenAIResponse(aggregate, 'deepseek-v4-flash', {
+  const response = toOpenAIResponse(aggregate, 'deepseek-v4.1-flash', {
     now: () => 456,
   });
 
   assert.equal(response.id, 'up-1');
   assert.equal(response.object, 'chat.completion');
   assert.equal(response.created, 123);
-  assert.equal(response.model, 'deepseek-v4-flash');
+  assert.equal(response.model, 'deepseek-v4.1-flash');
   assert.equal(response.choices[0].message.content, 'pong');
   assert.equal(response.choices[0].message.reasoning_content, 'think');
   assert.equal(response.choices[0].finish_reason, 'stop');
@@ -223,14 +306,14 @@ test('OpenAI 响应保留 length 与 refusal 完成原因', async () => {
   const truncated = toOpenAIResponse({
     content: 'partial',
     finishReason: 'length',
-  }, 'deepseek-v4-flash');
+  }, 'deepseek-v4.1-flash');
   assert.equal(truncated.choices[0].finish_reason, 'length');
 
   const refused = toOpenAIResponse({
     content: '',
     refusal: '无法处理',
     finishReason: 'content_filter',
-  }, 'deepseek-v4-flash');
+  }, 'deepseek-v4.1-flash');
   assert.equal(refused.choices[0].message.refusal, '无法处理');
   assert.equal(refused.choices[0].finish_reason, 'content_filter');
 });
@@ -254,9 +337,9 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
   }]);
 
   const fallback = mapModelCatalogue(null, {
-    defaultModel: 'deepseek-v4-flash',
+    defaultModel: 'deepseek-v4.1-flash',
   });
-  assert(fallback.some((model) => model.id === 'deepseek-v4-flash'));
+  assert(fallback.some((model) => model.id === 'deepseek-v4.1-flash'));
   assert(fallback.every((model) => model.wb_source === 'fallback'));
 });
 
@@ -268,7 +351,7 @@ test('POST /v1/chat/completions 返回文本、usage 并释放号池租约', asy
       res.end(JSON.stringify({
         data: {
           models: [{
-            id: 'deepseek-v4-flash',
+            id: 'deepseek-v4.1-flash',
             name: 'DeepSeek V4 Flash',
             maxInputTokens: 128000,
             maxOutputTokens: 8192,
@@ -278,10 +361,14 @@ test('POST /v1/chat/completions 返回文本、usage 并释放号池租约', asy
       return;
     }
 
-    let raw = '';
-    for await (const chunk of req) raw += chunk;
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    await once(req, 'end');
+    const raw = Buffer.concat(chunks).toString();
     received = JSON.parse(raw);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.flushHeaders();
+    await new Promise((resolve) => setTimeout(resolve, 20));
     res.write('data: {"id":"cmb-1","created":1,"choices":[{"delta":{"content":"po"}}]}\n\n');
     res.write('data: {"choices":[{"delta":{"content":"ng","reasoning_content":"think"}}]}\n\n');
     res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}\n\n');
@@ -292,7 +379,7 @@ test('POST /v1/chat/completions 返回文本、usage 并释放号池租约', asy
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       stream: false,
       messages: [{ role: 'user', content: 'ping' }],
     }),
@@ -300,10 +387,10 @@ test('POST /v1/chat/completions 返回文本、usage 并释放号池租约', asy
   assert.equal(response.status, 200);
   const json = await response.json();
   assert.equal(received.stream, true);
-  assert.equal(received.model, 'deepseek-v4-flash');
+  assert.equal(received.model, 'deepseek-v4.1-flash');
   assert.equal(json.object, 'chat.completion');
   assert.equal(json.id, 'cmb-1');
-  assert.equal(json.model, 'deepseek-v4-flash');
+  assert.equal(json.model, 'deepseek-v4.1-flash');
   assert.equal(json.choices[0].message.role, 'assistant');
   assert.equal(json.choices[0].message.content, 'pong');
   assert.equal(json.choices[0].message.reasoning_content, 'think');
@@ -317,12 +404,12 @@ test('POST /v1/chat/completions 返回文本、usage 并释放号池租约', asy
 
   const models = await (await fetch(`${baseUrl}/v1/models`)).json();
   assert.equal(models.object, 'list');
-  assert.equal(models.data[0].id, 'deepseek-v4-flash');
+  assert.equal(models.data[0].id, 'deepseek-v4.1-flash');
   assert.equal(models.data[0].name, 'DeepSeek V4 Flash');
 
-  const one = await fetch(`${baseUrl}/v1/models/deepseek-v4-flash`);
+  const one = await fetch(`${baseUrl}/v1/models/deepseek-v4.1-flash`);
   assert.equal(one.status, 200);
-  assert.equal((await one.json()).id, 'deepseek-v4-flash');
+  assert.equal((await one.json()).id, 'deepseek-v4.1-flash');
   assert.equal(inflight('openai-a'), 0);
 });
 
@@ -335,7 +422,7 @@ test('模型目录不可用时返回 fallback，未知模型返回 OpenAI 404', 
   const modelsResponse = await fetch(`${baseUrl}/v1/models`);
   assert.equal(modelsResponse.status, 200);
   const models = await modelsResponse.json();
-  assert(models.data.some((model) => model.id === 'deepseek-v4-flash'));
+  assert(models.data.some((model) => model.id === 'deepseek-v4.1-flash'));
   assert(models.data.every((model) => model.wb_source === 'fallback'));
 
   const missing = await fetch(`${baseUrl}/v1/models/not-found`);
@@ -344,7 +431,7 @@ test('模型目录不可用时返回 fallback，未知模型返回 OpenAI 404', 
   assert.equal(body.error.code, 'model_not_found');
 });
 
-test('OpenAI 不支持项使用 OpenAI 错误形状', async (t) => {
+test('OpenAI 上游失败在 SSE 开始前使用 OpenAI 错误形状', async (t) => {
   const { baseUrl } = await startFixture(t, async (_req, res) => {
     res.writeHead(500, { 'content-type': 'application/json' });
     res.end('{}');
@@ -355,14 +442,124 @@ test('OpenAI 不支持项使用 OpenAI 错误形状', async (t) => {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       messages: [{ role: 'user', content: 'ping' }],
-      stream: true,
+      stream: false,
     }),
   });
-  assert.equal(response.status, 400);
+  assert.equal(response.status, 502);
   const body = await response.json();
-  assert.equal(body.error.type, 'invalid_request_error');
-  assert.equal(body.error.code, 'stream_not_supported');
-  assert.match(body.error.message, /streaming/i);
+  assert.equal(body.error.type, 'api_error');
+  assert.equal(body.error.code, 'UPSTREAM_ERROR');
+});
+
+test('OpenAI SSE 流式文本、思考提示与多轮工具完成', async (t) => {
+  let round = 0;
+  const upstreamBodies = [];
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    await once(req, 'end');
+    upstreamBodies.push(JSON.parse(Buffer.concat(chunks).toString()));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.flushHeaders();
+    if (round === 0) {
+      res.write('data: {"id":"chat-round-1","choices":[{"delta":{"reasoning_content":"inspect"}}]}\n\n');
+      res.write(`data: ${JSON.stringify({
+        choices: [{
+          delta: {
+            content: 'Checking. ',
+            tool_calls: [{
+              index: 0,
+              id: 'call_read',
+              type: 'function',
+              function: { name: 'read_file', arguments: '' },
+            }],
+          },
+        }],
+      })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        choices: [{
+          delta: {
+            tool_calls: [{
+              index: 0,
+              function: { arguments: '{"path":"README.md"}' },
+            }],
+          },
+        }],
+      })}\n\n`);
+      res.write('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}\n\n');
+      res.end('data: [DONE]\n\n');
+      round += 1;
+    } else {
+      res.write('data: {"id":"chat-round-2","choices":[{"delta":{"content":"Read complete."}}]}\n\n');
+      res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":2}}\n\n');
+      res.end('data: [DONE]\n\n');
+    }
+  });
+  const tools = [{
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read a file.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' } },
+        required: ['path'],
+      },
+    },
+  }];
+  const firstResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'Read README' }],
+      tools,
+    }),
+  });
+  assert.equal(firstResponse.status, 200);
+  const first = await firstResponse.text();
+  assert.ok(first.includes('read_file'), JSON.stringify({
+    upstreamBodies,
+    first,
+    internal: settings.getApiSettings(),
+  }));
+  assert.match(first, /"reasoning_content":"inspect"/);
+  assert.match(first, /data: \[DONE\]/);
+  const firstEvents = parseSse(first);
+  assert.equal(firstEvents.filter((event) => event.choices?.[0]?.finish_reason).length, 1);
+  const call = firstEvents
+    .flatMap((event) => event.choices?.[0]?.delta?.tool_calls || [])
+    .find((item) => item.function?.name === 'read_file');
+  assert.ok(call, JSON.stringify(firstEvents));
+  assert.equal(call.function.arguments, '{"path":"README.md"}');
+
+  const secondResponse = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [
+        { role: 'user', content: 'Read README' },
+        {
+          role: 'assistant',
+          content: 'Checking. ',
+          tool_calls: [{ id: 'call_read', type: 'function', function: call.function }],
+        },
+        { role: 'tool', tool_call_id: 'call_read', content: '# Bridge' },
+      ],
+      tools,
+    }),
+  });
+  assert.equal(secondResponse.status, 200);
+  const second = await secondResponse.text();
+  assert.match(second, /Read complete\./);
+  assert.match(second, /"finish_reason":"stop"/);
+  assert.match(second, /data: \[DONE\]/);
+  assert.equal(upstreamBodies.length, 2);
+  assert.equal(upstreamBodies[1].messages.at(-1).role, 'tool');
+  assert.equal(upstreamBodies[1].messages.at(-1).tool_call_id, 'call_read');
 });
 
 test('OpenAI 工具结果引用缺失或工具开关关闭时返回明确错误', () => {
@@ -393,6 +590,10 @@ test('管理页提供独立的 OpenAI 开关和接口地址', async (t) => {
   const html = await (await fetch(`${baseUrl}/admin`)).text();
   assert.match(html, /data-act="api-openai-toggle"/);
   assert.match(html, /data-act="api-copy-openai-endpoint"/);
+  assert.match(html, /id="api-responses-persistence-switch"/);
+  assert.match(html, /id="api-responses-nudge-switch"/);
+  assert.match(html, /Responses 持久化/);
+  assert.match(html, /api-responses-persistence-switch/);
   const updated = await fetch(`${baseUrl}/api/api-compat`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
@@ -425,7 +626,7 @@ test('未声明 tools 时清洗 WorkBuddy DSML，不泄漏工具调用', async (
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       messages: [{ role: 'user', content: '读取 README' }],
     }),
   });
@@ -447,7 +648,7 @@ test('OpenAI 上游未给出完成原因时拒绝返回不完整文本', async (
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       messages: [{ role: 'user', content: 'ping' }],
     }),
   });
@@ -470,7 +671,7 @@ test('OpenAI 缺少 finish_reason 但工具片段完整时可恢复调用', asyn
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      model: 'deepseek-v4-flash',
+      model: 'deepseek-v4.1-flash',
       messages: [{ role: 'user', content: '读取 README' }],
       tools: [{
         type: 'function',
@@ -511,7 +712,7 @@ test('OpenAI 工具响应聚合为 tool_calls，未声明 tools 时失败关闭'
     );
   });
   const payload = {
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     messages: [{ role: 'user', content: '读取 README' }],
     tools: [{
       type: 'function',
@@ -553,4 +754,143 @@ test('OpenAI 工具响应聚合为 tool_calls，未声明 tools 时失败关闭'
   assert.equal(JSON.stringify(plain).includes('tool_calls'), false);
   assert.equal(inflight('openai-a'), 0);
   assert.equal(requestCount, 2);
+});
+
+test('OpenAI Chat 网络断开保存可见片段一次', async (t) => {
+  let upstreamClosed = false;
+  const { store, upstreamServer } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"id":"chat-cancel-unique","choices":[{"delta":{"content":"visible partial"}}]}\n\n');
+    res.once('close', () => {
+      upstreamClosed = true;
+    });
+  });
+  let raw = '';
+  const { PassThrough } = await import('node:stream');
+  const res = new PassThrough();
+  res.on('data', (chunk) => {
+    raw += chunk.toString('utf8');
+  });
+  res.writeHead = () => {};
+  const runtime = createOpenAIRuntime({
+    upstreamClient: createUpstreamClient({
+      baseUrl: `http://127.0.0.1:${upstreamServer.address().port}`,
+    }),
+    cancelPersistence: store,
+  });
+  const run = runtime.chatWithCancellation({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'cancel' }],
+    },
+    config: settings.getApiSettings(),
+  });
+  await waitFor(() => raw.includes('visible partial'));
+  res.destroy();
+  const result = await run;
+  assert.equal(result.started, true);
+  await waitFor(() => upstreamClosed && inflight('openai-a') === 0 && store.memoryView().length > 0);
+  const records = store.memoryView();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].status, 'incomplete');
+  assert.ok(JSON.stringify(records[0].body).includes('visible partial'));
+  assert.equal((await store.get(records[0].id))?.status, 'incomplete');
+});
+
+test('OpenAI HTTP 真实内核 RST 只保存一次可见片段且不伪装成成功取消', async (t) => {
+  let upstreamClosed = false;
+  const { baseUrl, store } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"id":"chat-rst-unique","choices":[{"delta":{"content":"visible partial"}}]}\n\n');
+    res.once('close', () => {
+      upstreamClosed = true;
+    });
+  });
+  const received = await sendKernelRst(`${baseUrl}/v1/chat/completions`, {
+    model: 'deepseek-v4.1-flash',
+    stream: true,
+    messages: [{ role: 'user', content: 'reset' }],
+  });
+  assert.match(received, /visible partial/);
+  assert.doesNotMatch(received, /\[DONE\]/);
+  await waitFor(() => upstreamClosed && inflight('openai-a') === 0 && store.memoryView().length > 0);
+  const records = store.memoryView();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].status, 'incomplete');
+  assert.equal(records[0].body.output[0].content[0].text, 'visible partial');
+  assert.equal(records[0].deadLetterWritten, undefined);
+  assert.equal((await store.get(records[0].id))?.status, 'incomplete');
+  assert.equal(pool.poolView().accounts.find((item) => item.name === 'openai-a').inflight, 0);
+});
+
+test('OpenAI chatWithCancellation 接收显式 Signal 并保留合法收尾', async (t) => {
+  const { createOpenAIRuntime } = await import('../../src/api-runtime.js');
+  let upstreamClosed = false;
+  const { store, upstreamServer } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"id":"chat-signal","choices":[{"delta":{"content":"visible partial"}}]}\n\n');
+    res.once('close', () => {
+      upstreamClosed = true;
+    });
+  });
+  const upstreamClient = createUpstreamClient({ baseUrl: `http://127.0.0.1:${upstreamServer.address().port}` });
+  const runtime = createOpenAIRuntime({ upstreamClient, cancelPersistence: store });
+  const controller = new AbortController();
+  const writes = [];
+  const res = {
+    writable: true,
+    destroyed: false,
+    writableEnded: false,
+    writableLength: 0,
+    headersSent: false,
+    writeHead() {
+      this.headersSent = true;
+    },
+    write(chunk, callback) {
+      writes.push(Buffer.from(chunk).toString('utf8'));
+      callback?.();
+      return true;
+    },
+    end() {
+      this.writableEnded = true;
+    },
+    on() {},
+    off() {},
+  };
+  const run = runtime.chatWithCancellation({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'cancel' }],
+    },
+    config: settings.getApiSettings(),
+    interruptSignal: controller.signal,
+  });
+  res.on = (event, listener) => {
+    if (event === 'close') {
+      process.nextTick(() => {
+        if (!writes.join('').includes('visible partial')) return;
+        res.destroyed = true;
+        listener();
+      });
+    }
+  };
+  await waitFor(() => writes.join('').includes('visible partial'));
+  controller.abort('client test cancellation');
+  const result = await run;
+  await waitFor(() => upstreamClosed && inflight('openai-a') === 0);
+  const raw = writes.join('');
+  const events = parseSse(raw);
+  assert.equal(result.canceled, true);
+  assert.equal(events.filter((event) => event.choices?.[0]?.finish_reason).length, 1);
+  assert.equal(events.find((event) => event.choices?.[0]?.finish_reason)?.choices[0].finish_reason, 'stop');
+  assert.equal(raw.match(/data: \[DONE\]/g)?.length, 1);
+  assert.equal(store.memoryView().length, 1);
+  assert.equal(store.memoryView()[0].body.output[0].content[0].text, 'visible partial');
+  assert.equal((await store.get(store.memoryView()[0].id))?.status, 'incomplete');
 });

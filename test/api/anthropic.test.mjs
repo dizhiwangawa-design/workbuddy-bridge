@@ -14,7 +14,7 @@ import { createSseParser, encodeSseEvent } from '../../src/sse.js';
 
 test('Anthropic 请求转换支持 tools、图片、tool_result 与 is_error', () => {
   const converted = anthropicToOpenAI({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     max_tokens: 256,
     system: [{ type: 'text', text: 'Be concise.' }],
     messages: [
@@ -71,7 +71,7 @@ test('Anthropic 请求转换支持 tools、图片、tool_result 与 is_error', (
 
 test('乱序 tool_result 自动前置且保持两组内部相对顺序', () => {
   const normalized = normalizeAnthropicRequest({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     max_tokens: 128,
     messages: [
       {
@@ -122,7 +122,7 @@ test('乱序 tool_result 自动前置且保持两组内部相对顺序', () => {
 
 test('tool_result 已在 text 前时保持原顺序且不产生重排 warning', () => {
   const normalized = normalizeAnthropicRequest({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     max_tokens: 128,
     messages: [
       {
@@ -147,7 +147,7 @@ test('tool_result 已在 text 前时保持原顺序且不产生重排 warning', 
 
 test('tool_result 没有匹配前一条 assistant tool_use 时返回 400', () => {
   assert.throws(() => anthropicToOpenAI({
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     max_tokens: 100,
     messages: [{
       role: 'user',
@@ -182,7 +182,7 @@ test('结构化工具调用只在响应结束时完成，并与 DSML 完全隔�
     dsml: fakeDsml,
     toolsDeclared: true,
     toolChoice: 'auto',
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     requestId: 'req_test',
   });
   assert.equal(arbitration.source, 'structured');
@@ -219,7 +219,7 @@ test('结构化全部无效时才回退到 DSML，未声明 tools 时永不调�
 test('Anthropic SSE encoder 生成完整 text/tool 事件并正确双重转义 JSON', () => {
   const encoder = createAnthropicEncoder({
     id: 'msg_test',
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     inputTokens: 12,
   });
   const events = encoder.start();
@@ -297,7 +297,7 @@ test('Anthropic encoder 出错时关闭 text block 且不发送 message_stop', (
 test('Anthropic encoder 直接结束空响应时仍生成完整成功事件序列', () => {
   const encoder = createAnthropicEncoder({
     id: 'msg_empty',
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
     inputTokens: 1,
   });
   const events = encoder.finalize({
@@ -316,7 +316,7 @@ test('Anthropic encoder 直接结束空响应时仍生成完整成功事件序�
 test('没有最终工具块时不会仅因上游 finish_reason 返回 tool_use', () => {
   const encoder = createAnthropicEncoder({
     id: 'msg_no_tools',
-    model: 'deepseek-v4-flash',
+    model: 'deepseek-v4.1-flash',
   });
   const events = encoder.finalize({
     calls: [],
