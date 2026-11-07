@@ -1317,7 +1317,7 @@ OpenAI 400/404，不得误报为已支持。
 - Produces `writeOpenAIStream({ res, account, response, commit, release, model, signal }): Promise<void>`。
 - 输出 `text/event-stream; charset=utf-8`、`cache-control: no-cache` 和 `x-accel-buffering: no`。
 
-- [ ] **Step 1: 写流式测试**
+- [x] **Step 1: 写流式测试**
 
 断言帧顺序、内容和结束标记：
 
@@ -1360,13 +1360,13 @@ async function waitFor(predicate, timeoutMs = 3000) {
 }
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/openai.test.mjs`
 
 Expected: FAIL，流式被拒绝或内容仍为普通 JSON。
 
-- [ ] **Step 3: 写最小 SSE 转发**
+- [x] **Step 3: 写最小 SSE 转发**
 
 ```js
 let started = false;
@@ -1411,7 +1411,7 @@ res.on('close', () => {
 
 在 `finally` 中调用 `release()` 和 `endTask` 的结果对象；释放函数内部使用 `released` 布尔值保证幂等。
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 Run: `node test/api/openai.test.mjs`
 
@@ -1456,7 +1456,7 @@ recoverInbandToolCalls(content: string): {
 
 每个恢复的调用使用唯一 `call_<random>` ID，不使用固定 `call_dsml_0`。
 
-- [ ] **Step 1: 写 DSML 分片及非流式工具测试**
+- [x] **Step 1: 写 DSML 分片及非流式工具测试**
 
 ```js
 import { createDsmlScanner } from '../../src/tool-calls.js';
@@ -1491,13 +1491,13 @@ assert.deepEqual(
 assert.match(json.choices[0].message.tool_calls[0].id, /^call_/);
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/openai.test.mjs`
 
 Expected: FAIL，DSML 被当作普通文本或 call ID 不唯一。
 
-- [ ] **Step 3: 实现增量扫描**
+- [x] **Step 3: 实现增量扫描**
 
 ```js
 const OPEN = '<｜｜DSML｜｜ calls>';
@@ -1619,7 +1619,7 @@ export function recoverInbandToolCalls(content) {
 - 结束帧使用 `finish_reason: "tool_calls"`。
 - tool result 以原始 OpenAI `role: "tool"` 消息继续发往上游，不做字符串拼接。
 
-- [ ] **Step 4: 运行工具与全量测试**
+- [x] **Step 4: 运行工具与全量测试**
 
 Run: `node test/api/openai.test.mjs`
 
@@ -1668,7 +1668,7 @@ toAnthropicResponse(aggregate: object, model: string): {
 estimateMessagesTokens(body: object): number;
 ```
 
-- [ ] **Step 1: 写 Anthropic 非流式测试**
+- [x] **Step 1: 写 Anthropic 非流式测试**
 
 ```js
 import { anthropicToOpenAI } from '../../src/protocols/anthropic.js';
@@ -1727,13 +1727,13 @@ const count = await fetch(`http://127.0.0.1:${port}/v1/messages/count_tokens`, {
 assert.ok((await count.json()).input_tokens > 0);
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/anthropic.test.mjs`
 
 Expected: FAIL，`/v1/messages` 未实现。
 
-- [ ] **Step 3: 实现最小转换**
+- [x] **Step 3: 实现最小转换**
 
 ```js
 export function anthropicToOpenAI(body) {
@@ -1824,7 +1824,7 @@ function estimateText(text) {
 }
 ```
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 Run: `node test/api/anthropic.test.mjs`
 
@@ -1855,7 +1855,7 @@ Expected: PASS。
 **Interfaces:**
 - Produces `writeAnthropicStream({ res, response, model, maxTokens, commit, signal }): Promise<{ usage: object; finishReason?: string }>`。
 
-- [ ] **Step 1: 写 SSE 顺序测试**
+- [x] **Step 1: 写 SSE 顺序测试**
 
 ```js
 const text = await response.text();
@@ -1874,13 +1874,13 @@ assert.match(text, /"type":"text_delta","text":"ng"/);
 assert.match(text, /"stop_reason":"end_turn"/);
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/anthropic.test.mjs`
 
 Expected: FAIL，`stream:true` 被拒绝或没有 Anthropic 事件。
 
-- [ ] **Step 3: 写最小事件序列**
+- [x] **Step 3: 写最小事件序列**
 
 先预读到一个有效上游 chat delta 或明确结束状态，再执行下面的提交和事件序列：
 
@@ -1926,7 +1926,7 @@ emitSseEvent(res, 'message_stop', { type: 'message_stop' });
 
 客户端中止时不得再尝试写 `message_stop`；在 `res.on('close')` 中止上游并在 `finally` 释放租约。
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 Run: `node test/api/anthropic.test.mjs`
 
@@ -1954,7 +1954,7 @@ Expected: PASS。
 - `toAnthropicResponse` 必须把聚合后的 `toolCalls` 转为完整 `type: "tool_use"` 内容块。
 - 流式输出使用 `content_block_start`、`input_json_delta`、`content_block_stop`，最终 `stop_reason: "tool_use"`。
 
-- [ ] **Step 1: 写请求转换和响应测试**
+- [x] **Step 1: 写请求转换和响应测试**
 
 请求：
 
@@ -2008,13 +2008,13 @@ assert.match(text, /"type":"input_json_delta"/);
 assert.match(text, /"stop_reason":"tool_use"/);
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/anthropic.test.mjs`
 
 Expected: FAIL，DSML 仍作为中文文本输出，或 tool_result 不能进入下一轮。
 
-- [ ] **Step 3: 补齐双向转换**
+- [x] **Step 3: 补齐双向转换**
 
 工具定义：
 
@@ -2108,7 +2108,7 @@ for (const [offset, call] of calls.entries()) {
 
 流式 Anthropic 路径必须和 OpenAI 路径共用 `createDsmlScanner`。不能直接把 `delta.content` 全量当作 `text_delta`，这是 reverse-proxy 当前 Anthropic 路径的已知缺口。
 
-- [ ] **Step 4: 运行工具和回归测试**
+- [x] **Step 4: 运行工具和回归测试**
 
 Run: `node test/api/anthropic.test.mjs`
 
@@ -2149,7 +2149,7 @@ refreshAccountCredentials(
 
 同一账号并发刷新共享一个 Promise；磁盘写入使用同目录临时文件、`fsync` 语义可接受的 rename 和 `0600` 权限。
 
-- [ ] **Step 1: 写刷新和故障测试**
+- [x] **Step 1: 写刷新和故障测试**
 
 测试文件先在导入业务模块前隔离数据目录：
 
@@ -2377,13 +2377,13 @@ test('流式首帧前 5xx 会换号', async () => {
 });
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/failover.test.mjs`
 
 Expected: FAIL，刷新函数不存在或第二个账号未被使用。
 
-- [ ] **Step 3: 实现单账号刷新锁**
+- [x] **Step 3: 实现单账号刷新锁**
 
 ```js
 const refreshLocks = new Map();
@@ -2424,7 +2424,7 @@ export function refreshAccountCredentials(accountName, client) {
 }
 ```
 
-- [ ] **Step 4: 实现换号边界**
+- [x] **Step 4: 实现换号边界**
 
 可重试状态：
 
@@ -2491,7 +2491,7 @@ release({
 });
 ```
 
-- [ ] **Step 5: 运行测试**
+- [x] **Step 5: 运行测试**
 
 Run: `node test/api/failover.test.mjs`
 
@@ -2596,7 +2596,7 @@ assert.match(html, /data-api-toggle="enabled"/);
 assert.match(html, /data-act="api-key-create"/);
 ```
 
-- [ ] **Step 2: 运行并确认失败**
+- [x] **Step 2: 运行并确认失败**
 
 Run: `node test/api/admin-api.test.mjs`
 
