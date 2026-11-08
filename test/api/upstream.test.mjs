@@ -25,6 +25,11 @@ function credentials(overrides = {}) {
   };
 }
 
+test('upstream client exposes its normalized endpoint for cache namespacing', () => {
+  const client = createUpstreamClient({ baseUrl: 'http://127.0.0.1:1234/' });
+  assert.equal(client.endpoint, 'http://127.0.0.1:1234');
+});
+
 test('直连 /v2/chat/completions 并发送 WorkBuddy 请求头', async (t) => {
   let seen;
   const { server, baseUrl } = await startServer(async (req, res) => {
