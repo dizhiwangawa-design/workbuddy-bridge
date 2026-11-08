@@ -22,7 +22,7 @@ Windsurf、Cursor 这些客户端各有各的 MCP 生态，官方没有提供「
 本项目提供三条入口：
 
 1. **MCP**：任意 MCP 客户端通过 `workbuddy_task` 把任务交给 WorkBuddy；这条路径仍用 `codebuddy -p` 执行文件类长任务。
-2. **Anthropic Messages API**：标准 Anthropic SDK / 客户端直接请求 `/v1/messages`，支持真实流式文本、`tool_use` / `tool_result` 和 `count_tokens`；这条路径直接请求 WorkBuddy 上游，不启动 CLI。
+2. **Anthropic Messages API**：标准 Anthropic SDK / 客户端直接请求 `/v1/messages`，支持真实流式文本、`thinking`、`tool_use` / `tool_result` 和 `count_tokens`；这条路径直接请求 WorkBuddy 上游，不启动 CLI。
 3. **OpenAI Chat Completions / Responses API**：兼容客户端可使用
    `/v1/chat/completions`、`/v1/responses`（HTTP/SSE 与原生 WebSocket）、
    `/v1/models`；支持流式文本、function 工具、思考提示和 Responses 工具协议，
@@ -115,7 +115,7 @@ wb http --port 7666
 
 | 方法与路径 | 说明 |
 |:---|:---|
-| `POST /v1/messages` | 支持流式 / 非流式文本、图片输入、`tool_use` 和 `tool_result` |
+| `POST /v1/messages` | 支持流式 / 非流式文本、图片输入、`thinking`、`tool_use` 和 `tool_result` |
 | `POST /v1/messages/count_tokens` | 本地保守估算，响应带 `estimated:true` 与 `estimator:"wb-conservative-v1"` |
 | `GET /admin` | 独立开关 Anthropic / OpenAI、Responses 持久化与续跑提示，管理客户端 Key |
 
@@ -191,6 +191,35 @@ if (toolUse) {
 - **四层超时**：首字节 60 秒、流中空闲 120 秒、`finish_reason` 后宽限 2 秒、总时长 600 秒。流开始后无法安全换号，只会终止当前响应；账号 inflight 始终释放。
 - **SSE 保活**：`message_start` 后每 15 秒发送一次 Anthropic `ping`，防止下游代理因短暂无事件而断开。ping 不代表上游出现了新内容。
 - **乱序工具结果**：user message 中排在 text/image 后的 `tool_result` 会自动移到最前，并保持 result 组与剩余块各自的相对顺序；引用未知 `tool_use_id` 的请求返回 400。
+
+### Anthropic thinking
+
+`thinking.type` 为必填字段，只接受 `enabled` 或 `disabled`。缺失 `thinking` 或
+`thinking.type:"disabled"` 在模型能力已知时向上游转发 `none`；`thinking:{}`、缺少
+`type`、未知 `type`、缺少预算或非法 `budget_tokens` 返回
+`400 invalid_request_error`。
+
+启用 thinking 时，预算按以下区间映射为具名档位，再按目标模型目录中的支持集合
+选择最近值：介于两个支持档位之间时向上取，高于模型最高档时取最高档。
+
+| `budget_tokens` | 初始档位 |
+|:---|:---|
+| `< 4096` | `low` |
+| `4096..16383` | `high` |
+| `>= 16384` | `max` |
+
+流式响应使用 `thinking` 内容块、`thinking_delta` 和 `signature_delta`；非流式响应
+在正文前返回 `{type:"thinking",thinking:string,signature:""}`。历史中的
+`thinking` / `redacted_thinking` 块不会回传给上游。上游没有可验证的 thinking
+签名，因此 `signature` 固定为空字符串。
+
+流式和非流式的 usage 都在 `output_tokens_details.reasoning_tokens` 中报告 reasoning
+token。上游可能在 `reasoning_tokens:0` 时仍通过 `reasoning_content` 返回有效的思考
+内容，判断是否思考时应同时检查这两个信号。
+
+`none` 是尽最大努力关闭，不保证所有上游模型都停止思考。禁用 thinking 时，
+bridge 不返回 reasoning 正文；若上游仍返回非空 `reasoning_content`，服务端会为该
+请求记录一条不含正文的 warning，并如实保留上游报告的 reasoning token。
 
 `count_tokens` 是确定性本地估算，不是 Anthropic 官方 tokenizer。中英文混合和长上下文可能有明显误差，**不得用于精确计费或裁剪刚好达到上下文上限的请求**；实际请求仍应处理上游的 `context_length_exceeded`。
 
@@ -340,7 +369,7 @@ Responses 的持久化和可靠性规则：
   服务端协议 Ping 为 15 秒，Pong 宽限 10 秒；超时后先取消上游、释放租约，再关闭传输。
   测试夹具可用短间隔注入这些阈值，生产固定为 15 秒 / 10 秒。
 
-Anthropic 的 thinking、prompt caching、`top_k`、`mcp_servers`、container、文档附件、
+Anthropic 的 prompt caching、`top_k`、`mcp_servers`、container、文档附件、
 图片形式的 `tool_result` 和流式响应中的工具块原位交错暂不支持；相关请求或
 content block 明确返回 `400 invalid_request_error`。
 

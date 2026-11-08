@@ -14,3 +14,17 @@
 - The model catalogue is cached for ten minutes per upstream endpoint and account
   UID; `/v1/models?refresh=true` forces a refresh.
 - OpenAI Chat and Responses preserve upstream reasoning-token usage details.
+
+### Added
+
+- Anthropic `thinking` budgets are mapped to model-supported reasoning effort.
+- Thinking responses expose upstream reasoning as Anthropic `thinking` blocks and
+  report reasoning-token details in streamed and non-streamed usage.
+
+### Known Limitations
+
+- Some upstream models continue reasoning after `none`. The proxy suppresses that
+  reasoning text when thinking is disabled and emits one content-free server
+  warning for the request.
+- Thinking signatures are empty because the upstream does not provide verifiable
+  signatures.
