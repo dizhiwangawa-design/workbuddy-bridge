@@ -6,6 +6,7 @@ import {
   createTextCache,
 } from '../stream-control.js';
 import { outputFromPartial } from '../responses-store.js';
+import { resolveReasoningEffort } from '../reasoning-effort.js';
 
 const SUPPORTED_TOOL_TYPES = new Set([
   'function',
@@ -116,7 +117,7 @@ export function baseResponse({
     parallel_tool_calls: request?.parallelToolCalls !== false,
     previous_response_id: previousResponseId,
     prompt_cache_key: null,
-    reasoning: { effort: null, summary: null },
+    reasoning: { effort: request?.forwardedEffort ?? null, summary: null },
     safety_identifier: null,
     service_tier: 'default',
     store: Boolean(store),
@@ -509,6 +510,16 @@ export function prepareResponsesRequest(body, {
   ) {
     throw bad('parallel_tool_calls must be boolean');
   }
+  if (body.reasoning !== undefined) {
+    if (!body.reasoning || typeof body.reasoning !== 'object' || Array.isArray(body.reasoning)) {
+      throw bad('reasoning must be an object');
+    }
+  }
+  const requestedEffort = body.reasoning?.effort === undefined
+    || body.reasoning?.effort === null
+    ? null
+    : String(body.reasoning.effort).trim().toLowerCase();
+  resolveReasoningEffort(requestedEffort, null);
   let choice = body.tool_choice;
   if (typeof choice === 'string' && !['auto', 'none', 'required'].includes(choice)) {
     throw bad('tool_choice must be auto, none, required or a tool selector');
@@ -573,6 +584,8 @@ export function prepareResponsesRequest(body, {
     parallelToolCalls: body.parallel_tool_calls !== false,
     requestedMax: max !== undefined,
     maxOutputTokens: max,
+    requestedEffort,
+    forwardedEffort: null,
     store: body.store === true,
   };
 }

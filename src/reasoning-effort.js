@@ -77,15 +77,14 @@ export function reasoningDeclaration(model) {
 }
 
 export function resolveReasoningEffort(requested, declaration) {
-  if (!declaration || declaration.form === 'none' || !declaration.efforts?.length) {
-    return null;
-  }
-
   const raw = requested === null || requested === undefined
     ? 'none'
     : canonical(requested);
   if (!ACCEPTED.has(raw)) {
     throw bad(`unknown reasoning effort: ${JSON.stringify(requested)}`);
+  }
+  if (!declaration || declaration.form === 'none' || !declaration.efforts?.length) {
+    return null;
   }
   if (raw === 'none') return 'none';
 

@@ -43,6 +43,10 @@ test('无 reasoning 对象不产生转发值', () => {
   const declaration = reasoningDeclaration({ id: 'glm-4.6' });
   assert.equal(resolveReasoningEffort('high', declaration), null);
   assert.equal(resolveReasoningEffort(null, declaration), null);
+  assert.throws(
+    () => resolveReasoningEffort('hihg', declaration),
+    (error) => error.status === 400,
+  );
 });
 
 test('已知模型缺失档位时显式转发 none', () => {
