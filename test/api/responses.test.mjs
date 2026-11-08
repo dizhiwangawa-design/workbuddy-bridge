@@ -68,6 +68,7 @@ async function fixture(t, handler, {
   const responsesStore = store || createResponsesStore({
     directory: path.join(tmp, `responses-${Date.now()}-${Math.random()}`),
   });
+  const { reasoningCatalogue = null } = apiDeps;
   const bridge = await startHttpServer({
     port: 0,
     host: '127.0.0.1',
@@ -77,6 +78,7 @@ async function fixture(t, handler, {
         upstreamClient,
         store: responsesStore,
         hardBytes,
+        reasoningCatalogue,
       }),
       ...apiDeps,
     },
@@ -151,6 +153,165 @@ test('historyForResponse 兼容旧记录并按版本化偏移只追加当前输�
     }),
     [...input, prior, current],
   );
+});
+
+function reasoningCatalogue(declaration) {
+  return {
+    getDeclaration() {
+      return declaration;
+    },
+  };
+}
+
+const THREE_RUNG = {
+  form: 'supported',
+  efforts: ['low', 'high', 'max'],
+  declaredEffort: null,
+  defaultEffort: 'high',
+  canDisableThinking: true,
+};
+
+const SINGLE_MEDIUM = {
+  form: 'single',
+  efforts: ['medium'],
+  declaredEffort: 'medium',
+  defaultEffort: null,
+  canDisableThinking: null,
+};
+
+const NO_REASONING = {
+  form: 'none',
+  efforts: [],
+  declaredEffort: null,
+  defaultEffort: null,
+  canDisableThinking: null,
+};
+
+test('Responses 按模型支持的档位注入并回显实际转发值', async (t) => {
+  const bodies = [];
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    upstream(res, 'done');
+  }, {
+    apiDeps: { reasoningCatalogue: reasoningCatalogue(THREE_RUNG) },
+  });
+
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'route',
+      reasoning: { effort: 'medium' },
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(bodies[0].reasoning_effort, 'high');
+  assert.equal(body.reasoning.effort, 'high');
+  assert.equal('max_tokens' in bodies[0], false);
+});
+
+test('Responses 单值声明覆盖任意非关闭档位', async (t) => {
+  const bodies = [];
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    upstream(res, 'done');
+  }, {
+    apiDeps: { reasoningCatalogue: reasoningCatalogue(SINGLE_MEDIUM) },
+  });
+
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deep-model',
+      input: 'route',
+      reasoning: { effort: 'max' },
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(bodies[0].reasoning_effort, 'medium');
+  assert.equal(body.reasoning.effort, 'medium');
+});
+
+test('Responses 已知模型缺少 reasoning 时转发 none', async (t) => {
+  let received;
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstream(res, 'done');
+  }, {
+    apiDeps: { reasoningCatalogue: reasoningCatalogue(THREE_RUNG) },
+  });
+
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', input: 'off' }),
+  });
+  const body = await response.json();
+
+  assert.equal(received.reasoning_effort, 'none');
+  assert.equal(body.reasoning.effort, 'none');
+});
+
+test('Responses 无 reasoning 声明时不注入字段', async (t) => {
+  let received;
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstream(res, 'done');
+  }, {
+    apiDeps: { reasoningCatalogue: reasoningCatalogue(NO_REASONING) },
+  });
+
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'glm-4.6',
+      input: 'plain',
+      reasoning: { effort: 'high' },
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal('reasoning_effort' in received, false);
+  assert.equal(body.reasoning.effort, null);
+});
+
+test('Responses 未知 effort 返回 400 且不请求上游', async (t) => {
+  let calls = 0;
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    calls += 1;
+    upstream(res, 'unexpected');
+  }, {
+    apiDeps: { reasoningCatalogue: reasoningCatalogue(THREE_RUNG) },
+  });
+
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'route',
+      reasoning: { effort: 'hihg' },
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.error.code, 'invalid_reasoning_effort');
+  assert.equal(calls, 0);
 });
 
 test('Responses 非流式输出 reasoning 与 message', async (t) => {

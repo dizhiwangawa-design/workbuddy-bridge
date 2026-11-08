@@ -9,8 +9,7 @@
 > WorkBuddy 上游，不启动 CLI。运行时要求 Node.js `>=22.13`（Responses 持久化使用内置
 > SQLite）。
 
-![登录页](assets/login-page.png)
-
+![管理页：用量看板、账号池与 API 兼容配置](assets/pool-dashboard.png)
 ---
 
 ## 这解决什么问题
@@ -22,7 +21,7 @@ Windsurf、Cursor 这些客户端各有各的 MCP 生态，官方没有提供「
 本项目提供三条入口：
 
 1. **MCP**：任意 MCP 客户端通过 `workbuddy_task` 把任务交给 WorkBuddy；这条路径仍用 `codebuddy -p` 执行文件类长任务。
-2. **Anthropic Messages API**：标准 Anthropic SDK / 客户端直接请求 `/v1/messages`，支持真实流式文本、`tool_use` / `tool_result` 和 `count_tokens`；这条路径直接请求 WorkBuddy 上游，不启动 CLI。
+2. **Anthropic Messages API**：标准 Anthropic SDK / 客户端直接请求 `/v1/messages`，支持真实流式文本、`thinking`、`tool_use` / `tool_result` 和 `count_tokens`；这条路径直接请求 WorkBuddy 上游，不启动 CLI。
 3. **OpenAI Chat Completions / Responses API**：兼容客户端可使用
    `/v1/chat/completions`、`/v1/responses`（HTTP/SSE 与原生 WebSocket）、
    `/v1/models`；支持流式文本、function 工具、思考提示和 Responses 工具协议，
@@ -115,7 +114,7 @@ wb http --port 7666
 
 | 方法与路径 | 说明 |
 |:---|:---|
-| `POST /v1/messages` | 支持流式 / 非流式文本、图片输入、`tool_use` 和 `tool_result` |
+| `POST /v1/messages` | 支持流式 / 非流式文本、图片输入、`thinking`、`tool_use` 和 `tool_result` |
 | `POST /v1/messages/count_tokens` | 本地保守估算，响应带 `estimated:true` 与 `estimator:"wb-conservative-v1"` |
 | `GET /admin` | 独立开关 Anthropic / OpenAI、Responses 持久化与续跑提示，管理客户端 Key |
 
@@ -192,6 +191,35 @@ if (toolUse) {
 - **SSE 保活**：`message_start` 后每 15 秒发送一次 Anthropic `ping`，防止下游代理因短暂无事件而断开。ping 不代表上游出现了新内容。
 - **乱序工具结果**：user message 中排在 text/image 后的 `tool_result` 会自动移到最前，并保持 result 组与剩余块各自的相对顺序；引用未知 `tool_use_id` 的请求返回 400。
 
+### Anthropic thinking
+
+`thinking.type` 为必填字段，只接受 `enabled` 或 `disabled`。缺失 `thinking` 或
+`thinking.type:"disabled"` 在模型能力已知时向上游转发 `none`；`thinking:{}`、缺少
+`type`、未知 `type`、缺少预算或非法 `budget_tokens` 返回
+`400 invalid_request_error`。
+
+启用 thinking 时，预算按以下区间映射为具名档位，再按目标模型目录中的支持集合
+选择最近值：介于两个支持档位之间时向上取，高于模型最高档时取最高档。
+
+| `budget_tokens` | 初始档位 |
+|:---|:---|
+| `< 4096` | `low` |
+| `4096..16383` | `high` |
+| `>= 16384` | `max` |
+
+流式响应使用 `thinking` 内容块、`thinking_delta` 和 `signature_delta`；非流式响应
+在正文前返回 `{type:"thinking",thinking:string,signature:""}`。历史中的
+`thinking` / `redacted_thinking` 块不会回传给上游。上游没有可验证的 thinking
+签名，因此 `signature` 固定为空字符串。
+
+流式和非流式的 usage 都在 `output_tokens_details.reasoning_tokens` 中报告 reasoning
+token。上游可能在 `reasoning_tokens:0` 时仍通过 `reasoning_content` 返回有效的思考
+内容，判断是否思考时应同时检查这两个信号。
+
+`none` 是尽最大努力关闭，不保证所有上游模型都停止思考。禁用 thinking 时，
+bridge 不返回 reasoning 正文；若上游仍返回非空 `reasoning_content`，服务端会为该
+请求记录一条不含正文的 warning，并如实保留上游报告的 reasoning token。
+
 `count_tokens` 是确定性本地估算，不是 Anthropic 官方 tokenizer。中英文混合和长上下文可能有明显误差，**不得用于精确计费或裁剪刚好达到上下文上限的请求**；实际请求仍应处理上游的 `context_length_exceeded`。
 
 ## OpenAI Chat Completions / Responses API
@@ -205,7 +233,7 @@ if (toolUse) {
 | `POST /v1/responses` | 非流式 JSON、SSE、`previous_response_id` 续接 |
 | `WS /v1/responses` | 原生 `response.create` / `response.interrupt` 命令 |
 | `GET /v1/responses/:id` | 查询保存的完成或取消片段 |
-| `GET /v1/models` | 优先读取 WorkBuddy 模型目录；不可用时返回带 `wb_source:"fallback"` 的稳定列表 |
+| `GET /v1/models` | 读取按 endpoint 与账号 UID 缓存的 WorkBuddy 模型目录；不可用时返回带 `wb_source:"fallback"` 的稳定列表 |
 | `GET /v1/models/:id` | 查询目录中的单个模型；未找到返回 `404 model_not_found` |
 
 ```js
@@ -295,6 +323,30 @@ OpenAI 与 Anthropic 路由共用客户端 Key，也共用现有号池和扫码�
   Responses 的 `file_id`、MCP server/container 等未实现工具类型也明确拒绝。
 - 客户端 Key、协议开关、错误形状沿用共享的 API 兼容层；远程访问仍需配置 Key。
 
+### 推理档位
+
+Chat Completions 的顶层 `reasoning_effort` 与 Responses 的
+`reasoning.effort` 接受不区分大小写的 `none`、`minimal`、`low`、`medium`、
+`high`、`xhigh`、`max`。`minimal` 按 `low` 处理；目标模型缺少精确档位时向上取
+最近支持值，同时保留模型支持的 `medium` 与 `xhigh`。
+
+档位能力来自所选账号的上游模型目录，不使用模型名前缀猜测：
+
+- `supportedEfforts` 数组按该模型的真实集合归一化。
+- 单值 `reasoning.effort` 表示该模型唯一的非关闭档位；例如声明 `medium` 的模型
+  会接收 `medium`，不会因为客户端要求 `high` 就改成 `high`。
+- 已知支持 reasoning 的模型在请求缺少档位时显式接收 `none`。
+- 模型目录明确声明无 reasoning，或缓存中没有该模型时，不向上游发送
+  `reasoning_effort`。
+- Responses 的 `reasoning.effort` 回显实际转发值；它可能与客户端请求值不同。
+- 未知档位名返回 `400 invalid_reasoning_effort`。这是对 Chat 过去静默透传行为的
+  有意变更。
+
+模型目录在每个上游 endpoint 与账号 UID 的组合上缓存 10 分钟，模型列表和请求归一化
+读取同一份快照。`GET /v1/models?refresh=true` 或
+`GET /v1/models/:id?refresh=true` 强制刷新；刷新失败时继续使用旧快照，并把列表
+来源标为 `stale`。模型行中的 `wb_reasoning` 字段展示归一化后的能力声明。
+
 Responses 的持久化和可靠性规则：
 
 - `store:true` 且管理设置开启 `responsesPersistence` 时，完成响应和主动取消/断连的
@@ -316,7 +368,7 @@ Responses 的持久化和可靠性规则：
   服务端协议 Ping 为 15 秒，Pong 宽限 10 秒；超时后先取消上游、释放租约，再关闭传输。
   测试夹具可用短间隔注入这些阈值，生产固定为 15 秒 / 10 秒。
 
-Anthropic 的 thinking、prompt caching、`top_k`、`mcp_servers`、container、文档附件、
+Anthropic 的 prompt caching、`top_k`、`mcp_servers`、container、文档附件、
 图片形式的 `tool_result` 和流式响应中的工具块原位交错暂不支持；相关请求或
 content block 明确返回 `400 invalid_request_error`。
 
@@ -324,7 +376,6 @@ content block 明确返回 `400 invalid_request_error`。
 
 v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调度的池子。`workbuddy_task` 不指定 `account` 时默认 `auto`，由调度器挑号；某个号挂了会自动换下一个。v0.3 补了完整用量看板；v0.4 加入 Anthropic API、DSML 安全归一化和共享号池的 API 并发控制；OpenAI Chat Completions 与 Responses 沿用同一号池、鉴权层和持久化取消路径。
 
-![数据看板](assets/pool-dashboard.png)
 
 ### 调度规则
 
@@ -378,7 +429,6 @@ wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
 # 或只开管理服务：wb admin（默认 7667）
 ```
 
-![扫码登录弹窗](assets/pool-login.png)
 
 **顶部看板**，区间可切今日 / 近 3 日 / 本周 / 本月 / 近 30 日 / 全部：
 
@@ -387,13 +437,13 @@ wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
 | KPI | Token 消耗（输入 / 输出 / 缓存读写拆分）、请求数、生成速度、缓存命中率、API 等价费用、成功率环 |
 | 时序图 | Token / 请求数 / 吞吐量三视图，柱状叠折线，悬停看逐点明细；按区间自动切小时或按天聚合 |
 | 最近请求 | 实时活动流：时间、模型、账号、token、耗时，失败的标红 |
-| 工作回顾 | GitHub 风格年度热力图，按 token 量分五档；右侧是活跃天数、总请求、总 token、峰值日 |
+| 工作回潮 | GitHub 风格年度热力图，按 token 量分五档；右侧是活跃天数、总请求、总 token、峰值日 |
 
 环比取「等长的上一段」：今日对昨日同时段、本周对上周、30 天对前 30 天。「全部」区间没有上一段，显示 `—`。
 
 **账号池**每张卡上能看到：
 
-- **额度**：剩余 token / 预算、今日已用、缓存占比、7 日用量曲线；没设预算时明确显示「未设每日预算」，不会假装是 0
+- **额度**：剩余 token / 预算、今日已用、缓存占比；没设预算时明确显示「未设每日预算」，不会假装是 0
 - **负载**：今日请求数、成功率、今日 token、当前并发 / 上限、平均耗时
 - **状态**：可用 / 冷却中（带倒计时）/ 未登录 / 已停用，左侧色条同步
 - **操作**：扫码登录（弹窗直接出二维码）、测试、设预算、重置冷却、调权重、启停、删除
@@ -403,12 +453,13 @@ wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
 - API 总开关，以及 Anthropic 与 OpenAI Chat Completions / Responses 的独立协议开关；
 - 流式响应、工具调用、通道兼容清洗的运行时开关；OpenAI Chat 在关闭流式后会对 `stream:true` 返回 `400 streaming_disabled`；
 - Responses 持久化与续跑提示的独立开关；OpenAI 关闭时二者不可用，持久化关闭时续跑提示不可用；
-- 上游地址、默认模型（默认 `deepseek-v4.1-flash`）、首字节 / 空闲 / 总超时和 DSML 缓冲上限；
+- Anthropic `thinking` 与 OpenAI `reasoning_effort`：按所选账号和 endpoint 的模型目录归一化档位，`/v1/models` 与请求转发读取同一份目录快照；
+- 上游地址、默认模型（默认 `deepseek-v4.1-flash`）和首字节 / 空闲 / 总超时；DSML 扫描上限由 `config.json` 的 `apiCompat.dsmlMaxBufferBytes` 配置；
 - 鉴权策略：所有连接要求 Key、远程连接要求 Key、信任反向代理；
 - 客户端 Key 生成、全部重置、明文一次性查看 / 复制、掩码列表和删除；
 - “测试 OpenAI 文本”和“测试 Anthropic 工具”：两者都走实际 runtime 与号池租约；Anthropic 测试执行一次 `tool_use` → `tool_result` 两轮探测，结果只显示 `ok`、账号、耗时和错误码，不显示提示词、token、完整 Key 或工具原文。
 
-顶部汇总可用账号数与状态分布，策略下拉即时生效。看板数据走 `GET /api/stats?range=today|3d|week|month|30d|all`，前端每 5 秒轮询一次。
+账号池标题汇总可用 / 总数、今日 token、今日请求数与当前调度策略，策略下拉即时生效。看板数据走 `GET /api/stats?range=today|3d|week|month|30d|all`，前端每 5 秒轮询一次。
 
 ### 命令行
 
@@ -496,12 +547,17 @@ dsh: disabling profile plugin row "mcp-workbuddy": Plugin @deepseek-ai/dsh-mcp-c
 is incompatible with dsh 0.2.1-rc.5 ...
 ```
 
-偏偏 npm 上 `@deepseek-ai/dsh-mcp-client` 的 `latest` 标签还停在 `0.0.1-rc.1`（2026-11 时），直接 `pnpm add` 装到的就是这个老版本。所以桥接会先读出你的 dsh 版本，再装同版本号的插件（如 `@deepseek-ai/dsh-mcp-client@0.2.1-rc.5`）。手动安装时务必带上版本：
+npm 上这个包的 `latest` 标签自 2026-08 起一直停在 `0.0.1-rc.1`，没跟着主线走（当前 `next` 是 `0.2.2-rc.1`）。包管理器在不带版本时会去解析 `latest`，所以 `pnpm add @deepseek-ai/dsh-mcp-client` 装到的是那个三个月前的老版本，它和现代 dsh 不兼容。
+
+桥接因此完全不依赖 `latest`：先读出你的 dsh 版本，再装**同版本号**的插件（如 `@deepseek-ai/dsh-mcp-client@0.2.1-rc.5`）。手动安装时务必带上版本：
+
 
 ```bash
 cd ~/.dsh/profiles/web
 pnpm add @deepseek-ai/dsh-mcp-client@$(dsh --version)
 ```
+升级 dsh 之后要重跑一次 wb install。​ 插件版本不会自动跟随：dsh 升级后，已装插件仍留在旧版本，启动时被静默禁用，日志里只有一行 disabling profile plugin row。
+wb install 每次都会按当前 dsh 版本重新对齐，所以升级 dsh 后顺手重跑一次最省事。
 
 配置生效后，工具在 dsh 里叫 `mcp__workbuddy__workbuddy_task`（MCP 服务器限定命名），其余用法不变。
 

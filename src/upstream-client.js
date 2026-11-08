@@ -141,6 +141,10 @@ export function createUpstreamClient({
   const requestTimeoutMs = Number(timeoutMs ?? apiConfig.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
   return {
+    get endpoint() {
+      return endpoint;
+    },
+
     async chat({
       accountId,
       credentials,

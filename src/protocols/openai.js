@@ -1,5 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { ApiError } from '../api-errors.js';
+import {
+  reasoningDeclaration,
+  resolveReasoningEffort,
+} from '../reasoning-effort.js';
 
 function requestError(message, code = 'invalid_request') {
   return new ApiError(400, message, {
@@ -166,6 +170,11 @@ export function prepareOpenAIRequest(body, {
 
   const model = String(body.model || defaultModel || '').trim();
   if (!model) throw requestError('model must not be empty');
+  const requestedEffort = body.reasoning_effort === undefined
+    || body.reasoning_effort === null
+    ? null
+    : String(body.reasoning_effort).trim().toLowerCase();
+  resolveReasoningEffort(requestedEffort, null);
 
   const tools = (body.tools || []).map(toolDeclaration);
   const names = new Set();
@@ -200,6 +209,19 @@ export function prepareOpenAIRequest(body, {
     toolsDeclared: tools.length > 0,
     toolChoice: toolChoice || 'auto',
     toolNames: names,
+    requestedEffort,
+  };
+}
+
+function reasoningTokenDetails(source) {
+  const reasoning = source?.completion_tokens_details?.reasoning_tokens;
+  if (reasoning === undefined || reasoning === null) return {};
+  const tokens = Number(reasoning);
+  if (!Number.isFinite(tokens)) return {};
+  return {
+    completion_tokens_details: {
+      reasoning_tokens: Math.max(0, tokens),
+    },
   };
 }
 
@@ -214,6 +236,7 @@ function eventUsage(usage) {
     total_tokens: Number.isFinite(total)
       ? total
       : (Number.isFinite(prompt) ? prompt : 0) + (Number.isFinite(completion) ? completion : 0),
+    ...reasoningTokenDetails(usage),
   };
 }
 
@@ -361,6 +384,7 @@ export function toOpenAIResponse(aggregate, model, { now = Date.now } = {}) {
       prompt_tokens: prompt,
       completion_tokens: completion,
       total_tokens: Number.isFinite(total) ? total : prompt + completion,
+      ...reasoningTokenDetails(used),
     },
   };
 }
@@ -459,6 +483,7 @@ export function createChatEncoder({ id, model, created = Math.floor(Date.now() /
 function modelRow(model) {
   const id = String(model.id || '').trim();
   if (!id || id === 'undefined') return null;
+  const declaration = reasoningDeclaration(model);
   return {
     id,
     object: 'model',
@@ -467,6 +492,13 @@ function modelRow(model) {
     name: model.name || id,
     context_window: model.maxInputTokens ?? null,
     max_output_tokens: model.maxOutputTokens ?? null,
+    wb_reasoning: {
+      form: declaration.form,
+      supported_efforts: declaration.efforts,
+      declared_effort: declaration.declaredEffort,
+      default_effort: declaration.defaultEffort,
+      can_disable_thinking: declaration.canDisableThinking,
+    },
   };
 }
 
@@ -496,5 +528,6 @@ export function mapModelCatalogue(payload, {
     context_window: null,
     max_output_tokens: null,
     wb_source: 'fallback',
+    wb_reasoning: null,
   }));
 }

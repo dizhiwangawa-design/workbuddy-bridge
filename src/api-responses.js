@@ -37,6 +37,7 @@ import {
   mergePartialOutput,
 } from './responses-store.js';
 import { debug, warn } from './log.js';
+import { resolveReasoningEffort } from './reasoning-effort.js';
 
 function runtimeError(message, code, {
   status = 502,
@@ -109,6 +110,7 @@ function parseOptions(options) {
 export function createResponsesRuntime(options = {}) {
   const {
     upstreamClient = createUpstreamClient(),
+    reasoningCatalogue = null,
     readCredentials = readAccountCredentials,
     pick = pickAccount,
     begin = beginTask,
@@ -129,6 +131,22 @@ export function createResponsesRuntime(options = {}) {
   const store = options.store || options.cancelPersistence
     || createResponsesStore({ now });
   let retriedDeadLetters = false;
+
+  function applyReasoningEffort(prepared, account, credentials) {
+    const declaration = reasoningCatalogue?.getDeclaration({
+      accountId: account,
+      credentials,
+      model: prepared.model,
+    }) || null;
+    const forwardedEffort = resolveReasoningEffort(
+      prepared.requestedEffort,
+      declaration,
+    );
+    if (forwardedEffort === null) delete prepared.body.reasoning_effort;
+    else prepared.body.reasoning_effort = forwardedEffort;
+    prepared.forwardedEffort = forwardedEffort;
+    return forwardedEffort;
+  }
 
   async function ensureDeadLetterRetry() {
     if (retriedDeadLetters) return;
@@ -1167,6 +1185,7 @@ export function createResponsesRuntime(options = {}) {
           { status: 401, type: 'authentication_error', retryable: true },
         );
         if (credentials.needsRefresh) credentials = await refresh(account, credentials);
+        applyReasoningEffort(prepared, account, credentials);
         armFirstByte();
         armTotal();
         let upstream = await upstreamClient.chat({

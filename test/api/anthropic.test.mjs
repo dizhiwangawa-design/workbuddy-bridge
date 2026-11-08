@@ -156,14 +156,76 @@ test('tool_result 没有匹配前一条 assistant tool_use 时返回 400', () =>
   }), (error) => error.status === 400 && /tool_use/.test(error.message));
 });
 
-test('Anthropic 对不支持的 thinking、缓存与请求字段返回明确 400', () => {
+test('Anthropic thinking 预算映射为具名档位', () => {
+  const base = {
+    model: 'deepseek-v4.1-flash',
+    max_tokens: 2048,
+    messages: [{ role: 'user', content: 'hello' }],
+  };
+  for (const [thinking, effort, enabled] of [
+    [{ type: 'enabled', budget_tokens: 1024 }, 'low', true],
+    [{ type: 'enabled', budget_tokens: 8000 }, 'high', true],
+    [{ type: 'enabled', budget_tokens: 32000 }, 'max', true],
+    [{ type: 'disabled' }, 'none', false],
+  ]) {
+    const normalized = normalizeAnthropicRequest({ ...base, thinking });
+    assert.equal(normalized.requestedEffort, effort);
+    assert.equal(normalized.thinkingEnabled, enabled);
+  }
+  const absent = normalizeAnthropicRequest(base);
+  assert.equal(absent.requestedEffort, 'none');
+  assert.equal(absent.thinkingEnabled, false);
+});
+
+test('Anthropic thinking 的畸形请求返回 400', () => {
+  const base = {
+    model: 'deepseek-v4.1-flash',
+    max_tokens: 64,
+    messages: [{ role: 'user', content: 'hello' }],
+  };
+  for (const thinking of [
+    {},
+    { type: 'maybe' },
+    { type: 'enabled' },
+    { type: 'enabled', budget_tokens: -1 },
+    { type: 'enabled', budget_tokens: 1.5 },
+  ]) {
+    assert.throws(
+      () => normalizeAnthropicRequest({ ...base, thinking }),
+      (error) => error.status === 400 && error.type === 'invalid_request_error',
+    );
+  }
+});
+
+test('Anthropic 历史回放忽略 thinking 块', () => {
+  const normalized = normalizeAnthropicRequest({
+    model: 'deepseek-v4.1-flash',
+    max_tokens: 64,
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'private', signature: '' },
+          { type: 'redacted_thinking', data: 'private' },
+          { type: 'text', text: 'answer' },
+        ],
+      },
+      { role: 'user', content: 'next' },
+    ],
+  });
+  assert.deepEqual(normalized.messages[0], {
+    role: 'assistant',
+    content: 'answer',
+  });
+});
+
+test('Anthropic 对不支持的缓存与请求字段返回明确 400', () => {
   const base = {
     model: 'deepseek-v4.1-flash',
     max_tokens: 64,
     messages: [{ role: 'user', content: 'hello' }],
   };
   for (const body of [
-    { ...base, thinking: { type: 'enabled', budget_tokens: 1 } },
     { ...base, mcp_servers: [] },
     { ...base, container: 'container_1' },
     { ...base, cache_control: { type: 'ephemeral' } },
@@ -374,6 +436,74 @@ test('Anthropic encoder 直接结束空响应时仍生成完整成功事件序�
     'message_stop',
   ]);
   assert.equal(events[0].data.message.id, 'msg_empty');
+});
+
+test('Anthropic 流式 thinking 使用合法内容块和 delta', () => {
+  const encoder = createAnthropicEncoder({
+    id: 'msg_thinking',
+    model: 'deepseek-v4.1-flash',
+    inputTokens: 5,
+    thinkingEnabled: true,
+  });
+  const events = [
+    ...encoder.start(),
+    ...encoder.thinkingDelta('inspect'),
+    ...encoder.textDelta('done'),
+    ...encoder.finalize({
+      finishReason: 'stop',
+      outputTokens: 8,
+      reasoningTokens: 3,
+    }),
+  ];
+
+  const start = events.find((event) => (
+    event.type === 'content_block_start'
+    && event.data.content_block.type === 'thinking'
+  ));
+  assert.deepEqual(start.data.content_block, {
+    type: 'thinking',
+    thinking: '',
+    signature: '',
+  });
+  assert.equal(
+    events.filter((event) => event.data?.delta?.type === 'thinking_delta')
+      .map((event) => event.data.delta.thinking)
+      .join(''),
+    'inspect',
+  );
+  assert.ok(events.some((event) => (
+    event.type === 'content_block_delta'
+    && event.data.delta.type === 'signature_delta'
+    && event.data.delta.signature === ''
+  )));
+  const stop = events.find((event) => (
+    event.type === 'content_block_stop'
+    && event.data.index === start.data.index
+  ));
+  assert.ok(stop);
+  const terminal = events.find((event) => event.type === 'message_delta');
+  assert.equal(terminal.data.usage.output_tokens_details.reasoning_tokens, 3);
+});
+
+test('Anthropic 禁用 thinking 时 encoder 不输出推理内容', () => {
+  const encoder = createAnthropicEncoder({
+    id: 'msg_no_thinking',
+    model: 'deepseek-v4.1-flash',
+    thinkingEnabled: false,
+  });
+  const events = [
+    ...encoder.start(),
+    ...encoder.thinkingDelta('must not leak'),
+    ...encoder.finalize({ finishReason: 'stop', outputTokens: 2 }),
+  ];
+  assert.equal(
+    events.some((event) => event.data?.content_block?.type === 'thinking'),
+    false,
+  );
+  assert.equal(
+    events.some((event) => event.data?.delta?.type === 'thinking_delta'),
+    false,
+  );
 });
 
 test('没有最终工具块时不会仅因上游 finish_reason 返回 tool_use', () => {

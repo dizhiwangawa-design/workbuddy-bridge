@@ -76,6 +76,9 @@ async function startFixture(t, upstreamHandler, overrides = {}) {
     directory: path.join(tmp, `openai-cancel-${Date.now()}-${Math.random()}`),
   });
   const apiDeps = { upstreamClient, cancelPersistence: store };
+  if (overrides.reasoningCatalogue) {
+    apiDeps.reasoningCatalogue = overrides.reasoningCatalogue;
+  }
   delete overrides.cancelStore;
   const bridge = await startHttpServer({
     port: 0,
@@ -285,7 +288,7 @@ test('OpenAI SSE 聚合生成标准非流式响应', async () => {
         delta: { content: 'ng', reasoning_content: 'think' },
       }],
     },
-    '{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}',
+    '{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4,"completion_tokens_details":{"reasoning_tokens":0}}}',
     '[DONE]',
   ]);
   const response = toOpenAIResponse(aggregate, 'deepseek-v4.1-flash', {
@@ -303,6 +306,7 @@ test('OpenAI SSE 聚合生成标准非流式响应', async () => {
     prompt_tokens: 3,
     completion_tokens: 1,
     total_tokens: 4,
+    completion_tokens_details: { reasoning_tokens: 0 },
   });
 });
 
@@ -326,7 +330,17 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
   const mapped = mapModelCatalogue({
     data: {
       models: [
-        { id: 'model-a', name: 'Model A', maxInputTokens: 1000, maxOutputTokens: 200 },
+        {
+          id: 'model-a',
+          name: 'Model A',
+          maxInputTokens: 1000,
+          maxOutputTokens: 200,
+          reasoning: {
+            supportedEfforts: ['low', 'high', 'max'],
+            defaultEffort: 'high',
+            canDisableThinking: false,
+          },
+        },
       ],
     },
   });
@@ -338,6 +352,13 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
     name: 'Model A',
     context_window: 1000,
     max_output_tokens: 200,
+    wb_reasoning: {
+      form: 'supported',
+      supported_efforts: ['low', 'high', 'max'],
+      declared_effort: null,
+      default_effort: 'high',
+      can_disable_thinking: false,
+    },
   }]);
 
   const fallback = mapModelCatalogue(null, {
@@ -348,6 +369,265 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
     ['auto', 'deepseek-v4.1-flash'],
   );
   assert(fallback.every((model) => model.wb_source === 'fallback'));
+  assert(fallback.every((model) => model.wb_reasoning === null));
+});
+
+test('模型目录在 TTL 内复用同一份缓存', async (t) => {
+  let catalogueCalls = 0;
+  const { baseUrl } = await startFixture(t, (req, res) => {
+    if (req.url === '/v2/enterprises/personal/models') {
+      catalogueCalls += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        data: {
+          models: [{
+            id: 'deepseek-v4.1-flash',
+            reasoning: {
+              supportedEfforts: ['low', 'high', 'max'],
+              defaultEffort: 'high',
+              canDisableThinking: true,
+            },
+          }],
+        },
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  const first = await fetch(`${baseUrl}/v1/models`);
+  const second = await fetch(`${baseUrl}/v1/models`);
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(catalogueCalls, 1);
+});
+
+test('模型目录 refresh=true 强制刷新', async (t) => {
+  let catalogueCalls = 0;
+  const { baseUrl } = await startFixture(t, (req, res) => {
+    if (req.url === '/v2/enterprises/personal/models') {
+      catalogueCalls += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        data: {
+          models: [{
+            id: 'deepseek-v4.1-flash',
+            reasoning: { effort: 'medium' },
+          }],
+        },
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await fetch(`${baseUrl}/v1/models`);
+  await fetch(`${baseUrl}/v1/models?refresh=true`);
+  await fetch(`${baseUrl}/v1/models`);
+
+  assert.equal(catalogueCalls, 2);
+});
+
+function declarationCatalogue(declaration) {
+  return {
+    getDeclaration() {
+      return declaration;
+    },
+  };
+}
+
+const CHAT_THREE_RUNG = {
+  form: 'supported',
+  efforts: ['low', 'high', 'max'],
+  declaredEffort: null,
+  defaultEffort: 'high',
+  canDisableThinking: true,
+};
+
+const CHAT_SINGLE_MEDIUM = {
+  form: 'single',
+  efforts: ['medium'],
+  declaredEffort: 'medium',
+  defaultEffort: null,
+  canDisableThinking: null,
+};
+
+const CHAT_NO_REASONING = {
+  form: 'none',
+  efforts: [],
+  declaredEffort: null,
+  defaultEffort: null,
+  canDisableThinking: null,
+};
+
+test('Chat 按模型支持集合归一化 reasoning_effort 并保留 reasoning usage', async (t) => {
+  const bodies = [];
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6,'
+      + '"completion_tokens_details":{"reasoning_tokens":1}}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'route' }],
+      reasoning_effort: 'medium',
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(bodies[0].reasoning_effort, 'high');
+  assert.equal(body.usage.completion_tokens_details.reasoning_tokens, 1);
+});
+
+test('Chat 流式终帧保留 reasoning_tokens', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,'
+      + '"completion_tokens_details":{"reasoning_tokens":2}}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'stream' }],
+      reasoning_effort: 'high',
+      stream: true,
+    }),
+  });
+  const events = parseSse(await response.text());
+  const finalUsage = events.find((event) => event.usage)?.usage;
+
+  assert.equal(response.status, 200);
+  assert.equal(finalUsage.completion_tokens_details.reasoning_tokens, 2);
+});
+
+test('Chat 单值声明覆盖任意非关闭档位', async (t) => {
+  let received;
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_SINGLE_MEDIUM),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deep-model',
+      messages: [{ role: 'user', content: 'route' }],
+      reasoning_effort: 'max',
+    }),
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(received.reasoning_effort, 'medium');
+});
+
+test('Chat 已知模型缺少 reasoning 时转发 none', async (t) => {
+  let received;
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'off' }],
+    }),
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(received.reasoning_effort, 'none');
+});
+
+test('Chat 无 reasoning 声明时删除克隆中的字段', async (t) => {
+  let received;
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_NO_REASONING),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'glm-4.6',
+      messages: [{ role: 'user', content: 'plain' }],
+      reasoning_effort: 'high',
+    }),
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal('reasoning_effort' in received, false);
+});
+
+test('Chat 未知 reasoning_effort 返回 400 且不请求上游', async (t) => {
+  let calls = 0;
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    calls += 1;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'route' }],
+      reasoning_effort: 'hihg',
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.error.code, 'invalid_reasoning_effort');
+  assert.equal(calls, 0);
 });
 
 test('POST /v1/chat/completions 返回文本、usage 并释放号池租约', async (t) => {
