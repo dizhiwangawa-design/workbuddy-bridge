@@ -117,9 +117,14 @@ low < medium < high < xhigh < max
 
 缓存缺失时的保守回退：
 
-- `glm-*`、`kimi-*`、`deepseek-*` 使用 `low|high|max`。
-- 其他模型使用公共子集 `low|high`。
-- 目录明确声明无 reasoning 对象时始终优先使用该声明，不发送字段。
+- 不按模型名前缀猜测档位集合。
+- 目录快照中查不到目标模型时，不注入 `reasoning_effort`。
+- 冷启动首个请求可能因此不显式控制思考，但不会向无 reasoning 能力的模型注入
+  未经验证的字段。
+
+上游从未承诺模型名称与档位能力之间存在对应关系。`glm-5.2`、`kimi-k2.5`、
+`deepseek-v4-flash` 等单值声明，以及无 reasoning 对象的 `glm-4.6`、
+`glm-4.7`、`glm-5.0`，都证明前缀推断会产生错误注入。
 
 ## 各协议行为
 
@@ -137,6 +142,8 @@ low < medium < high < xhigh < max
 
 - 读取并校验 `reasoning.effort`。
 - 在选定账号后把归一化结果写入上游 `reasoning_effort`。
+- 模型目录明确无 reasoning 对象，或缓存中没有该模型时，白名单构造 `outbound`
+  时必须不添加 `reasoning_effort`。
 - 对外仍保持客户端未请求输出上限时的 `max_output_tokens: null` 语义。
 - 响应中的 `reasoning.effort` 返回实际转发值。
 - reasoning token 继续映射到
@@ -147,8 +154,12 @@ low < medium < high < xhigh < max
 - 接受并校验顶层 `reasoning_effort`。
 - 与 Responses 复用同一归一化函数。
 - 以解析后的模型声明覆盖客户端原值后再发往上游。
+- Chat 从客户端请求全量克隆，因此模型目录明确无 reasoning 对象，或缓存中没有
+  该模型时，必须显式 `delete outbound.reasoning_effort`。
 - 输出 usage 保留
   `completion_tokens_details.reasoning_tokens`。
+
+两条路径只共用纯转换函数；注入动作由协议层分别完成。
 
 ### Anthropic Messages
 
@@ -162,8 +173,9 @@ low < medium < high < xhigh < max
 | `type: enabled`，预算 `4096..16383` | `high` |
 | `type: enabled`，预算 `>= 16384` | `max` |
 
-预算分桶结果仍必须经过目标模型的档位集合归一化。`thinking.type` 缺失但
-`thinking` 对象存在时，沿用 Anthropic 兼容语义按 `enabled` 处理。
+预算分桶结果仍必须经过目标模型的档位集合归一化。`thinking.type` 是必填字段；
+`thinking: {}`、缺失 `type`、未知 `type` 都返回 400，不把畸形请求解释为
+`enabled`。
 
 响应映射：
 
@@ -176,6 +188,10 @@ low < medium < high < xhigh < max
   忽略 thinking 块。
 - `none` 后上游仍返回非空 `reasoning_content` 时，不把内容泄漏给禁用了 thinking
   的客户端，但记录不含正文的 warning，并按上游可用值如实上报 reasoning token。
+
+Responses 的 `reasoning.effort` 回显实际转发值是有意的观测语义。客户端传入
+`medium` 而目标模型只支持 `low|high|max` 时，响应可以返回 `high`。如果客户端
+强制要求回显值等于请求值，该客户端需要单独适配；bridge 不伪造一致。
 
 ## 输出预算与截断
 
@@ -205,13 +221,29 @@ low < medium < high < xhigh < max
 
 ## 错误处理
 
-- Responses/Chat 的未知档位返回协议对应的 400。
+- Responses/Chat 的未知档位返回协议对应的 400。这是对外行为变更：Chat 过去会
+  原样透传并依赖上游忽略未知值，现在会让配置错误立即可见。
 - Anthropic 未知 `thinking.type` 返回 400。
+- Anthropic `thinking: {}` 或缺失 `thinking.type` 返回 400。
 - Anthropic `budget_tokens` 必须是非负整数；非法值返回 400。
 - 目录不可用不是请求失败条件，除非模型明确要求无法回退的能力。
 - 上游 5xx 不使已有档位缓存失效。
 - `canDisableThinking` 不参与注入判断；无论其值为何都先发送客户端要求的
   `none`。部分模型仍可能继续思考，因此响应阶段必须观察实际 reasoning 内容。
+
+PR1 不增加未知档位兼容开关。严格 400 是明确的产品决策；若后续需要过渡期，应
+另行设计配置和弃用周期，不能在 PR1 中暗含宽松模式。
+
+## 对外变更记录
+
+PR1 必须同步增加 `CHANGELOG.md`，记录以下行为变更：
+
+- Responses 和 Chat 的未知推理档位从透传/忽略改为 400。
+- Responses 的 `reasoning.effort` 从固定 `null` 改为实际转发值。
+- Chat/Responses 的模型不支持 reasoning 时不再向上游发送该字段。
+- 请求档位可能被归一化为目标模型支持的其他档位。
+
+仓库当前没有 `CHANGELOG.md`，PR1 创建该文件即可，不需要伪造历史版本条目。
 
 ## 测试策略
 
@@ -251,6 +283,12 @@ thinkingHappened = reasoningTokens > 0 || reasoningContent.length > 0
 - 服务端记录不含正文的 warning。
 - 上游明确报告的 reasoning token 不被抹成 0。
 
+严格 thinking 参数测试还需覆盖：
+
+- `thinking: {}` 返回 400。
+- `thinking.type` 缺失或未知时返回 400。
+- `thinking.type: disabled` 仍正常映射 `none`。
+
 目录测试覆盖：
 
 - 相同账号和模型在 TTL 内只加载一次。
@@ -260,9 +298,26 @@ thinkingHappened = reasoningTokens > 0 || reasoningContent.length > 0
 - 刷新失败保留旧快照。
 - 模型列表和档位解析使用同一快照中的 reasoning 声明。
 
-实现完成后运行相关 API 测试文件，并运行 `npm test`。当前基线中与本功能无关的
-`ERR_WORKER_INVALID_EXEC_ARGV` 和取消持久化失败必须单独记录，不能当作本次功能
-通过或失败的依据。
+### 验收命令
+
+PR1 和 PR2 的 API 验收命令统一为：
+
+```bash
+npm run test:api
+```
+
+该命令必须退出码为 0，并新增覆盖本规格的测试。`test/api/run.mjs` 按文件隔离
+运行，不受 CLI 登录测试影响。
+
+`npm test` 定义为 `node test/run.mjs && node test/api/run.mjs`。当
+`run.mjs` 的登录 TUI 测试在某个环境中失败时，`&&` 会短路，API 测试根本不会
+执行。因此：
+
+- 不得用 `npm test` 单独证明 API 测试通过。
+- 若 `npm test` 通过，可作为补充的全量验收证据。
+- 若 `run.mjs` 失败，记录本机实际失败项和输出，并与同一提交前的基线比较；
+  不把某个环境中的登录失败静态描述为普遍已知错误。
+- PR1/PR2 的合并门槛以 `npm run test:api` 为准。
 
 ## 许可证边界
 
@@ -278,6 +333,8 @@ thinkingHappened = reasoningTokens > 0 || reasoningContent.length > 0
 - 新增 endpoint + UID 目录缓存，并让模型列表与档位解析共用快照。
 - Responses/Chat 注入、回显和 reasoning token 透出。
 - 单值声明沿用目录值。
+- 冷启动无目录快照时不按模型名前缀猜测，直接不注入。
+- 严格拒绝未知档位，并创建 `CHANGELOG.md` 记录行为变更。
 - 不修改 Anthropic thinking。
 
 ### PR2
