@@ -45,6 +45,7 @@ import {
 } from './stream-control.js';
 import { createDeadLetter, createResponsesStore } from './responses-store.js';
 import { createChatEncoder } from './protocols/openai.js';
+import { resolveReasoningEffort } from './reasoning-effort.js';
 
 const ANTHROPIC_ESTIMATOR = 'wb-conservative-v1';
 const PING_INTERVAL_MS = PRODUCTION_KEEPALIVE_MS;
@@ -1193,12 +1194,21 @@ function openAIUsage(source, fallbackInput = 0, fallbackOutput = 0) {
   const total = Number(source?.total_tokens);
   const promptTokens = Number.isFinite(prompt) ? prompt : fallbackInput;
   const completionTokens = Number.isFinite(completion) ? completion : fallbackOutput;
+  const reasoning = source?.completion_tokens_details?.reasoning_tokens;
+  const reasoningTokens = Number(reasoning);
   return {
     prompt_tokens: Math.max(0, promptTokens),
     completion_tokens: Math.max(0, completionTokens),
     total_tokens: Number.isFinite(total)
       ? Math.max(0, total)
       : Math.max(0, promptTokens + completionTokens),
+    ...(reasoning !== undefined && reasoning !== null && Number.isFinite(reasoningTokens)
+      ? {
+          completion_tokens_details: {
+            reasoning_tokens: Math.max(0, reasoningTokens),
+          },
+        }
+      : {}),
   };
 }
 
@@ -1555,6 +1565,14 @@ export function createOpenAIRuntime({
         });
       }
       if (credentials.needsRefresh) credentials = await refreshCredentials(credentials);
+      const declaration = reasoningCatalogue?.getDeclaration({
+        accountId: account,
+        credentials,
+        model: body.model,
+      }) || null;
+      const forwardedEffort = resolveReasoningEffort(body.requestedEffort, declaration);
+      if (forwardedEffort === null) delete body.body.reasoning_effort;
+      else body.body.reasoning_effort = forwardedEffort;
 
       armTotal();
       armFirstByte();
