@@ -665,6 +665,8 @@ export function createAnthropicRuntime({
       );
       if (forwardedEffort === null) delete body.body.reasoning_effort;
       else body.body.reasoning_effort = forwardedEffort;
+      // 实际转发值：客户端回显与排查都读它，而不是读请求里的原始值。
+      body.forwardedEffort = forwardedEffort;
     }
 
     try {
@@ -1642,6 +1644,7 @@ export function createOpenAIRuntime({
       const forwardedEffort = resolveReasoningEffort(body.requestedEffort, declaration);
       if (forwardedEffort === null) delete body.body.reasoning_effort;
       else body.body.reasoning_effort = forwardedEffort;
+      body.forwardedEffort = forwardedEffort;
 
       armTotal();
       armFirstByte();

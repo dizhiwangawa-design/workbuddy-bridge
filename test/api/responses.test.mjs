@@ -2265,3 +2265,58 @@ async function waitFor(predicate, timeout = 1000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+// ---------------------------------------------------------------------------
+// 冷目录：DeepSeek Harness 的真实场景。
+// 它的模型列表是手写的，从不调用 GET /v1/models，所以能力目录永远是冷的。
+// 旧行为是冷目录一律删掉 reasoning_effort，上游因此不再返回 reasoning_content。
+// ---------------------------------------------------------------------------
+test('Responses 能力目录未预热时透传客户端档位', async (t) => {
+  let received;
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstream(res, 'done');
+  }); // 不传 reasoningCatalogue：等价于目录冷
+
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'go',
+      reasoning: { effort: 'max' },
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(received.reasoning_effort, 'max');
+  assert.equal(body.reasoning.effort, 'max');
+});
+
+test('Responses 冷目录下客户端的 none 与未声明的行为保持不变', async (t) => {
+  const received = [];
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    upstream(res, 'done');
+  });
+
+  for (const reasoning of [{ effort: 'none' }, undefined]) {
+    await fetch(`${baseUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        input: 'off',
+        ...(reasoning ? { reasoning } : {}),
+      }),
+    });
+  }
+
+  assert.equal(received[0].reasoning_effort, 'none');
+  assert.equal(received[1].reasoning_effort, 'none');
+});
