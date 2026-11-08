@@ -227,6 +227,11 @@ bridge 不返回 reasoning 正文；若上游仍返回非空 `reasoning_content`
 管理页的 **OpenAI 协议** 开关只控制 OpenAI 路由；默认保持关闭，开启后可通过
 同一端口使用以下接口（管理页继续提供独立 OpenAI 开关）：
 
+> 第三方客户端里的 **API 地址 / API Base URL** 应填写
+> `http://127.0.0.1:7666/v1`，不要填写 `/v1/responses` 或
+> `/v1/chat/completions`。协议选择只决定生成请求使用哪条路由；模型目录始终从
+> `http://127.0.0.1:7666/v1/models` 获取。
+
 | 方法与路径 | 当前范围 |
 |:---|:---|
 | `POST /v1/chat/completions` | 流式 / 非流式文本、图片、function 工具与多轮 `tool` 续传 |
@@ -346,6 +351,9 @@ Chat Completions 的顶层 `reasoning_effort` 与 Responses 的
 读取同一份快照。`GET /v1/models?refresh=true` 或
 `GET /v1/models/:id?refresh=true` 强制刷新；刷新失败时继续使用旧快照，并把列表
 来源标为 `stale`。模型行中的 `wb_reasoning` 字段展示归一化后的能力声明。
+模型行同时输出 `input`、`input_modalities` 与
+`architecture.input_modalities`；上游目录声明 `supportsImages:true` 时三者都会
+包含 `image`，让客户端能在发请求前正确启用图片输入。
 
 Responses 的持久化和可靠性规则：
 
@@ -520,7 +528,8 @@ wb doctor            # 确认已登录
 
 ## DeepSeek Harness（dsh）接入细节
 
-dsh 的配置模型和别的客户端都不一样，有两点容易踩坑，`wb install` 已经替你处理：
+dsh 的配置模型和别的客户端都不一样，前两点由 `wb install` 处理，第三点需要在
+`llm-pi-ai` 模型条目中声明：
 
 **1. 它不是 `mcpServers` JSON，而是一份 YAML patch 层。**
 
@@ -562,6 +571,29 @@ wb install 每次都会按当前 dsh 版本重新对齐，所以升级 dsh 后�
 配置生效后，工具在 dsh 里叫 `mcp__workbuddy__workbuddy_task`（MCP 服务器限定命名），其余用法不变。
 
 > `wb install` 会写入 `~/.dsh/profiles/` 下所有已初始化的 profile。设 `WB_DSH_SKIP_PLUGIN_INSTALL=1` 可跳过插件安装、只写配置。
+
+**3. 手写模型条目不会自动继承桥接的推理与图片能力。**
+
+dsh 对不在其内置目录中的模型默认只宣告文本输入、不提供思考档位。否则它会在本地
+拒绝图片，也不会向桥接发送 `reasoning.effort`。以 `deepseek-v4.1-flash` 为例：
+
+```yaml
+models:
+  - id: deepseek-v4.1-flash
+    name: DeepSeek-V4.1-Flash
+    contextWindow: 1000000
+    maxTokens: 128000
+    input: [text, image]
+    reasoningEfforts:
+      off:
+      low: low
+      high: high
+      max: max
+```
+
+路由级 `reasoning: high` 可指定默认档位。桥接的 `/v1/models` 已同步上游真实的
+`input` 与 `wb_reasoning`，但当前 dsh 网络发现只采纳 id、名称和容量，因此手写条目
+仍需把能力字段写在 `cordis.patch.yml` 中。
 
 ## 工具一览
 

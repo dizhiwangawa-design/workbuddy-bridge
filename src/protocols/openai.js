@@ -484,6 +484,7 @@ function modelRow(model) {
   const id = String(model.id || '').trim();
   if (!id || id === 'undefined') return null;
   const declaration = reasoningDeclaration(model);
+  const input = ['text', ...(model.supportsImages === true ? ['image'] : [])];
   return {
     id,
     object: 'model',
@@ -492,6 +493,12 @@ function modelRow(model) {
     name: model.name || id,
     context_window: model.maxInputTokens ?? null,
     max_output_tokens: model.maxOutputTokens ?? null,
+    input,
+    input_modalities: input,
+    architecture: {
+      input_modalities: input,
+      output_modalities: ['text'],
+    },
     wb_reasoning: {
       form: declaration.form,
       supported_efforts: declaration.efforts,

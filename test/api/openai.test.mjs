@@ -333,6 +333,7 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
         {
           id: 'model-a',
           name: 'Model A',
+          supportsImages: true,
           maxInputTokens: 1000,
           maxOutputTokens: 200,
           reasoning: {
@@ -352,6 +353,12 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
     name: 'Model A',
     context_window: 1000,
     max_output_tokens: 200,
+    input: ['text', 'image'],
+    input_modalities: ['text', 'image'],
+    architecture: {
+      input_modalities: ['text', 'image'],
+      output_modalities: ['text'],
+    },
     wb_reasoning: {
       form: 'supported',
       supported_efforts: ['low', 'high', 'max'],
@@ -360,6 +367,18 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
       can_disable_thinking: false,
     },
   }]);
+
+  const textOnly = mapModelCatalogue({
+    data: {
+      models: [{ id: 'text-only', supportsImages: false }],
+    },
+  });
+  assert.deepEqual(textOnly[0].input, ['text']);
+  assert.deepEqual(textOnly[0].input_modalities, ['text']);
+  assert.deepEqual(textOnly[0].architecture, {
+    input_modalities: ['text'],
+    output_modalities: ['text'],
+  });
 
   const fallback = mapModelCatalogue(null, {
     defaultModel: 'deepseek-v4.1-flash',
@@ -893,7 +912,7 @@ test('OpenAI 工具结果引用缺失或工具开关关闭时返回明确错误'
   }, { toolsEnabled: false }), (error) => error.code === 'tools_disabled');
 });
 
-test('管理页提供独立的 OpenAI 开关和接口地址', async (t) => {
+test('管理页提供独立的 OpenAI 开关、Base URL 和接口地址', async (t) => {
   const { baseUrl } = await startFixture(t, async (_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{"data":{"models":[]}}');
@@ -901,6 +920,9 @@ test('管理页提供独立的 OpenAI 开关和接口地址', async (t) => {
   const html = await (await fetch(`${baseUrl}/admin`)).text();
   assert.match(html, /data-act="api-openai-toggle"/);
   assert.match(html, /data-act="api-copy-openai-endpoint"/);
+  assert.match(html, /Base URL/);
+  assert.match(html, /不要带 \/responses/);
+  assert.match(html, /\/v1\/models/);
   assert.match(html, /id="api-responses-persistence-switch"/);
   assert.match(html, /id="api-responses-nudge-switch"/);
   assert.match(html, /Responses 持久化/);

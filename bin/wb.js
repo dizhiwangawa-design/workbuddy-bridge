@@ -84,7 +84,7 @@ ${C.bold('用法')}
       检查环境。
 
 ${C.bold('API 兼容入口')}
-  OpenAI Base  http://127.0.0.1:7666/v1
+  OpenAI Base  http://127.0.0.1:7666/v1   （客户端填这里，不要带具体接口）
   POST         /v1/chat/completions
   POST         /v1/responses
   WS           /v1/responses

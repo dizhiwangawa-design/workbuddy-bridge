@@ -11,6 +11,10 @@
 - Responses report the actually forwarded reasoning effort instead of `null`.
 - Models without reasoning capability do not receive `reasoning_effort`.
 - Model listings include a namespaced `wb_reasoning` capability declaration.
+- Model listings now publish upstream image support through `input`,
+  `input_modalities`, and `architecture.input_modalities`.
+- The admin page now distinguishes the OpenAI Base URL from request endpoints and
+  shows the model catalogue URL to prevent `/v1/responses/models` misconfiguration.
 - The model catalogue is cached for ten minutes per upstream endpoint and account
   UID; `/v1/models?refresh=true` forces a refresh.
 - OpenAI Chat and Responses preserve upstream reasoning-token usage details.

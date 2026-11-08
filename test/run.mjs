@@ -485,7 +485,7 @@ await test('管理页 Key 用量按 Anthropic、Chat、Responses 分开显示', 
   assert(/0 tok/.test(rendered), '缺少 Responses 空 token');
 });
 
-await test('管理页 OpenAI 卡片分别展示 Chat 与 Responses 地址及用量', async () => {
+await test('管理页 OpenAI 卡片明确展示 Base URL、接口与模型目录地址', async () => {
   const vm = await import('node:vm');
   const { adminPage } = await import('../src/admin.js');
   const html = adminPage({ home: '/tmp/test-bridge' });
@@ -499,8 +499,12 @@ await test('管理页 OpenAI 卡片分别展示 Chat 与 Responses 地址及用�
     openai_chat: { req: 4, tokens: 400 },
     openai_responses: { req: 3, tokens: 300 },
   });
+  assert(/Base URL/.test(rendered), '缺少 OpenAI Base URL');
+  assert(/http:\/\/127\.0\.0\.1:7666\/v1<\/code>/.test(rendered), 'Base URL 不应包含具体接口路径');
+  assert(/不要带 \/responses/.test(rendered), '缺少具体接口路径的防误填提示');
   assert(/http:\/\/127\.0\.0\.1:7666\/v1\/chat\/completions/.test(rendered), '缺少 Chat 地址');
   assert(/http:\/\/127\.0\.0\.1:7666\/v1\/responses/.test(rendered), '缺少 Responses 地址');
+  assert(/http:\/\/127\.0\.0\.1:7666\/v1\/models/.test(rendered), '缺少模型目录地址');
   assert(/4 次/.test(rendered), '缺少 Chat 请求数');
   assert(/400 tok/.test(rendered), '缺少 Chat token');
   assert(/3 次/.test(rendered), '缺少 Responses 请求数');
