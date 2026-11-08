@@ -4,6 +4,7 @@ import {
   budgetEffort,
   reasoningDeclaration,
   resolveReasoningEffort,
+  resolveRequestedEffort,
 } from '../../src/reasoning-effort.js';
 
 function supported(efforts) {
@@ -77,6 +78,81 @@ test('Anthropic 空对象和未知 type 返回 400', () => {
     assert.throws(
       () => budgetEffort(thinking),
       (error) => error.status === 400,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// resolveRequestedEffort：客户端意图 → 实际转发值
+//
+// v0.4 的判定链把「目录里没有这个模型」和「模型不支持 reasoning」压成同一个
+// null，于是一次目录未预热就静默删掉 reasoning_effort，上游随即不再返回思维链
+// （dsh 的模型列表是手写的，永远不会触发目录预热）。这里只修这一点：目录给不出
+// 答案时透传客户端声明的值；未声明与显式 none 的既有行为完全不变。
+// ---------------------------------------------------------------------------
+
+const CLOSABLE = reasoningDeclaration({
+  reasoning: { supportedEfforts: ['low', 'high', 'max'], defaultEffort: 'high', canDisableThinking: true },
+});
+const NOT_CLOSABLE = reasoningDeclaration({
+  reasoning: { supportedEfforts: ['low', 'high', 'max'], defaultEffort: 'high', canDisableThinking: false },
+});
+
+test('目录未知时透传客户端声明的档位', () => {
+  assert.deepEqual(resolveRequestedEffort('max', null), { effort: 'max', source: 'passthrough' });
+  assert.deepEqual(resolveRequestedEffort('high', null), { effort: 'high', source: 'passthrough' });
+  assert.deepEqual(resolveRequestedEffort('minimal', null), { effort: 'low', source: 'passthrough' });
+});
+
+test('目录热时仍然按能力归一化，不透传', () => {
+  assert.deepEqual(resolveRequestedEffort('medium', CLOSABLE), { effort: 'high', source: 'mapped' });
+  assert.deepEqual(resolveRequestedEffort('max', CLOSABLE), { effort: 'max', source: 'mapped' });
+});
+
+test('未声明档位保持现状：一律 none，不读 canDisableThinking', () => {
+  assert.deepEqual(resolveRequestedEffort(null, CLOSABLE), { effort: 'none', source: 'default' });
+  assert.deepEqual(resolveRequestedEffort(undefined, CLOSABLE), { effort: 'none', source: 'default' });
+  assert.deepEqual(resolveRequestedEffort(null, null), { effort: 'none', source: 'default' });
+  assert.deepEqual(resolveRequestedEffort(null, NOT_CLOSABLE), { effort: 'none', source: 'default' });
+});
+
+test('显式 none 保持现状：即便模型声明不可关思考也照发', () => {
+  assert.deepEqual(resolveRequestedEffort('none', CLOSABLE), { effort: 'none', source: 'disabled' });
+  assert.deepEqual(resolveRequestedEffort('none', NOT_CLOSABLE), { effort: 'none', source: 'disabled' });
+  assert.deepEqual(resolveRequestedEffort('none', null), { effort: 'none', source: 'disabled' });
+});
+
+test('明确声明不支持 reasoning 的模型不转发', () => {
+  const noReasoning = reasoningDeclaration({ id: 'glm-4.6' });
+  assert.deepEqual(resolveRequestedEffort('high', noReasoning), { effort: null, source: 'unsupported' });
+  assert.deepEqual(resolveRequestedEffort(null, noReasoning), { effort: null, source: 'unsupported' });
+});
+
+test('未知档位名在冷热目录下都返回 400', () => {
+  for (const declaration of [null, CLOSABLE, reasoningDeclaration({ id: 'glm-4.6' })]) {
+    assert.throws(
+      () => resolveRequestedEffort('hihg', declaration),
+      (error) => error.status === 400 && error.code === 'invalid_reasoning_effort',
+    );
+  }
+});
+
+test('档位大小写归一，输出恒为小写', () => {
+  assert.deepEqual(resolveRequestedEffort('MAX', null), { effort: 'max', source: 'passthrough' });
+  assert.deepEqual(resolveRequestedEffort('Max', CLOSABLE), { effort: 'max', source: 'mapped' });
+});
+
+test('resolveReasoningEffort 与新判定链给出同一个值', () => {
+  for (const [requested, declaration] of [
+    ['max', null],
+    ['medium', CLOSABLE],
+    [null, CLOSABLE],
+    ['none', NOT_CLOSABLE],
+    ['high', reasoningDeclaration({ id: 'glm-4.6' })],
+  ]) {
+    assert.equal(
+      resolveReasoningEffort(requested, declaration),
+      resolveRequestedEffort(requested, declaration).effort,
     );
   }
 });
