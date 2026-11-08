@@ -20,6 +20,7 @@ import {
 } from './tool-calls.js';
 import { createSseParser, encodeSseEvent } from './sse.js';
 import { ApiError, sendApiError } from './api-errors.js';
+import { withClientKeyAttribution } from './api-attribution.js';
 import {
   readAccountCredentials,
   refreshAccountCredentials,
@@ -307,6 +308,7 @@ export function createAnthropicRuntime({
     config,
     stream,
     account,
+    clientKey = null,
     interruptSignal = null,
   }) {
     const requestId = `msg_${randomUUID()}`;
@@ -359,7 +361,7 @@ export function createAnthropicRuntime({
     function releaseLease(result) {
       if (leaseReleased) return;
       leaseReleased = true;
-      end(account, result);
+      end(account, withClientKeyAttribution(result, clientKey, 'anthropic'));
     }
 
     function write(events) {
@@ -1119,7 +1121,7 @@ export function createAnthropicRuntime({
     throw failure;
   }
 
-  async function messages({ req, res, body, config, interruptSignal = null }) {
+  async function messages({ req, res, body, config, clientKey = null, interruptSignal = null }) {
     const normalized = normalizeBody(body, config);
     const pool = poolLoader();
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
@@ -1150,6 +1152,7 @@ export function createAnthropicRuntime({
         config,
         stream: normalized.stream,
         account: picked.name,
+        clientKey,
         interruptSignal,
       });
       if (result.ok) return result;
@@ -1220,6 +1223,7 @@ export function createOpenAIRuntime({
     body,
     config,
     account,
+    clientKey = null,
     interruptSignal = null,
   }) {
     const startedAt = now();
@@ -1308,7 +1312,7 @@ export function createOpenAIRuntime({
     function releaseLease(result) {
       if (leaseReleased) return;
       leaseReleased = true;
-      end(account, result);
+      end(account, withClientKeyAttribution(result, clientKey, 'openai_chat'));
     }
 
     function onClientDisconnect() {
@@ -1881,11 +1885,18 @@ export function createOpenAIRuntime({
     }
   }
 
-  async function chat({ req, res, body, config }) {
-    return chatWithCancellation({ req, res, body, config });
+  async function chat({ req, res, body, config, clientKey = null }) {
+    return chatWithCancellation({ req, res, body, config, clientKey });
   }
 
-  async function chatWithCancellation({ req, res, body, config, interruptSignal = null }) {
+  async function chatWithCancellation({
+    req,
+    res,
+    body,
+    config,
+    clientKey = null,
+    interruptSignal = null,
+  }) {
     if (body?.stream === true && config.streaming === false) {
       throw new ApiError(400, 'streaming is disabled', { code: 'streaming_disabled' });
     }
@@ -1919,6 +1930,7 @@ export function createOpenAIRuntime({
         body: normalized,
         config,
         account: picked.name,
+        clientKey,
       });
       if (result.ok || result.started) return result;
       lastFailure = result.error;

@@ -4,7 +4,7 @@ import {
   publicApiSettings,
   updateApiSettings,
   getApiSettings,
-  verifyApiKey,
+  resolveApiKey,
   resetApiKey,
 } from './api-settings.js';
 import { ApiError, sendApiError } from './api-errors.js';
@@ -146,7 +146,8 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
       return true;
     }
 
-    if (clientKeyRequired(req, config) && !verifyApiKey(readClientKey(req))) {
+    const clientKey = resolveApiKey(readClientKey(req));
+    if (clientKeyRequired(req, config) && !clientKey) {
       sendApiError(res, new ApiError(401, 'invalid API key', {
         type: 'authentication_error',
         code: 'invalid_api_key',
@@ -185,7 +186,7 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
         ...deps,
         cancelPersistence: sharedCancelStore(deps),
       });
-      await runtime.messages({ req, res, body, config });
+      await runtime.messages({ req, res, body, config, clientKey });
       return true;
     }
 
@@ -196,7 +197,7 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
     });
     if (route.operation === 'openai.responses') {
       const body = await readBody(req);
-      await responses.create({ req, res, body, config });
+      await responses.create({ req, res, body, config, clientKey });
       return true;
     }
     if (route.operation === 'openai.response') {
@@ -208,7 +209,7 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
     }
     if (route.operation === 'openai.chat') {
       const body = await readBody(req);
-      await runtime.chat({ req, res, body, config });
+      await runtime.chat({ req, res, body, config, clientKey });
       return true;
     }
     if (route.operation === 'openai.models') {
@@ -262,10 +263,11 @@ export function createApiAuthCheck(deps = {}) {
     const config = getApiSettings();
     if (!config.enabled) return { ok: false, status: 404, code: 'api_disabled', message: 'API compatibility is disabled' };
     if (!config.openai) return { ok: false, status: 404, code: 'protocol_disabled', message: 'OpenAI protocol is disabled' };
-    if (clientKeyRequired(req, config) && !verifyApiKey(readClientKey(req))) {
+    const clientKey = resolveApiKey(readClientKey(req));
+    if (clientKeyRequired(req, config) && !clientKey) {
       return { ok: false, status: 401, code: 'invalid_api_key', message: 'invalid API key' };
     }
-    return { ok: true, config, responses: getResponsesRuntime(deps) };
+    return { ok: true, config, clientKey, responses: getResponsesRuntime(deps) };
   };
 }
 

@@ -62,20 +62,52 @@ export function parseDayKey(key) {
 
 // ------------------------------------------------------------------ 桶
 
-export function emptyBucket() {
+export function emptyMetrics() {
   return { req: 0, ok: 0, fail: 0, tin: 0, tout: 0, cacheRead: 0, cacheWrite: 0, ms: 0, cost: 0 };
 }
 
+export function emptyBucket() {
+  return {
+    ...emptyMetrics(),
+    apis: Object.create(null),
+    keys: Object.create(null),
+  };
+}
+
+function addMetrics(target, src) {
+  target.req += src?.req || 0;
+  target.ok += src?.ok || 0;
+  target.fail += src?.fail || 0;
+  target.tin += src?.tin || 0;
+  target.tout += src?.tout || 0;
+  target.cacheRead += src?.cacheRead || 0;
+  target.cacheWrite += src?.cacheWrite || 0;
+  target.ms += src?.ms || 0;
+  target.cost += src?.cost || 0;
+  return target;
+}
+
 export function addBucket(target, src) {
-  target.req += src.req || 0;
-  target.ok += src.ok || 0;
-  target.fail += src.fail || 0;
-  target.tin += src.tin || 0;
-  target.tout += src.tout || 0;
-  target.cacheRead += src.cacheRead || 0;
-  target.cacheWrite += src.cacheWrite || 0;
-  target.ms += src.ms || 0;
-  target.cost += src.cost || 0;
+  addMetrics(target, src);
+  target.apis ||= Object.create(null);
+  target.keys ||= Object.create(null);
+  for (const [api, metrics] of Object.entries(src?.apis || {})) {
+    target.apis[api] ||= emptyMetrics();
+    addMetrics(target.apis[api], metrics);
+  }
+  for (const [keyId, source] of Object.entries(src?.keys || {})) {
+    if (!target.keys[keyId]) {
+      target.keys[keyId] = {
+        name: source?.name || '',
+        apis: Object.create(null),
+      };
+    }
+    if (source?.name) target.keys[keyId].name = source.name;
+    for (const [api, metrics] of Object.entries(source?.apis || {})) {
+      target.keys[keyId].apis[api] ||= emptyMetrics();
+      addMetrics(target.keys[keyId].apis[api], metrics);
+    }
+  }
   return target;
 }
 
@@ -106,6 +138,11 @@ export function recordSample(pool, sample, now = Date.now()) {
   const s = pool.series;
   const at = sample.at || now;
   const ok = sample.ok ? 1 : 0;
+  const apiProtocol = normalizeApiProtocol(sample.apiProtocol);
+  const clientKeyId = String(sample.clientKeyId || 'anonymous').slice(0, 100) || 'anonymous';
+  const clientKeyName = String(
+    sample.clientKeyName || (apiProtocol === 'unknown' ? '其他来源' : '本机免 Key'),
+  ).slice(0, 80);
 
   const one = {
     req: 1,
@@ -125,6 +162,12 @@ export function recordSample(pool, sample, now = Date.now()) {
   ]) {
     if (!map[key]) map[key] = emptyBucket();
     addBucket(map[key], one);
+    map[key].apis[apiProtocol] ||= emptyMetrics();
+    addMetrics(map[key].apis[apiProtocol], one);
+    map[key].keys[clientKeyId] ||= { name: clientKeyName, apis: Object.create(null) };
+    map[key].keys[clientKeyId].name = clientKeyName;
+    map[key].keys[clientKeyId].apis[apiProtocol] ||= emptyMetrics();
+    addMetrics(map[key].keys[clientKeyId].apis[apiProtocol], one);
   }
 
   s.seq = (Number(s.seq) || 0) + 1;
@@ -139,11 +182,24 @@ export function recordSample(pool, sample, now = Date.now()) {
     tout: one.tout,
     cacheRead: one.cacheRead,
     ms: one.ms,
+    apiProtocol,
+    clientKeyId,
+    clientKeyName,
   });
   if (s.events.length > MAX_EVENTS) s.events.length = MAX_EVENTS;
 
   pruneSeries(pool, now);
   return s;
+}
+
+function normalizeApiProtocol(value) {
+  const api = String(value || '').trim().toLowerCase();
+  if (api === 'anthropic') return 'anthropic';
+  if (api === 'openai' || api === 'openai_chat' || api === 'openai-chat') return 'openai_chat';
+  if (api === 'responses' || api === 'openai_responses' || api === 'openai-responses') {
+    return 'openai_responses';
+  }
+  return 'unknown';
 }
 
 /** 只保留窗口内的桶，避免 pool.json 无限膨胀。 */
@@ -229,11 +285,35 @@ export function summarize(points, price = priceConfig()) {
   const b = emptyBucket();
   for (const p of points) addBucket(b, p);
 
+  const summary = summarizeMetrics(b, price);
   let peakThroughput = 0;
-  for (const p of points) {
-    const v = p.ms ? (p.tout || 0) / (p.ms / 1000) : 0;
-    if (v > peakThroughput) peakThroughput = v;
+  for (const point of points) {
+    const value = point.ms ? (point.tout || 0) / (point.ms / 1000) : 0;
+    if (value > peakThroughput) peakThroughput = value;
   }
+  summary.peakThroughput = peakThroughput;
+  const byApi = Object.fromEntries(
+    Object.entries(b.apis).map(([api, metrics]) => [api, summarizeMetrics(metrics, price)]),
+  );
+  const byKey = Object.fromEntries(
+    Object.entries(b.keys).map(([keyId, entry]) => [
+      keyId,
+      {
+        name: entry.name,
+        ...summarizeMetrics(entry, price),
+        apis: Object.fromEntries(
+          Object.entries(entry.apis).map(([api, metrics]) => [api, summarizeMetrics(metrics, price)]),
+        ),
+      },
+    ]),
+  );
+  return { ...summary, byApi, byKey };
+}
+
+function summarizeMetrics(b, price) {
+  let peakThroughput = 0;
+  const v = b.ms ? (b.tout || 0) / (b.ms / 1000) : 0;
+  if (v > peakThroughput) peakThroughput = v;
 
   const tokens = b.tin + b.tout;
   const cost = costOf(b, price);
@@ -258,7 +338,6 @@ export function summarize(points, price = priceConfig()) {
     costCny: cost.cny,
     costSource: cost.source,
     costUsd: cost.usd,
-    activeAccounts: 0,
   };
 }
 
@@ -309,6 +388,7 @@ export function buildStats(pool, range = 'today', { now = Date.now() } = {}) {
   const granularity = span <= 3 * DAY_MS + HOUR_MS ? 'hour' : 'day';
   const points = seriesPoints(pool, from, win.to, granularity);
   const totals = summarize(points, price);
+  const { byApi, byKey, ...totalValues } = totals;
 
   // 环比：等长的前一段。全部区间没有「上一段」，返回 null 让前端不显示箭头
   let prev = null;
@@ -328,7 +408,9 @@ export function buildStats(pool, range = 'today', { now = Date.now() } = {}) {
     from,
     to: win.to,
     granularity,
-    totals: { ...totals, activeAccounts: accounts.size },
+    totals: { ...totalValues, activeAccounts: accounts.size },
+    byApi,
+    byKey,
     prev,
     deltas: prev
       ? {

@@ -1310,3 +1310,61 @@ test('OpenAI 取消片段持久化失败时不发送成功收尾', async () => {
   assert.doesNotMatch(raw, /"finish_reason":"stop"/);
   assert.doesNotMatch(raw, /data: \[DONE\]/);
 });
+
+test('OpenAI Chat 租约释放保留客户端 Key 归因', async () => {
+  const released = [];
+  const runtime = createOpenAIRuntime({
+    pick: () => ({ name: 'attributed-openai' }),
+    begin: () => {},
+    end: (account, result) => released.push({ account, result }),
+    readCredentials: () => ({
+      ok: true,
+      accessToken: 'test-access',
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    }),
+    upstreamClient: {
+      chat: async () => ({
+        status: 200,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"id":"chat-attribution","choices":[{"delta":{"content":"ok"},'
+              + '"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":1}}\n\n'
+              + 'data: [DONE]\n\n',
+            ));
+            controller.close();
+          },
+        }),
+      }),
+    },
+  });
+  const res = {
+    headersSent: false,
+    writable: true,
+    writableEnded: false,
+    destroyed: false,
+    writeHead() { this.headersSent = true; },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+
+  const result = await runtime.chatWithCancellation({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'attribute this' }],
+    },
+    config: { ...settings.getApiSettings(), openai: true },
+    clientKey: { id: 'key-chat', name: 'desktop' },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(released.length, 1);
+  assert.equal(released[0].result.meta.apiProtocol, 'openai_chat');
+  assert.equal(released[0].result.meta.clientKeyId, 'key-chat');
+  assert.equal(released[0].result.meta.clientKeyName, 'desktop');
+});

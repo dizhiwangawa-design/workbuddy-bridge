@@ -344,6 +344,7 @@ export async function startHttpServer({
       ws,
       send: (message) => ws.send(message),
       config: result.config,
+      clientKey: result.clientKey,
     });
     if (head?.length) socket.emit('data', head);
   });

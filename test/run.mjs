@@ -400,6 +400,113 @@ await test('管理令牌会注入页面并用于后续 API 请求', async () => 
   }
 });
 
+await test('管理页账号卡片能渲染模型标签', async () => {
+  const vm = await import('node:vm');
+  const { adminPage } = await import('../src/admin.js');
+  const html = adminPage({ home: '/tmp/test-bridge' });
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assertEqual(scripts.length, 1, '管理页内联脚本数');
+  const source = scripts[0][1];
+  const start = source.indexOf('var TOKEN=');
+  const end = source.indexOf('function renderPool(){');
+  assert(start >= 0 && end > start, '没有找到账号卡片渲染代码');
+
+  const context = {};
+  vm.runInNewContext(source.slice(start, end), context);
+  const rendered = context.card({
+    name: 'alice',
+    model: 'deepseek-v4.1-flash',
+    status: 'ready',
+    statusText: '可用',
+    enabled: true,
+    isDefault: false,
+    auth: '已登录',
+    inflight: 0,
+    maxConcurrency: 2,
+    weight: 1,
+    lastUsedAt: 0,
+    cooldownLeftMs: 0,
+    cooldownModels: [],
+    lastError: '',
+    quota: { limit: 0, used: 0, remaining: null },
+    today: { req: 0, successRate: null, tokens: 0, cacheHitRate: null, avgMs: 0 },
+  });
+  assert(rendered.includes('deepseek-v4.1-flash'), '模型标签没有渲染出来');
+});
+
+await test('管理页弹窗主按钮保留品牌色背景与白色文字', async () => {
+  const { adminPage } = await import('../src/admin.js');
+  const html = adminPage({ home: '/tmp/test-bridge' });
+  assert(
+    /\.modal \.row button\.primary\{[^}]*background:var\(--brand\);[^}]*color:#fff;?/.test(html),
+    '弹窗主按钮缺少可读的前景与背景配色',
+  );
+});
+
+await test('管理页为客户端 Key 生成不重名的默认名称', async () => {
+  const vm = await import('node:vm');
+  const { adminPage } = await import('../src/admin.js');
+  const html = adminPage({ home: '/tmp/test-bridge' });
+  const source = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+  const start = source.indexOf('function num(');
+  const end = source.indexOf('function renderApi(){');
+  const context = {};
+  vm.runInNewContext(source.slice(start, end), context);
+  assertEqual(typeof context.defaultKeyName, 'function', '缺少默认 Key 命名函数');
+  assertEqual(context.defaultKeyName([], 'dashboard'), 'dashboard');
+  assertEqual(
+    context.defaultKeyName([{ name: 'dashboard' }, { name: 'dashboard-2' }], 'dashboard'),
+    'dashboard-3',
+  );
+});
+
+await test('管理页 Key 用量按 Anthropic、Chat、Responses 分开显示', async () => {
+  const vm = await import('node:vm');
+  const { adminPage } = await import('../src/admin.js');
+  const html = adminPage({ home: '/tmp/test-bridge' });
+  const source = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+  const start = source.indexOf('function num(');
+  const end = source.indexOf('function renderApi(){');
+  const context = {};
+  vm.runInNewContext(source.slice(start, end), context);
+  assertEqual(typeof context.keyUsageHtml, 'function', '缺少 Key 用量渲染函数');
+  const rendered = context.keyUsageHtml({
+    anthropic: { req: 2, tokens: 120 },
+    openai_chat: { req: 1, tokens: 30 },
+  });
+  assert(/Anthropic/.test(rendered), '缺少 Anthropic 指标');
+  assert(/2 次/.test(rendered), '缺少 Anthropic 请求数');
+  assert(/120 tok/.test(rendered), '缺少 Anthropic token');
+  assert(/Chat/.test(rendered), '缺少 Chat 指标');
+  assert(/1 次/.test(rendered), '缺少 Chat 请求数');
+  assert(/30 tok/.test(rendered), '缺少 Chat token');
+  assert(/Responses/.test(rendered), '缺少 Responses 指标');
+  assert(/0 次/.test(rendered), '缺少 Responses 空请求数');
+  assert(/0 tok/.test(rendered), '缺少 Responses 空 token');
+});
+
+await test('管理页 OpenAI 卡片分别展示 Chat 与 Responses 地址及用量', async () => {
+  const vm = await import('node:vm');
+  const { adminPage } = await import('../src/admin.js');
+  const html = adminPage({ home: '/tmp/test-bridge' });
+  const source = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
+  const start = source.indexOf('function num(');
+  const end = source.indexOf('function renderApi(){');
+  const context = {};
+  vm.runInNewContext(source.slice(start, end), context);
+  assertEqual(typeof context.openAiEndpointRows, 'function', '缺少 OpenAI 地址渲染函数');
+  const rendered = context.openAiEndpointRows('http://127.0.0.1:7666', {
+    openai_chat: { req: 4, tokens: 400 },
+    openai_responses: { req: 3, tokens: 300 },
+  });
+  assert(/http:\/\/127\.0\.0\.1:7666\/v1\/chat\/completions/.test(rendered), '缺少 Chat 地址');
+  assert(/http:\/\/127\.0\.0\.1:7666\/v1\/responses/.test(rendered), '缺少 Responses 地址');
+  assert(/4 次/.test(rendered), '缺少 Chat 请求数');
+  assert(/400 tok/.test(rendered), '缺少 Chat token');
+  assert(/3 次/.test(rendered), '缺少 Responses 请求数');
+  assert(/300 tok/.test(rendered), '缺少 Responses token');
+});
+
 // ---------------------------------------------------------------- 号池
 console.log(C.dim('\n[6/7] 号池调度'));
 
@@ -704,6 +811,48 @@ await test('活跃账号数不受请求流展示上限影响', () => {
   assertEqual(stats.totals.activeAccounts, 65, '活跃账号数应覆盖完整区间');
 });
 
+await test('按客户端 Key 和 API 分开统计用量', () => {
+  const now = new Date(2026, 10, 4, 12, 0, 0, 0).getTime();
+  const pool = { series: statsMod.emptySeries(), accounts: {} };
+  statsMod.recordSample(pool, {
+    at: now - 3000,
+    ok: true,
+    tin: 100,
+    tout: 20,
+    apiProtocol: 'anthropic',
+    clientKeyId: 'key-a',
+    clientKeyName: 'laptop',
+  }, now);
+  statsMod.recordSample(pool, {
+    at: now - 2000,
+    ok: true,
+    tin: 200,
+    tout: 30,
+    apiProtocol: 'openai_chat',
+    clientKeyId: 'key-a',
+    clientKeyName: 'laptop',
+  }, now);
+  statsMod.recordSample(pool, {
+    at: now - 1000,
+    ok: false,
+    tin: 300,
+    tout: 40,
+    apiProtocol: 'openai_responses',
+    clientKeyId: 'key-b',
+    clientKeyName: 'desktop',
+  }, now);
+
+  const stats = statsMod.buildStats(pool, 'today', { now });
+  assertEqual(stats.byApi.anthropic.req, 1, 'Anthropic 请求数');
+  assertEqual(stats.byApi.anthropic.tokens, 120, 'Anthropic token');
+  assertEqual(stats.byApi.openai_chat.tokens, 230, 'Chat token');
+  assertEqual(stats.byApi.openai_responses.req, 1, 'Responses 请求数');
+  assertEqual(stats.byKey['key-a'].name, 'laptop', 'Key 名称快照');
+  assertEqual(stats.byKey['key-a'].apis.anthropic.tokens, 120, 'Key 内 Anthropic token');
+  assertEqual(stats.byKey['key-a'].apis.openai_chat.tokens, 230, 'Key 内 Chat token');
+  assertEqual(stats.byKey['key-b'].apis.openai_responses.fail, 1, 'Key 内 Responses 失败数');
+});
+
 await test('endTask 不重复累加缓存 token', () => {
   poolMod.updateAccount('w3', { enabled: true, budgetTokens: 0 });
   const before = poolMod.loadPool().accounts.w3.total.tokensIn || 0;
@@ -715,6 +864,25 @@ await test('endTask 不重复累加缓存 token', () => {
   const after = poolMod.loadPool().accounts.w3;
   assertEqual(after.total.tokensIn - before, 10000, 'input 已含缓存，不再叠加');
   assert(after.total.cacheRead >= 8000, '缓存单独记录');
+});
+
+await test('endTask 把客户端 Key 和 API 归因写入请求明细', () => {
+  poolMod.beginTask('w3');
+  poolMod.endTask('w3', {
+    ok: true,
+    durationMs: 1000,
+    meta: {
+      model: 'deepseek-v4.1-flash',
+      usage: { input_tokens: 10, output_tokens: 2 },
+      apiProtocol: 'openai_responses',
+      clientKeyId: 'key-response',
+      clientKeyName: 'desktop',
+    },
+  });
+  const event = poolMod.loadPool().series.events[0];
+  assertEqual(event.apiProtocol, 'openai_responses');
+  assertEqual(event.clientKeyId, 'key-response');
+  assertEqual(event.clientKeyName, 'desktop');
 });
 
 await test('模型名从 modelUsage 回退解析（真实 CLI 无顶层 model）', async () => {
