@@ -18,6 +18,7 @@ import {
   createDsmlScanner,
   structuredToolArgumentLimit,
 } from './tool-calls.js';
+import { continuationNudgeEnabled } from './continuation-nudge.js';
 import { createSseParser, encodeSseEvent } from './sse.js';
 import { ApiError, sendApiError } from './api-errors.js';
 import { withClientKeyAttribution } from './api-attribution.js';
@@ -268,7 +269,9 @@ function normalizeBody(body, config) {
     ...body,
     model: body?.model || config.defaultModel,
   };
-  const converted = anthropicToOpenAI(candidate);
+  const converted = anthropicToOpenAI(candidate, {
+    continuationNudge: continuationNudgeEnabled(config),
+  });
   for (const warning of converted.warnings) {
     warn(
       `Anthropic request warning: ${warning.code}`
@@ -1988,6 +1991,7 @@ export function createOpenAIRuntime({
     const normalized = prepareOpenAIRequest(body, {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
+      continuationNudge: continuationNudgeEnabled(config),
     });
     const pool = poolLoader();
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));

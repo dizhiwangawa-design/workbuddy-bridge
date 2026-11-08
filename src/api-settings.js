@@ -15,6 +15,7 @@ const BOOLEAN_FIELDS = [
   'tools',
   'responsesPersistence',
   'responsesNudge',
+  'continuationNudge',
   'channelSanitize',
   'requireApiKey',
   'remoteRequireKey',

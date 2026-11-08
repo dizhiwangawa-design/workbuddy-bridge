@@ -60,11 +60,15 @@ test('Anthropic 请求转换支持 tools、图片、tool_result 与 is_error', (
 
   assert.equal(converted.body.stream, true);
   assert.equal(converted.body.messages[0].role, 'system');
-  assert.equal(converted.body.messages[2].role, 'assistant');
-  assert.equal(converted.body.messages[2].tool_calls[0].id, 'toolu_1');
-  assert.equal(converted.body.messages[3].role, 'tool');
-  assert.equal(converted.body.messages[3].tool_call_id, 'toolu_1');
-  assert.match(converted.body.messages[3].content, /^\[tool_error\]/);
+  // 带工具时会在最后一条 user 之后补一条回合约束（continuation-nudge），
+  // 因此 assistant 及之后的消息整体后移一位。
+  assert.equal(converted.body.messages[2].role, 'system');
+  assert.match(converted.body.messages[2].content, /运行约束/);
+  assert.equal(converted.body.messages[3].role, 'assistant');
+  assert.equal(converted.body.messages[3].tool_calls[0].id, 'toolu_1');
+  assert.equal(converted.body.messages[4].role, 'tool');
+  assert.equal(converted.body.messages[4].tool_call_id, 'toolu_1');
+  assert.match(converted.body.messages[4].content, /^\[tool_error\]/);
   assert.equal(converted.body.tools[0].function.name, 'get_weather');
   assert.equal(converted.body.tool_choice.function.name, 'get_weather');
 });

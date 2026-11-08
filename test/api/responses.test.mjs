@@ -771,7 +771,13 @@ test('Responses 工具历史按 call_id 配对并修复 output 位于 call 之�
     prepared.body.messages.find((item) => item.role === 'tool').tool_call_id,
     'call_a',
   );
-  assert.equal(prepared.body.messages.at(-1).content, 'next');
+  assert.equal(
+    prepared.body.messages.filter((item) => item.role === 'user').at(-1).content,
+    'next',
+  );
+  // 带工具时末尾会追加回合约束，user 消息本身不受影响。
+  assert.equal(prepared.body.messages.at(-1).role, 'system');
+  assert.match(prepared.body.messages.at(-1).content, /运行约束/);
 });
 
 test('Responses 工具历史支持 local_shell_call 与 shell_call', () => {

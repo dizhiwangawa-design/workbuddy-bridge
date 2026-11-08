@@ -4,6 +4,7 @@ import {
   reasoningDeclaration,
   resolveReasoningEffort,
 } from '../reasoning-effort.js';
+import { withContinuationNudge } from '../continuation-nudge.js';
 
 function requestError(message, code = 'invalid_request') {
   return new ApiError(400, message, {
@@ -133,6 +134,7 @@ function normalizeToolChoice(choice, tools) {
 export function prepareOpenAIRequest(body, {
   defaultModel = 'deepseek-v4.1-flash',
   toolsEnabled = true,
+  continuationNudge = true,
 } = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw requestError('request body must be a JSON object');
@@ -191,7 +193,10 @@ export function prepareOpenAIRequest(body, {
 
   const outbound = structuredClone(body);
   outbound.model = model;
-  outbound.messages = normalizeMessages(body.messages);
+  outbound.messages = withContinuationNudge(normalizeMessages(body.messages), {
+    tools: tools.length,
+    enabled: continuationNudge,
+  });
   outbound.stream = true;
   delete outbound.stream_options;
   delete outbound.n;
@@ -484,6 +489,7 @@ function modelRow(model) {
   const id = String(model.id || '').trim();
   if (!id || id === 'undefined') return null;
   const declaration = reasoningDeclaration(model);
+  const input = ['text', ...(model.supportsImages === true ? ['image'] : [])];
   return {
     id,
     object: 'model',
@@ -492,6 +498,12 @@ function modelRow(model) {
     name: model.name || id,
     context_window: model.maxInputTokens ?? null,
     max_output_tokens: model.maxOutputTokens ?? null,
+    input,
+    input_modalities: input,
+    architecture: {
+      input_modalities: input,
+      output_modalities: ['text'],
+    },
     wb_reasoning: {
       form: declaration.form,
       supported_efforts: declaration.efforts,

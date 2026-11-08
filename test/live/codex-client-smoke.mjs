@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { removeTreeQuietly, stageBridgeHome } from './bridge-home.mjs';
+import { CONTINUATION_NUDGE_MARKER } from '../../src/continuation-nudge.js';
 
 const model = process.env.WB_LIVE_MODEL?.trim() || 'deepseek-v4.1-flash';
 const account = process.env.WB_LIVE_ACCOUNT?.trim() || 'default';
@@ -35,44 +37,14 @@ const bridgeHome = path.join(temporary, 'bridge');
 const codexHome = path.join(temporary, 'codex-home');
 const workspace = path.join(temporary, 'workspace');
 process.once('exit', () => {
-  fs.rmSync(temporary, { recursive: true, force: true });
+  try {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  } catch {
+    // 清理失败不影响验证结论。
+  }
 });
 
-function copyBridgeState() {
-  fs.mkdirSync(path.join(bridgeHome, 'profiles'), { recursive: true, mode: 0o700 });
-  for (const file of ['config.json', 'pool.json', 'accounts.json']) {
-    const source = path.join(sourceBridgeHome, file);
-    if (fs.existsSync(source)) {
-      fs.copyFileSync(source, path.join(bridgeHome, file));
-      fs.chmodSync(path.join(bridgeHome, file), 0o600);
-    }
-  }
-  const sourceProfiles = path.join(sourceBridgeHome, 'profiles');
-  if (!fs.existsSync(sourceProfiles)) {
-    throw new Error('bridge profiles directory is missing');
-  }
-  fs.cpSync(sourceProfiles, path.join(bridgeHome, 'profiles'), {
-    recursive: true,
-    force: true,
-    preserveTimestamps: true,
-  });
-
-  const accountsFile = path.join(bridgeHome, 'accounts.json');
-  if (!fs.existsSync(accountsFile)) {
-    throw new Error('bridge accounts.json is missing');
-  }
-  const store = JSON.parse(fs.readFileSync(accountsFile, 'utf8'));
-  for (const [name, record] of Object.entries(store.accounts || {})) {
-    const relative = path.relative(sourceProfiles, String(record.profileDir || ''));
-    if (relative.startsWith('..') || path.isAbsolute(relative)) {
-      throw new Error(`account profile path is outside the bridge home: ${name}`);
-    }
-    record.profileDir = path.join(bridgeHome, 'profiles', relative);
-  }
-  fs.writeFileSync(accountsFile, JSON.stringify(store, null, 2), { mode: 0o600 });
-}
-
-copyBridgeState();
+stageBridgeHome({ sourceBridgeHome, bridgeHome });
 process.env.WB_BRIDGE_HOME = bridgeHome;
 process.env.WB_COMMAND = path.join(temporary, 'missing-codebuddy-command');
 process.env.WB_DEBUG = process.env.WB_DEBUG || '1';
@@ -291,6 +263,11 @@ function createObservedUpstreamClient() {
           : [],
         tool_choice: body.tool_choice || null,
         parallel_tool_calls: body.parallel_tool_calls ?? null,
+        continuation_nudge: Array.isArray(body.messages) && body.messages.some((message) => (
+          message?.role === 'system'
+          && typeof message?.content === 'string'
+          && message.content.includes(CONTINUATION_NUDGE_MARKER)
+        )),
         max_tokens: body.max_tokens ?? null,
         response_format: body.response_format?.type || null,
       };
@@ -396,9 +373,18 @@ try {
   );
   const finalRow = pool.poolView().accounts.find((item) => item.name === account);
 
+  // 结构断言：带工具的请求必须真的把回合约束送到了上游。
+  // 行为断言（文件是否建全）会受模型随机性影响，这条不会。
+  const nudgeExpected = !/^(0|false|no|off)$/i.test(
+    String(process.env.WB_CONTINUATION_NUDGE || '').trim(),
+  );
+  const nudgeDelivered = upstreamAttempts.some(
+    (attempt) => attempt.continuation_nudge && attempt.tools?.length,
+  );
   const passed = result.code === 0
     && leaseReleased
     && summarizeResponseEvents().tool_identity_ok
+    && (!nudgeExpected || nudgeDelivered)
     && (!expectFiles
       ? fs.existsSync(lastMessage)
       : files.length === 3 && testResult?.code === 0);
@@ -410,6 +396,7 @@ try {
       files,
       test_exit_code: testResult?.code ?? null,
       lease_released: leaseReleased,
+      continuation_nudge_delivered: nudgeDelivered,
       upstream_attempts: upstreamAttempts,
       response_events: summarizeResponseEvents(),
       output_tail: safeOutput,
@@ -429,6 +416,10 @@ try {
     transport: {
       websocket_upgrades: wsUpgrades,
       http_response_requests: httpResponses,
+    },
+    continuation_nudge: {
+      expected: nudgeExpected,
+      delivered: nudgeDelivered,
     },
     response_events: summarizeResponseEvents(),
     workspace: {
@@ -460,5 +451,7 @@ try {
     remoteRequireKey: originalSettings.remoteRequireKey,
     defaultModel: originalSettings.defaultModel,
   });
-  fs.rmSync(temporary, { recursive: true, force: true });
+  // 清理是尽力而为：受管环境可能对单轮大批量删除设了守卫，
+  // 那不该把一次已经跑完的 live 验证判成失败。
+  removeTreeQuietly(temporary);
 }

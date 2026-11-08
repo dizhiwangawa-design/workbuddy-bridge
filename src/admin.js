@@ -1018,16 +1018,20 @@ function keyUsageHtml(apis){
 function openAiEndpointRows(origin, byApi){
   byApi=byApi||{};
   var rows=[
+    {label:'Base URL',path:'/v1',note:'客户端填这里，不要带 /responses 或 /chat/completions'},
     {label:'Chat',path:'/v1/chat/completions',usage:byApi.openai_chat},
-    {label:'Responses',path:'/v1/responses',usage:byApi.openai_responses}
+    {label:'Responses',path:'/v1/responses',usage:byApi.openai_responses},
+    {label:'Models',path:'/v1/models',note:'模型目录；“获取可用模型”使用此地址'}
   ];
   return rows.map(function(row){
     var url=origin+row.path;
+    var copyTitle=row.label==='Base URL'?'复制 OpenAI Base URL':'复制 OpenAI '+row.label+' 接口地址';
+    var detail=row.note||('当前区间 · '+usageLine(row.usage));
     return '<div class="api-endpoint">'+
       '<span class="api-endpoint-tag">'+row.label+'</span>'+
       '<div class="api-endpoint-copy"><code>'+h(url)+'</code>'+
-        '<small>当前区间 · '+usageLine(row.usage)+'</small></div>'+
-      '<button class="mini" data-act="api-copy-endpoint" data-url="'+h(url)+'" title="复制 OpenAI '+row.label+' 接口地址">复制</button>'+
+        '<small>'+h(detail)+'</small></div>'+
+      '<button class="mini" data-act="api-copy-endpoint" data-url="'+h(url)+'" title="'+h(copyTitle)+'">复制</button>'+
     '</div>';
   }).join('');
 }
@@ -1052,6 +1056,7 @@ function renderApi(){
   $('api-openai-meta').innerHTML=
     '<span>Chat <b>SSE / JSON</b></span>'+
     '<span>Responses <b>HTTP / WS</b></span>'+
+    '<span>Base <b>'+h(location.origin+'/v1')+'</b></span>'+
     '<span>模型目录 <b>/v1/models</b></span>'+
     '<span>Tools <b>'+(s.tools?'已开放':'已关闭')+'</b></span>';
   var persistenceEnabled=!!(openaiEnabled&&s.responsesPersistence);
