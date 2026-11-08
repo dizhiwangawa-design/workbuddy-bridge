@@ -794,37 +794,44 @@ export function createResponsesStreamEncoder({
   retain = 'tail',
 }) {
   let sequence = 2;
+  let nextOutputIndex = Array.isArray(response.output) ? response.output.length : 0;
   let reasoningItem = null;
+  let reasoningIndex = -1;
+  let reasoningClosed = false;
   let messageItem = null;
+  let messageIndex = -1;
   const reasoningText = createTextCache({ maxBytes, retain });
   const outputText = createTextCache({ maxBytes, retain });
-  let outputIndex = Array.isArray(response.output) ? response.output.length : 0;
   const output = [];
   const event = (type, data) => ({
     type,
     data: { type, sequence_number: sequence++, ...data },
   });
+  // 每块一次性取号，绝不事后修正：output_index 必须等于该 item 在终态
+  // response.output 里的下标，两者是同一条不变量（见 alignLiveOutputIds）。
+  const nextIndex = () => nextOutputIndex++;
 
   function reasoningDelta(delta) {
     if (!delta) return [];
     reasoningText.append(delta);
     if (!reasoningItem) {
       reasoningItem = reasoningItemFor(response.id);
+      reasoningIndex = nextIndex();
       output.push(reasoningItem);
       return [
         event('response.output_item.added', {
-          output_index: outputIndex,
+          output_index: reasoningIndex,
           item: { ...reasoningItem, status: 'in_progress', summary: [] },
         }),
         event('response.reasoning_summary_part.added', {
           item_id: reasoningItem.id,
-          output_index: outputIndex,
+          output_index: reasoningIndex,
           summary_index: 0,
           part: { type: 'summary_text', text: '' },
         }),
         event('response.reasoning_summary_text.delta', {
           item_id: reasoningItem.id,
-          output_index: outputIndex,
+          output_index: reasoningIndex,
           summary_index: 0,
           delta,
         }),
@@ -832,10 +839,40 @@ export function createResponsesStreamEncoder({
     }
     return [event('response.reasoning_summary_text.delta', {
       item_id: reasoningItem.id,
-      output_index: outputIndex,
+      output_index: reasoningIndex,
       summary_index: 0,
       delta,
     })];
+  }
+
+  /**
+   * 关闭推理块。上游只会给出增量，不会给「思考结束」这个事实，所以必须由这里
+   * 补出 done 事件；否则客户端要靠终态自己推断，块一直停在 in_progress。
+   * 幂等：重复调用返回空数组。
+   */
+  function reasoningSummaryDone() {
+    const item = reasoningItem;
+    if (!item || reasoningClosed) return [];
+    reasoningClosed = true;
+    const text = reasoningText.value();
+    return [
+      event('response.reasoning_summary_text.done', {
+        item_id: item.id,
+        output_index: reasoningIndex,
+        summary_index: 0,
+        text,
+      }),
+      event('response.reasoning_summary_part.done', {
+        item_id: item.id,
+        output_index: reasoningIndex,
+        summary_index: 0,
+        part: { type: 'summary_text', text },
+      }),
+      event('response.output_item.done', {
+        output_index: reasoningIndex,
+        item: { ...item, status: 'completed', summary: [{ type: 'summary_text', text }] },
+      }),
+    ];
   }
 
   function textDelta(delta) {
@@ -843,22 +880,22 @@ export function createResponsesStreamEncoder({
     outputText.append(delta);
     if (!messageItem) {
       messageItem = responseMessage('', 'in_progress');
+      messageIndex = nextIndex();
       output.push(messageItem);
-      outputIndex += reasoningItem ? 1 : 0;
       return [
         event('response.output_item.added', {
-          output_index: outputIndex,
+          output_index: messageIndex,
           item: { ...messageItem, content: [] },
         }),
         event('response.content_part.added', {
           item_id: messageItem.id,
-          output_index: outputIndex,
+          output_index: messageIndex,
           content_index: 0,
           part: { type: 'output_text', text: '', annotations: [] },
         }),
         event('response.output_text.delta', {
           item_id: messageItem.id,
-          output_index: outputIndex,
+          output_index: messageIndex,
           content_index: 0,
           delta,
         }),
@@ -866,7 +903,7 @@ export function createResponsesStreamEncoder({
     }
     return [event('response.output_text.delta', {
       item_id: messageItem.id,
-      output_index: outputIndex,
+      output_index: messageIndex,
       content_index: 0,
       delta,
     })];
@@ -874,7 +911,17 @@ export function createResponsesStreamEncoder({
 
   return {
     reasoningDelta,
+    reasoningSummaryDone,
     textDelta,
+    /**
+     * live 已经完整走完的 item 类型，供终态事件去重。
+     * 只有真正发过 output_item.done 的类型才列在这里。
+     */
+    closedItemTypes() {
+      const closed = [];
+      if (reasoningClosed) closed.push('reasoning');
+      return closed;
+    },
     snapshot() {
       return {
         reasoning: reasoningText.value(),

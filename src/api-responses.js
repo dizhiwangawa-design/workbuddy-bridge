@@ -528,10 +528,28 @@ export function createResponsesRuntime(options = {}) {
       finalDeltas = false,
       finalReasoningDeltas = false,
     } = {}) {
-      alignLiveOutputIds(finalBody);
       const live = liveEncoder?.snapshot();
+      const closedTypes = new Set(liveEncoder?.closedItemTypes?.() || []);
+      const closedIds = new Set(
+        (live?.output || [])
+          .filter((item) => closedTypes.has(item.type))
+          .map((item) => item.id),
+      );
+      alignLiveOutputIds(finalBody);
       const events = protocolEvents(finalBody, false).slice(2);
       for (const event of events) {
+        // live 已经完整关闭的块，终态里的 done 系列一律跳过，避免同一 item 被关闭两次。
+        const closedHere = closedIds.has(event.data.item?.id)
+          || closedIds.has(event.data.item_id);
+        const doneLike = event.type === 'response.output_item.done'
+          || event.type.endsWith('_text.done')
+          || event.type.endsWith('_part.done')
+          || event.type.endsWith('_arguments.done')
+          || event.type.endsWith('_input.done');
+        if (closedHere && doneLike) {
+          event.markRemoved = true;
+          continue;
+        }
         const duplicateLiveItem = live
           && event.type === 'response.output_item.added'
           && ['message', 'reasoning'].includes(event.data.item?.type);
@@ -580,16 +598,29 @@ export function createResponsesRuntime(options = {}) {
         });
     }
 
+    // live 的 output_index 按到达顺序分配，终态必须与它逐项对齐——
+    // output_index 等于该 item 在 response.output 里的下标是同一条不变量。
+    // 只搬 id 不搬顺序会让「正文先到」的响应出现流与终态错位（正文重复挂载）。
     function alignLiveOutputIds(finalBody) {
       const live = liveEncoder?.snapshot();
       if (!live?.output?.length) return finalBody;
-      finalBody.output = finalBody.output.map((item, index) => {
-        if (index < prior.length || !['message', 'reasoning'].includes(item.type)) {
-          return item;
-        }
-        const liveItem = live.output.find((candidate) => candidate.type === item.type);
-        return liveItem ? { ...item, id: liveItem.id } : item;
-      });
+      const head = finalBody.output.slice(0, prior.length);
+      const tail = finalBody.output.slice(prior.length);
+      const liveFor = (type) => live.output.find((candidate) => candidate.type === type);
+      // 带 live 身份的块按 live 顺序排在前面，其余（工具调用等）保持原有相对顺序。
+      const withLive = [];
+      const withoutLive = [];
+      for (const item of tail) {
+        const liveItem = liveFor(item.type);
+        if (liveItem) withLive.push({ item, index: live.output.indexOf(liveItem) });
+        else withoutLive.push(item);
+      }
+      withLive.sort((a, b) => a.index - b.index);
+      finalBody.output = [
+        ...head,
+        ...withLive.map((entry) => ({ ...entry.item, id: liveFor(entry.item.type).id })),
+        ...withoutLive,
+      ];
       return finalBody;
     }
 
@@ -1264,6 +1295,8 @@ export function createResponsesRuntime(options = {}) {
           previousResponseId,
           request: prepared,
         });
+        // 先关闭 live 的推理块，再对齐终态；终态里同源的 done 事件由 cancelEvents 去掉。
+        publishLive(liveEncoder?.reasoningSummaryDone());
         alignLiveOutputIds(finalBody);
         release({
           ok: true,

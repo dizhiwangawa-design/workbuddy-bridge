@@ -2320,3 +2320,66 @@ test('Responses 冷目录下客户端的 none 与未声明的行为保持不变'
   assert.equal(received[0].reasoning_effort, 'none');
   assert.equal(received[1].reasoning_effort, 'none');
 });
+
+// ---------------------------------------------------------------------------
+// live 输出块生命周期：output_index 必须等于终态 output 的下标，
+// 每个块只 closed 一次，推理增量必须有配对的 done 事件。
+// ---------------------------------------------------------------------------
+test('Responses 正文与推理的 output_index 不冲突且与终态顺序一致', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    // 真实上游可能先给正文，再给推理
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: '先写正文。' } }] }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: '然后我才思考。' } }] }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: {}, finish_reason: 'stop' }] }));
+    res.end('data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', stream: true, store: false, input: 'mix' }),
+  });
+  const events = parseSse(await response.text());
+  const added = events.filter((e) => e.type === 'response.output_item.added');
+  const indexes = added.map((e) => e.output_index);
+  assert.equal(new Set(indexes).size, indexes.length, `duplicate output_index: ${indexes}`);
+
+  const doneIds = events
+    .filter((e) => e.type === 'response.output_item.done')
+    .map((e) => e.item?.id);
+  assert.equal(new Set(doneIds).size, doneIds.length, `duplicate output_item.done: ${doneIds}`);
+
+  // 顺序不变量：流里的 output_index 必须等于该 item 在终态 output 里的下标
+  const terminal = events.find((e) => e.type === 'response.completed');
+  terminal.response.output.forEach((item, i) => {
+    const addedEvent = added.find((e) => e.item?.id === item.id);
+    assert.equal(
+      addedEvent?.output_index,
+      i,
+      `item ${item.id} (${item.type}) 的流索引与终态下标不一致`,
+    );
+  });
+});
+
+test('Responses 推理增量必须带出结束事件', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: '想一想' } }] }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] }));
+    res.end('data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', stream: true, store: false, input: 'think' }),
+  });
+  const events = parseSse(await response.text());
+  const at = (type) => events.findIndex((e) => e.type === type);
+  assert.ok(at('response.reasoning_summary_text.delta') >= 0);
+  assert.ok(at('response.reasoning_summary_text.done') > at('response.reasoning_summary_text.delta'));
+  assert.ok(at('response.reasoning_summary_part.done') > 0);
+  assert.ok(at('response.reasoning_summary_text.done') < at('response.completed'));
+
+  const textDone = events.find((e) => e.type === 'response.reasoning_summary_text.done');
+  assert.equal(textDone.item_id, events.find((e) => e.type === 'response.output_item.added' && e.item?.type === 'reasoning').item.id);
+});
