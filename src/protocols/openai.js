@@ -230,6 +230,21 @@ function reasoningTokenDetails(source) {
   };
 }
 
+/**
+ * 上游把 prompt 缓存命中放在两个位置之一（`prompt_cache_hit_tokens` 与
+ * `prompt_tokens_details.cached_tokens`）。以前只透传 reasoning_tokens，
+ * 客户端因此永远显示「缓存命中 0%」。0 时不输出字段，保持旧响应形状。
+ */
+function promptCacheDetails(source) {
+  const cached = Number(
+    source?.prompt_cache_hit_tokens
+    ?? source?.prompt_tokens_details?.cached_tokens
+    ?? 0,
+  );
+  if (!Number.isFinite(cached) || cached <= 0) return {};
+  return { prompt_tokens_details: { cached_tokens: Math.max(0, cached) } };
+}
+
 function eventUsage(usage) {
   if (!usage || typeof usage !== 'object') return undefined;
   const prompt = Number(usage.prompt_tokens ?? usage.input_tokens);
@@ -242,6 +257,7 @@ function eventUsage(usage) {
       ? total
       : (Number.isFinite(prompt) ? prompt : 0) + (Number.isFinite(completion) ? completion : 0),
     ...reasoningTokenDetails(usage),
+    ...promptCacheDetails(usage),
   };
 }
 
@@ -390,6 +406,7 @@ export function toOpenAIResponse(aggregate, model, { now = Date.now } = {}) {
       completion_tokens: completion,
       total_tokens: Number.isFinite(total) ? total : prompt + completion,
       ...reasoningTokenDetails(used),
+      ...promptCacheDetails(used),
     },
   };
 }

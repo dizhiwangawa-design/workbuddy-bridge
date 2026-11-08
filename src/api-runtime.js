@@ -170,10 +170,22 @@ function usageFromChunk(chunk, usage) {
     ?? source.reasoning_tokens
     ?? usage.reasoningTokens
     ?? 0;
+  // 上游把 prompt 缓存命中放在两个位置之一；缓存读与写入是 Anthropic 的原生字段。
+  const cacheRead = source.prompt_cache_hit_tokens
+    ?? source.prompt_tokens_details?.cached_tokens
+    ?? source.cache_read_input_tokens
+    ?? usage.cacheReadTokens
+    ?? 0;
+  const cacheWrite = source.prompt_cache_write_tokens
+    ?? source.cache_creation_input_tokens
+    ?? usage.cacheWriteTokens
+    ?? 0;
   return {
     inputTokens: Number(source.prompt_tokens ?? source.input_tokens ?? usage.inputTokens ?? 0),
     outputTokens: Number(source.completion_tokens ?? source.output_tokens ?? usage.outputTokens ?? 0),
     reasoningTokens: Math.max(0, Number(reasoning) || 0),
+    cacheReadTokens: Math.max(0, Number(cacheRead) || 0),
+    cacheWriteTokens: Math.max(0, Number(cacheWrite) || 0),
   };
 }
 
@@ -847,6 +859,13 @@ export function createAnthropicRuntime({
           output_tokens_details: {
             reasoning_tokens: reasoningTokens,
           },
+          // Anthropic 的原生缓存字段；只在非零时输出，保持既有响应形状。
+          ...(Number(usage.cacheReadTokens) > 0
+            ? { cache_read_input_tokens: Math.max(0, Number(usage.cacheReadTokens)) }
+            : {}),
+          ...(Number(usage.cacheWriteTokens) > 0
+            ? { cache_creation_input_tokens: Math.max(0, Number(usage.cacheWriteTokens)) }
+            : {}),
         },
       };
       if (body.normalized.thinkingEnabled && reasoningText.value()) {
@@ -873,6 +892,8 @@ export function createAnthropicRuntime({
           finishReason,
           outputTokens: Math.max(0, outputTokens),
           reasoningTokens,
+          cacheReadTokens: Math.max(0, Number(usage.cacheReadTokens) || 0),
+          cacheWriteTokens: Math.max(0, Number(usage.cacheWriteTokens) || 0),
         }));
         if (!cancelKind && !writer?.failed && writer?.ended) {
           terminate('client', clientWriteFailure());
@@ -953,7 +974,12 @@ export function createAnthropicRuntime({
           ensureStarted({ allowCanceled: true });
           if (encoder && writer && !writer.failed) {
             writer.writeComment('bridge-anthropic-canceled');
-            write(encoder.cancel({ outputTokens, reasoningTokens }));
+            write(encoder.cancel({
+              outputTokens,
+              reasoningTokens,
+              cacheReadTokens: Math.max(0, Number(usage.cacheReadTokens) || 0),
+              cacheWriteTokens: Math.max(0, Number(usage.cacheWriteTokens) || 0),
+            }));
           }
         } else if (stream && !persisted.ok) {
           writer?.fail(persisted.error);
@@ -1267,6 +1293,12 @@ function openAIUsage(source, fallbackInput = 0, fallbackOutput = 0) {
   const completionTokens = Number.isFinite(completion) ? completion : fallbackOutput;
   const reasoning = source?.completion_tokens_details?.reasoning_tokens;
   const reasoningTokens = Number(reasoning);
+  // 上游把 prompt 缓存命中放在两个位置之一；只在非零时输出，保持旧响应形状。
+  const cached = Number(
+    source?.prompt_cache_hit_tokens
+    ?? source?.prompt_tokens_details?.cached_tokens
+    ?? 0,
+  );
   return {
     prompt_tokens: Math.max(0, promptTokens),
     completion_tokens: Math.max(0, completionTokens),
@@ -1279,6 +1311,9 @@ function openAIUsage(source, fallbackInput = 0, fallbackOutput = 0) {
             reasoning_tokens: Math.max(0, reasoningTokens),
           },
         }
+      : {}),
+    ...(Number.isFinite(cached) && cached > 0
+      ? { prompt_tokens_details: { cached_tokens: Math.max(0, cached) } }
       : {}),
   };
 }

@@ -355,12 +355,20 @@ export function createAnthropicEncoder({
     ];
   }
 
-  function usage(outputTokens, reasoningTokens) {
+  // Anthropic 的 prompt 缓存是原生字段；上游没报（或为 0）时不输出，
+  // 保持既有响应形状，避免严格 schema 的客户端因多出字段报错。
+  function usage(outputTokens, reasoningTokens, cacheReadTokens = 0, cacheWriteTokens = 0) {
     return {
       output_tokens: Math.max(0, Number(outputTokens) || 0),
       output_tokens_details: {
         reasoning_tokens: Math.max(0, Number(reasoningTokens) || 0),
       },
+      ...(Number(cacheReadTokens) > 0
+        ? { cache_read_input_tokens: Math.max(0, Number(cacheReadTokens)) }
+        : {}),
+      ...(Number(cacheWriteTokens) > 0
+        ? { cache_creation_input_tokens: Math.max(0, Number(cacheWriteTokens)) }
+        : {}),
     };
   }
 
@@ -435,6 +443,8 @@ export function createAnthropicEncoder({
       finishReason,
       outputTokens = 0,
       reasoningTokens = 0,
+      cacheReadTokens = 0,
+      cacheWriteTokens = 0,
     } = {}) {
       if (finished) return [];
       finished = true;
@@ -473,7 +483,7 @@ export function createAnthropicEncoder({
           stop_reason: stopReason(finishReason, calls.length > 0),
           stop_sequence: null,
         },
-        usage: usage(outputTokens, reasoningTokens),
+        usage: usage(outputTokens, reasoningTokens, cacheReadTokens, cacheWriteTokens),
       }));
       events.push(event('message_stop', {
         type: 'message_stop',
@@ -486,14 +496,19 @@ export function createAnthropicEncoder({
       return [event('ping', { type: 'ping' })];
     },
 
-    cancel({ outputTokens = 0, reasoningTokens = 0 } = {}) {
+    cancel({
+      outputTokens = 0,
+      reasoningTokens = 0,
+      cacheReadTokens = 0,
+      cacheWriteTokens = 0,
+    } = {}) {
       if (finished) return [];
       finished = true;
       const events = started ? [...closeThinking(), ...closeText()] : this.start();
       events.push(event('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: 'canceled', stop_sequence: null },
-        usage: usage(outputTokens, reasoningTokens),
+        usage: usage(outputTokens, reasoningTokens, cacheReadTokens, cacheWriteTokens),
       }));
       events.push(event('message_stop', { type: 'message_stop' }));
       return events;

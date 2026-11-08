@@ -1929,3 +1929,58 @@ test('Anthropic 租约释放保留客户端 Key 归因', async () => {
   assert.equal(released[0].result.meta.clientKeyId, 'key-anthropic');
   assert.equal(released[0].result.meta.clientKeyName, 'laptop');
 });
+
+test('Anthropic usage 透传上游 prompt 缓存命中', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4010,"completion_tokens":12,"total_tokens":4022,'
+      + '"prompt_cache_hit_tokens":3840,"prompt_cache_write_tokens":64}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'cache' }],
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.usage.cache_read_input_tokens, 3840);
+  assert.equal(body.usage.cache_creation_input_tokens, 64);
+});
+
+test('Anthropic usage 上游不报缓存时保持旧形状', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'plain' }],
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal('cache_read_input_tokens' in body.usage, false);
+  assert.equal('cache_creation_input_tokens' in body.usage, false);
+});

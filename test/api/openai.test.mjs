@@ -1670,3 +1670,77 @@ test('OpenAI Chat 租约释放保留客户端 Key 归因', async () => {
   assert.equal(released[0].result.meta.clientKeyId, 'key-chat');
   assert.equal(released[0].result.meta.clientKeyName, 'desktop');
 });
+
+test('Chat 透传 prompt 缓存命中明细', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4010,"completion_tokens":12,"total_tokens":4022,'
+      + '"prompt_cache_hit_tokens":3840,"prompt_tokens_details":{"cached_tokens":3840}}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'cache' }],
+      reasoning_effort: 'high',
+      stream: true,
+    }),
+  });
+  const text = await response.text();
+  const usage = text.split('\n')
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trim())
+    .filter((payload) => payload && payload !== '[DONE]')
+    .map((payload) => JSON.parse(payload))
+    .map((event) => event.usage)
+    .filter(Boolean)
+    .at(-1);
+
+  assert.equal(usage.prompt_tokens, 4010);
+  assert.equal(usage.prompt_tokens_details.cached_tokens, 3840);
+});
+
+test('Chat 上游不报缓存命中时不输出该字段', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'plain' }],
+      reasoning_effort: 'high',
+      stream: true,
+    }),
+  });
+  const text = await response.text();
+  const usage = text.split('\n')
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trim())
+    .filter((payload) => payload && payload !== '[DONE]')
+    .map((payload) => JSON.parse(payload))
+    .map((event) => event.usage)
+    .filter(Boolean)
+    .at(-1);
+
+  assert.equal(usage.prompt_tokens_details, undefined);
+});
