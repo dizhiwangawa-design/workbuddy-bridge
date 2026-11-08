@@ -205,7 +205,7 @@ if (toolUse) {
 | `POST /v1/responses` | 非流式 JSON、SSE、`previous_response_id` 续接 |
 | `WS /v1/responses` | 原生 `response.create` / `response.interrupt` 命令 |
 | `GET /v1/responses/:id` | 查询保存的完成或取消片段 |
-| `GET /v1/models` | 优先读取 WorkBuddy 模型目录；不可用时返回带 `wb_source:"fallback"` 的稳定列表 |
+| `GET /v1/models` | 读取按 endpoint 与账号 UID 缓存的 WorkBuddy 模型目录；不可用时返回带 `wb_source:"fallback"` 的稳定列表 |
 | `GET /v1/models/:id` | 查询目录中的单个模型；未找到返回 `404 model_not_found` |
 
 ```js
@@ -294,6 +294,30 @@ OpenAI 与 Anthropic 路由共用客户端 Key，也共用现有号池和扫码�
 - Chat 的 `n` 只能为 `1`。Embeddings、Audio、Batch、Fine-tuning 不在本次范围；
   Responses 的 `file_id`、MCP server/container 等未实现工具类型也明确拒绝。
 - 客户端 Key、协议开关、错误形状沿用共享的 API 兼容层；远程访问仍需配置 Key。
+
+### 推理档位
+
+Chat Completions 的顶层 `reasoning_effort` 与 Responses 的
+`reasoning.effort` 接受不区分大小写的 `none`、`minimal`、`low`、`medium`、
+`high`、`xhigh`、`max`。`minimal` 按 `low` 处理；目标模型缺少精确档位时向上取
+最近支持值，同时保留模型支持的 `medium` 与 `xhigh`。
+
+档位能力来自所选账号的上游模型目录，不使用模型名前缀猜测：
+
+- `supportedEfforts` 数组按该模型的真实集合归一化。
+- 单值 `reasoning.effort` 表示该模型唯一的非关闭档位；例如声明 `medium` 的模型
+  会接收 `medium`，不会因为客户端要求 `high` 就改成 `high`。
+- 已知支持 reasoning 的模型在请求缺少档位时显式接收 `none`。
+- 模型目录明确声明无 reasoning，或缓存中没有该模型时，不向上游发送
+  `reasoning_effort`。
+- Responses 的 `reasoning.effort` 回显实际转发值；它可能与客户端请求值不同。
+- 未知档位名返回 `400 invalid_reasoning_effort`。这是对 Chat 过去静默透传行为的
+  有意变更。
+
+模型目录在每个上游 endpoint 与账号 UID 的组合上缓存 10 分钟，模型列表和请求归一化
+读取同一份快照。`GET /v1/models?refresh=true` 或
+`GET /v1/models/:id?refresh=true` 强制刷新；刷新失败时继续使用旧快照，并把列表
+来源标为 `stale`。模型行中的 `wb_reasoning` 字段展示归一化后的能力声明。
 
 Responses 的持久化和可靠性规则：
 
