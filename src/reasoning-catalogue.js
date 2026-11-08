@@ -73,6 +73,9 @@ export function createReasoningCatalogue({
     try {
       const payload = await load({ accountId, credentials });
       const models = extractModels(payload);
+      if (!models.length) {
+        throw new Error('upstream model catalogue was empty');
+      }
       const entry = {
         models,
         fetchedAt: loadedAt,

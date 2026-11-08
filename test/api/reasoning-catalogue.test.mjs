@@ -118,6 +118,37 @@ test('刷新失败保留旧快照', async () => {
   );
 });
 
+test('空目录刷新不覆盖有效的旧快照', async () => {
+  let loads = 0;
+  const catalogue = createReasoningCatalogue({
+    endpoint: 'https://a.test',
+    now: () => 1000,
+    load: async () => {
+      loads += 1;
+      return loads === 1 ? payload('medium') : { data: { models: [] } };
+    },
+  });
+  const credentials = { uid: 'u1' };
+
+  await catalogue.snapshot({ accountId: 'a', credentials });
+  const stale = await catalogue.snapshot({
+    accountId: 'a',
+    credentials,
+    refresh: true,
+  });
+
+  assert.equal(stale.stale, true);
+  assert.match(stale.error.message, /empty/i);
+  assert.equal(
+    catalogue.getDeclaration({
+      accountId: 'a',
+      credentials,
+      model: 'deep-model',
+    }).efforts[0],
+    'medium',
+  );
+});
+
 test('非标准包装仍能递归提取 models', async () => {
   const catalogue = createReasoningCatalogue({
     endpoint: 'https://a.test',
