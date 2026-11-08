@@ -1866,6 +1866,73 @@ test('Responses parallel_tool_calls=false 不隐式强制工具调用', () => {
   assert.equal(prepared.parallelToolCalls, false);
 });
 
+// codex 的 web_search = "live" / "cached"（默认就是 live）和 dsh 的 web_fetch 都会把
+// 托管工具塞进每一次请求，上游没有执行器。以前这里直接 400，整轮对话直接失败；
+// 现在应该静默剔除。
+test('Responses 跳过上游不支持的托管工具而不是 400', async (t) => {
+  const received = [];
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    upstream(res, 'answer');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'search the web',
+      tools: [
+        { type: 'function', name: 'read', parameters: { type: 'object' } },
+        { type: 'web_search' },
+        { type: 'web_fetch' },
+        { type: 'web_search_preview' },
+      ],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.status, 'completed');
+  assert.deepEqual(received[0].tools.map((tool) => tool.function.name), ['read']);
+
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'only hosted tools',
+    tools: [{ type: 'web_search' }],
+  });
+  assert.equal(prepared.body.tools, undefined);
+  assert.equal(prepared.toolsDeclared, false);
+  assert.equal(prepared.toolChoice, 'auto');
+});
+
+test('Responses 把指向托管工具的 tool_choice 降级为 auto', async (t) => {
+  const received = [];
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    upstream(res, 'answer');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'forced search',
+      tools: [
+        { type: 'function', name: 'read', parameters: { type: 'object' } },
+        { type: 'web_search' },
+      ],
+      tool_choice: { type: 'web_search' },
+    }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.tool_choice, 'auto');
+  assert.equal(received[0].tool_choice, undefined);
+});
+
 test('Responses 拒绝非法 parallel_tool_calls 与 tool_choice 类型', () => {
   const tools = [{ type: 'function', name: 'read', parameters: { type: 'object' } }];
   assert.throws(() => responses.prepareResponsesRequest({
@@ -1884,7 +1951,7 @@ test('Responses 拒绝非法 parallel_tool_calls 与 tool_choice 类型', () => 
     model: 'deepseek-v4.1-flash',
     input: 'invalid choice type',
     tools,
-    tool_choice: { type: 'web_search' },
+    tool_choice: { type: 'file_id' },
   }), (error) => error.status === 400 && error.code === 'invalid_request');
 });
 
@@ -1997,7 +2064,7 @@ test('Responses 不支持工具与 file_id 使用明确 400', async (t) => {
     body: JSON.stringify({
       model: 'deepseek-v4.1-flash',
       input: 'hello',
-      tools: [{ type: 'web_search' }],
+      tools: [{ type: 'not_a_tool_type' }],
     }),
   });
   assert.equal(unsupported.status, 400);

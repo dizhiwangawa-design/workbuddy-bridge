@@ -8,6 +8,7 @@ import {
 import { outputFromPartial } from '../responses-store.js';
 import { resolveReasoningEffort } from '../reasoning-effort.js';
 import { withContinuationNudge } from '../continuation-nudge.js';
+import { warn } from '../log.js';
 
 const SUPPORTED_TOOL_TYPES = new Set([
   'function',
@@ -17,6 +18,28 @@ const SUPPORTED_TOOL_TYPES = new Set([
   'shell',
   'apply_patch',
 ]);
+
+/**
+ * 上游托管的工具（web_search / file_search / computer_use……）：客户端会无条件
+ * 把这些工具塞进每一次请求，但上游没有对应执行器，也不需要模型知道它们。
+ * 直接 400 会让整轮对话失败（dsh 报 `tools[14] type web_search is not supported`），
+ * 所以这里静默剔除；引用这些名称的 tool_choice 也随之降级为 auto。
+ */
+const HOSTED_TOOL_TYPES = new Set([
+  'web_fetch',
+  'file_search',
+  'code_interpreter',
+  'image_generation',
+  'mcp',
+  'container',
+]);
+
+function isHostedToolType(type) {
+  const value = String(type || '').trim().toLowerCase();
+  return value.startsWith('web_search')
+    || value.startsWith('computer_use')
+    || HOSTED_TOOL_TYPES.has(value);
+}
 
 function bad(message, code = 'invalid_request') {
   return new ApiError(400, message, { type: 'invalid_request_error', code });
@@ -198,10 +221,16 @@ export function convertResponsesTools(input) {
   const tools = [];
   const registry = new Map();
   const names = new Set();
+  const hosted = [];
 
   for (const [index, tool] of input.entries()) {
     if (!tool || typeof tool !== 'object') throw bad(`tools[${index}] must be an object`);
     const type = String(tool.type || '');
+    if (isHostedToolType(type)) {
+      // 客户端常驻声明的托管工具，上游没有执行器：跳过而不是 400。
+      hosted.push(`${index}:${type}`);
+      continue;
+    }
     if (type === 'custom' && tool.name === 'apply_patch') {
       // The canonical Codex custom tool may be followed by its host counterpart.
     } else if (!SUPPORTED_TOOL_TYPES.has(type)) {
@@ -292,6 +321,9 @@ export function convertResponsesTools(input) {
     });
     names.add(declaration.function.name);
     names.add(name);
+  }
+  if (hosted.length) {
+    warn(`Responses 跳过上游不支持的托管工具: ${hosted.join(', ')}`);
   }
   return { tools, registry, names };
 }
@@ -528,12 +560,17 @@ export function prepareResponsesRequest(body, {
   }
   if (choice === 'required' && !tools.length) throw bad('tool_choice requires at least one tool');
   if (choice && typeof choice === 'object') {
-    if (
+    if (isHostedToolType(choice.type)) {
+      // 被剔除的托管工具不能成为 tool_choice：降级为 auto，让请求继续可用。
+      choice = undefined;
+    } else if (
       choice.type !== undefined
       && !['function', 'custom', 'apply_patch', 'shell', 'local_shell'].includes(choice.type)
     ) {
       throw bad(`tool_choice type ${choice.type || '(missing)'} is not supported`);
     }
+  }
+  if (choice && typeof choice === 'object') {
     const builtin = ['apply_patch', 'shell', 'local_shell'].includes(choice.type) ? choice.type : '';
     const chosen = String(builtin || choice.name || choice.function?.name || '');
     if (!chosen) throw bad('tool_choice must name a tool');
@@ -587,7 +624,9 @@ export function prepareResponsesRequest(body, {
     ]),
     toolsDeclared: tools.length > 0,
     toolChoice: choice || 'auto',
-    requestedToolChoice: body.tool_choice === undefined ? 'auto' : body.tool_choice,
+    requestedToolChoice: body.tool_choice === undefined || choice === undefined
+      ? 'auto'
+      : body.tool_choice,
     parallelToolCalls: body.parallel_tool_calls !== false,
     requestedMax: max !== undefined,
     maxOutputTokens: max,
