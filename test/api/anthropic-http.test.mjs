@@ -38,6 +38,8 @@ async function startFixture(t, upstreamHandler, {
   accountNames = ['api-a'],
   config = {},
   store = null,
+  reasoningCatalogue = null,
+  logWarn = null,
 } = {}) {
   const currentPool = pool.loadPool();
   for (const name of Object.keys(currentPool.accounts)) {
@@ -70,10 +72,16 @@ async function startFixture(t, upstreamHandler, {
 
   const upstreamBaseUrl = `http://127.0.0.1:${upstreamServer.address().port}`;
   const upstreamClient = createUpstreamClient({ baseUrl: upstreamBaseUrl });
+  const apiDeps = {
+    upstreamClient,
+    ...(store ? { cancelPersistence: store } : {}),
+    ...(reasoningCatalogue ? { reasoningCatalogue } : {}),
+    ...(logWarn ? { logWarn } : {}),
+  };
   const bridge = await startHttpServer({
     port: 0,
     host: '127.0.0.1',
-    apiDeps: store ? { upstreamClient, cancelPersistence: store } : { upstreamClient },
+    apiDeps,
   });
 
   t.after(async () => {
@@ -103,6 +111,22 @@ async function parseResponse(response) {
 function inflight(name) {
   return pool.poolView().accounts.find((item) => item.name === name)?.inflight;
 }
+
+function declarationCatalogue(declaration) {
+  return {
+    getDeclaration() {
+      return declaration;
+    },
+  };
+}
+
+const THREE_RUNG = {
+  form: 'supported',
+  efforts: ['low', 'high', 'max'],
+  declaredEffort: null,
+  defaultEffort: 'high',
+  canDisableThinking: true,
+};
 
 function sendKernelRst(url, body) {
   return new Promise((resolve, reject) => {
@@ -205,6 +229,146 @@ test('POST /v1/messages 实时流式转发文本并在末尾追加结构化 tool
     'tool_use',
   );
   assert.equal(inflight('api-a'), 0);
+});
+
+test('Anthropic thinking 流式输出推理块并使用 reasoning_content 作为成功证据', async (t) => {
+  let received;
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    received = JSON.parse(raw);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"reasoning_content":"inspect"}}]}\n\n');
+    res.write('data: {"choices":[{"delta":{"content":"done"}}]}\n\n');
+    res.end(
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6,'
+      + '"completion_tokens_details":{"reasoning_tokens":0}}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  }, {
+    reasoningCatalogue: declarationCatalogue(THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'think' }],
+      thinking: { type: 'enabled', budget_tokens: 8000 },
+      stream: true,
+    }),
+  });
+  const { events } = await parseResponse(response);
+
+  assert.equal(response.status, 200);
+  assert.equal(received.reasoning_effort, 'high');
+  assert.equal(
+    events
+      .filter((event) => event.data?.delta?.type === 'thinking_delta')
+      .map((event) => event.data.delta.thinking)
+      .join(''),
+    'inspect',
+  );
+  assert.equal(
+    events
+      .filter((event) => event.data?.delta?.type === 'text_delta')
+      .map((event) => event.data.delta.text)
+      .join(''),
+    'done',
+  );
+  assert.equal(
+    events.find((event) => event.event === 'message_delta')
+      .data.usage.output_tokens_details.reasoning_tokens,
+    0,
+  );
+});
+
+test('Anthropic thinking 非流式返回 thinking 内容块和 reasoning usage', async (t) => {
+  let received;
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    received = JSON.parse(raw);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"reasoning_content":"inspect"}}]}\n\n');
+    res.write('data: {"choices":[{"delta":{"content":"done"}}]}\n\n');
+    res.end(
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6,'
+      + '"completion_tokens_details":{"reasoning_tokens":4}}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  }, {
+    reasoningCatalogue: declarationCatalogue({
+      ...THREE_RUNG,
+      efforts: ['low', 'high'],
+    }),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'think' }],
+      thinking: { type: 'enabled', budget_tokens: 32000 },
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(received.reasoning_effort, 'high');
+  assert.deepEqual(body.content[0], {
+    type: 'thinking',
+    thinking: 'inspect',
+    signature: '',
+  });
+  assert.equal(body.usage.output_tokens_details.reasoning_tokens, 4);
+});
+
+test('Anthropic thinking 禁用时隐藏推理正文并记录一条无正文告警', async (t) => {
+  const warnings = [];
+  let received;
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    received = JSON.parse(raw);
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"reasoning_content":"secret reasoning"}}]}\n\n');
+    res.write('data: {"choices":[{"delta":{"reasoning_content":" still secret"}}]}\n\n');
+    res.write('data: {"choices":[{"delta":{"content":"answer"}}]}\n\n');
+    res.end(
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6,'
+      + '"completion_tokens_details":{"reasoning_tokens":2}}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  }, {
+    logWarn: (message) => warnings.push(String(message)),
+    reasoningCatalogue: declarationCatalogue(THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'answer without thinking' }],
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(received.reasoning_effort, 'none');
+  assert.equal(body.content.some((block) => block.type === 'thinking'), false);
+  assert.equal(body.usage.output_tokens_details.reasoning_tokens, 2);
+  assert.equal(warnings.filter((line) => /thinking .*disabled/i.test(line)).length, 1);
+  assert.equal(warnings.join('\n').includes('secret'), false);
 });
 
 test('DSML fallback 清洗正文；未声明 tools 时只清洗不生成 tool_use', async (t) => {
@@ -798,7 +962,10 @@ test('Anthropic 主动取消先持久化，再用合法 canceled 收尾', async 
       body: new ReadableStream({
         start(controller) {
           controller.enqueue(new TextEncoder().encode(
-            'data: {"choices":[{"delta":{"content":"visible partial"}}]}\n\n',
+            'data: {"choices":[{"delta":{"reasoning_content":"plan"}}],'
+            + '"usage":{"prompt_tokens":3,"completion_tokens":1,'
+            + '"completion_tokens_details":{"reasoning_tokens":5}}}\n\n'
+            + 'data: {"choices":[{"delta":{"content":"visible partial"}}]}\n\n',
           ));
           signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
         },
@@ -836,6 +1003,7 @@ test('Anthropic 主动取消先持久化，再用合法 canceled 收尾', async 
       model: 'deepseek-v4.1-flash',
       max_tokens: 32,
       messages: [{ role: 'user', content: 'cancel' }],
+      thinking: { type: 'enabled', budget_tokens: 8000 },
       stream: true,
     },
     config: settings.getApiSettings(),
@@ -854,6 +1022,7 @@ test('Anthropic 主动取消先持久化，再用合法 canceled 收尾', async 
   assert.equal((raw.match(/event: message_stop/g) || []).length, 1);
   assert.match(raw, /"stop_reason":"canceled"/);
   assert.equal(raw.match(/^: bridge-anthropic-canceled$/gm)?.length, 1);
+  assert.match(raw, /"reasoning_tokens":5/);
   const record = store.memoryView()[0];
   assert.equal(record.status, 'incomplete');
   assert.equal(record.body.output[0].content[0].text, 'visible partial');

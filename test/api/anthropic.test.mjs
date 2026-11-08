@@ -438,6 +438,74 @@ test('Anthropic encoder 直接结束空响应时仍生成完整成功事件序�
   assert.equal(events[0].data.message.id, 'msg_empty');
 });
 
+test('Anthropic 流式 thinking 使用合法内容块和 delta', () => {
+  const encoder = createAnthropicEncoder({
+    id: 'msg_thinking',
+    model: 'deepseek-v4.1-flash',
+    inputTokens: 5,
+    thinkingEnabled: true,
+  });
+  const events = [
+    ...encoder.start(),
+    ...encoder.thinkingDelta('inspect'),
+    ...encoder.textDelta('done'),
+    ...encoder.finalize({
+      finishReason: 'stop',
+      outputTokens: 8,
+      reasoningTokens: 3,
+    }),
+  ];
+
+  const start = events.find((event) => (
+    event.type === 'content_block_start'
+    && event.data.content_block.type === 'thinking'
+  ));
+  assert.deepEqual(start.data.content_block, {
+    type: 'thinking',
+    thinking: '',
+    signature: '',
+  });
+  assert.equal(
+    events.filter((event) => event.data?.delta?.type === 'thinking_delta')
+      .map((event) => event.data.delta.thinking)
+      .join(''),
+    'inspect',
+  );
+  assert.ok(events.some((event) => (
+    event.type === 'content_block_delta'
+    && event.data.delta.type === 'signature_delta'
+    && event.data.delta.signature === ''
+  )));
+  const stop = events.find((event) => (
+    event.type === 'content_block_stop'
+    && event.data.index === start.data.index
+  ));
+  assert.ok(stop);
+  const terminal = events.find((event) => event.type === 'message_delta');
+  assert.equal(terminal.data.usage.output_tokens_details.reasoning_tokens, 3);
+});
+
+test('Anthropic 禁用 thinking 时 encoder 不输出推理内容', () => {
+  const encoder = createAnthropicEncoder({
+    id: 'msg_no_thinking',
+    model: 'deepseek-v4.1-flash',
+    thinkingEnabled: false,
+  });
+  const events = [
+    ...encoder.start(),
+    ...encoder.thinkingDelta('must not leak'),
+    ...encoder.finalize({ finishReason: 'stop', outputTokens: 2 }),
+  ];
+  assert.equal(
+    events.some((event) => event.data?.content_block?.type === 'thinking'),
+    false,
+  );
+  assert.equal(
+    events.some((event) => event.data?.delta?.type === 'thinking_delta'),
+    false,
+  );
+});
+
 test('没有最终工具块时不会仅因上游 finish_reason 返回 tool_use', () => {
   const encoder = createAnthropicEncoder({
     id: 'msg_no_tools',

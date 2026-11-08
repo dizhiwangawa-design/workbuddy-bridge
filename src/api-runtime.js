@@ -165,9 +165,14 @@ function textDelta(content) {
 function usageFromChunk(chunk, usage) {
   const source = chunk?.usage || chunk?.message?.usage;
   if (!source) return usage;
+  const reasoning = source.completion_tokens_details?.reasoning_tokens
+    ?? source.reasoning_tokens
+    ?? usage.reasoningTokens
+    ?? 0;
   return {
     inputTokens: Number(source.prompt_tokens ?? source.input_tokens ?? usage.inputTokens ?? 0),
     outputTokens: Number(source.completion_tokens ?? source.output_tokens ?? usage.outputTokens ?? 0),
+    reasoningTokens: Math.max(0, Number(reasoning) || 0),
   };
 }
 
@@ -290,6 +295,8 @@ export function estimateAnthropicInputTokens(body) {
 
 export function createAnthropicRuntime({
   upstreamClient = createUpstreamClient(),
+  reasoningCatalogue = null,
+  logWarn = warn,
   readCredentials = readAccountCredentials,
   pick = pickAccount,
   begin = beginTask,
@@ -332,11 +339,13 @@ export function createAnthropicRuntime({
     let cancelPromise = null;
     let leaseReleased = false;
     const visibleText = createRuntimeTextCache({ hardBytes });
+    const reasoningText = createRuntimeTextCache({ hardBytes });
     let dsmlCalls = [];
     let structured;
     let scanner;
     let encoder;
     let usage = { inputTokens: inputEstimate, outputTokens: 0 };
+    let warnedThinkingWhileDisabled = false;
     let finishReason = null;
     let sawDone = false;
     let leaseResult = {
@@ -389,6 +398,7 @@ export function createAnthropicRuntime({
         id: requestId,
         model: body.model,
         inputTokens: inputEstimate,
+        thinkingEnabled: body.normalized.thinkingEnabled,
       });
       write(encoder.start());
       if (writer?.failed || writer?.ended || cancelKind) return;
@@ -564,10 +574,25 @@ export function createAnthropicRuntime({
       usage = usageFromChunk(document, usage);
       const choice = Array.isArray(document.choices) ? document.choices[0] : null;
       if (choice) {
-        const delta = choice.delta || {};
+        const delta = choice.delta || choice.message || {};
         const messageTools = choice.message?.tool_calls;
         if (Array.isArray(messageTools)) pushStructured(messageTools);
         if (Array.isArray(delta.tool_calls)) pushStructured(delta.tool_calls);
+        if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+          appendRuntimeText(reasoningText, delta.reasoning_content);
+          if (body.normalized.thinkingEnabled) {
+            ensureStarted();
+            if (encoder && !cancelKind) {
+              write(encoder.thinkingDelta(delta.reasoning_content));
+            }
+          } else if (!warnedThinkingWhileDisabled) {
+            warnedThinkingWhileDisabled = true;
+            logWarn(
+              `Anthropic request ${requestId} received reasoning content while thinking `
+              + 'was disabled; the model may not honor none',
+            );
+          }
+        }
         if (delta.content !== undefined) feedContent(delta.content);
         if (choice.finish_reason) {
           finishReason = choice.finish_reason;
@@ -625,6 +650,20 @@ export function createAnthropicRuntime({
       });
     }
 
+    function applyReasoningEffort(credentials) {
+      const declaration = reasoningCatalogue?.getDeclaration({
+        accountId: account,
+        credentials,
+        model: body.normalized.model || body.requestBody.model,
+      }) || null;
+      const forwardedEffort = resolveReasoningEffort(
+        body.normalized.requestedEffort,
+        declaration,
+      );
+      if (forwardedEffort === null) delete body.body.reasoning_effort;
+      else body.body.reasoning_effort = forwardedEffort;
+    }
+
     try {
       structured = createStructuredToolAssembler({
         maxBytes: structuredToolArgumentLimit(
@@ -643,12 +682,14 @@ export function createAnthropicRuntime({
         });
       }
       if (credentials.needsRefresh) credentials = await refreshCredentials(credentials);
+      applyReasoningEffort(credentials);
 
       armTotal();
       armFirstByte();
       let response = await requestUpstream(credentials);
       if (response.status === 401 && credentials.refreshToken) {
         credentials = await refreshCredentials(credentials);
+        applyReasoningEffort(credentials);
         response = await requestUpstream(credentials);
       }
       if (!response.ok) {
@@ -675,6 +716,8 @@ export function createAnthropicRuntime({
       }
       if (cancelKind) {
         ensureStarted({ allowCanceled: true });
+        const outputTokens = conservativeTokenEstimate(visibleText.value());
+        const reasoningTokens = Math.max(0, Number(usage.reasoningTokens) || 0);
         const persisted = await cancelPersistence.save({
           id: requestId,
           createdAt: startedAt,
@@ -689,6 +732,11 @@ export function createAnthropicRuntime({
               content: [{ type: 'output_text', text: visibleText.value() }],
             }] : [],
           },
+          usage: {
+            input_tokens: usage.inputTokens || inputEstimate,
+            output_tokens: outputTokens,
+            output_tokens_details: { reasoning_tokens: reasoningTokens },
+          },
           partial: { content: visibleText.value() },
         }, {
           cancelInfo: { reason: cancelKind, phase: 'generation' },
@@ -702,7 +750,8 @@ export function createAnthropicRuntime({
           if (encoder && writer && !writer.failed) {
             writer.writeComment('bridge-anthropic-canceled');
             write(encoder.cancel({
-              outputTokens: conservativeTokenEstimate(visibleText.value()),
+              outputTokens,
+              reasoningTokens,
             }));
           }
         } else if (!persisted.ok) {
@@ -777,6 +826,7 @@ export function createAnthropicRuntime({
           text: visibleText.value(),
           tools: arbitration.calls.map((call) => call.input),
         });
+      const reasoningTokens = Math.max(0, Number(usage.reasoningTokens) || 0);
       const stopReason = mapStopReason(finishReason, arbitration.calls.length > 0);
       const responseBody = {
         id: requestId,
@@ -789,8 +839,18 @@ export function createAnthropicRuntime({
         usage: {
           input_tokens: usage.inputTokens || inputEstimate,
           output_tokens: Math.max(0, outputTokens),
+          output_tokens_details: {
+            reasoning_tokens: reasoningTokens,
+          },
         },
       };
+      if (body.normalized.thinkingEnabled && reasoningText.value()) {
+        responseBody.content.push({
+          type: 'thinking',
+          thinking: reasoningText.value(),
+          signature: '',
+        });
+      }
       if (visibleText.value()) {
         responseBody.content.push({ type: 'text', text: visibleText.value() });
       }
@@ -807,6 +867,7 @@ export function createAnthropicRuntime({
           calls: arbitration.calls,
           finishReason,
           outputTokens: Math.max(0, outputTokens),
+          reasoningTokens,
         }));
         if (!cancelKind && !writer?.failed && writer?.ended) {
           terminate('client', clientWriteFailure());
@@ -854,6 +915,7 @@ export function createAnthropicRuntime({
     } catch (error) {
       if (cancelKind) {
         const outputTokens = conservativeTokenEstimate(visibleText.value());
+        const reasoningTokens = Math.max(0, Number(usage.reasoningTokens) || 0);
         if (stream) ensureStarted({ allowCanceled: true });
         const persisted = await cancelPersistence.save({
           id: requestId,
@@ -869,7 +931,11 @@ export function createAnthropicRuntime({
               content: [{ type: 'output_text', text: visibleText.value() }],
             }] : [],
           },
-          usage: { input_tokens: inputEstimate, output_tokens: outputTokens },
+          usage: {
+            input_tokens: usage.inputTokens || inputEstimate,
+            output_tokens: outputTokens,
+            output_tokens_details: { reasoning_tokens: reasoningTokens },
+          },
           partial: { content: visibleText.value() },
         }, {
           cancelInfo: { reason: cancelReason || cancelKind, phase: 'generation' },
@@ -882,7 +948,7 @@ export function createAnthropicRuntime({
           ensureStarted({ allowCanceled: true });
           if (encoder && writer && !writer.failed) {
             writer.writeComment('bridge-anthropic-canceled');
-            write(encoder.cancel({ outputTokens }));
+            write(encoder.cancel({ outputTokens, reasoningTokens }));
           }
         } else if (stream && !persisted.ok) {
           writer?.fail(persisted.error);

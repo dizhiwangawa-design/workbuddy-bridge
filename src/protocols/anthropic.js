@@ -311,11 +311,13 @@ export function createAnthropicEncoder({
   id,
   model,
   inputTokens = 0,
+  thinkingEnabled = false,
 }) {
   let started = false;
   let finished = false;
   let nextIndex = 0;
   let textIndex = null;
+  let thinkingIndex = null;
 
   function event(type, data) {
     return { type, data };
@@ -329,6 +331,32 @@ export function createAnthropicEncoder({
       type: 'content_block_stop',
       index,
     })];
+  }
+
+  function closeThinking() {
+    if (thinkingIndex === null) return [];
+    const index = thinkingIndex;
+    thinkingIndex = null;
+    return [
+      event('content_block_delta', {
+        type: 'content_block_delta',
+        index,
+        delta: { type: 'signature_delta', signature: '' },
+      }),
+      event('content_block_stop', {
+        type: 'content_block_stop',
+        index,
+      }),
+    ];
+  }
+
+  function usage(outputTokens, reasoningTokens) {
+    return {
+      output_tokens: Math.max(0, Number(outputTokens) || 0),
+      output_tokens_details: {
+        reasoning_tokens: Math.max(0, Number(reasoningTokens) || 0),
+      },
+    };
   }
 
   return {
@@ -352,7 +380,7 @@ export function createAnthropicEncoder({
 
     textDelta(text) {
       if (!started || finished || !text) return [];
-      const events = [];
+      const events = closeThinking();
       if (textIndex === null) {
         textIndex = nextIndex;
         nextIndex += 1;
@@ -370,14 +398,43 @@ export function createAnthropicEncoder({
       return events;
     },
 
+    thinkingDelta(text) {
+      if (!thinkingEnabled || !started || finished || !text) return [];
+      const events = closeText();
+      if (thinkingIndex === null) {
+        thinkingIndex = nextIndex;
+        nextIndex += 1;
+        events.push(event('content_block_start', {
+          type: 'content_block_start',
+          index: thinkingIndex,
+          content_block: {
+            type: 'thinking',
+            thinking: '',
+            signature: '',
+          },
+        }));
+      }
+      events.push(event('content_block_delta', {
+        type: 'content_block_delta',
+        index: thinkingIndex,
+        delta: {
+          type: 'thinking_delta',
+          thinking: String(text),
+        },
+      }));
+      return events;
+    },
+
     finalize({
       calls = [],
       finishReason,
       outputTokens = 0,
+      reasoningTokens = 0,
     } = {}) {
       if (finished) return [];
       finished = true;
       const events = started ? [] : this.start();
+      events.push(...closeThinking());
       events.push(...closeText());
       for (const call of calls) {
         const index = nextIndex;
@@ -411,7 +468,7 @@ export function createAnthropicEncoder({
           stop_reason: stopReason(finishReason, calls.length > 0),
           stop_sequence: null,
         },
-        usage: { output_tokens: outputTokens },
+        usage: usage(outputTokens, reasoningTokens),
       }));
       events.push(event('message_stop', {
         type: 'message_stop',
@@ -424,14 +481,14 @@ export function createAnthropicEncoder({
       return [event('ping', { type: 'ping' })];
     },
 
-    cancel({ outputTokens = 0 } = {}) {
+    cancel({ outputTokens = 0, reasoningTokens = 0 } = {}) {
       if (finished) return [];
       finished = true;
-      const events = started ? closeText() : this.start();
+      const events = started ? [...closeThinking(), ...closeText()] : this.start();
       events.push(event('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: 'canceled', stop_sequence: null },
-        usage: { output_tokens: Math.max(0, Number(outputTokens) || 0) },
+        usage: usage(outputTokens, reasoningTokens),
       }));
       events.push(event('message_stop', { type: 'message_stop' }));
       return events;
@@ -440,7 +497,7 @@ export function createAnthropicEncoder({
     error(error) {
       if (finished) return [];
       finished = true;
-      const events = started ? closeText() : [];
+      const events = started ? [...closeThinking(), ...closeText()] : [];
       events.push(event('error', {
         type: 'error',
         error: {
