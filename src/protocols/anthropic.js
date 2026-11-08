@@ -1,4 +1,5 @@
 import { ApiError } from '../api-errors.js';
+import { budgetEffort } from '../reasoning-effort.js';
 
 function requestError(message) {
   return new ApiError(400, message, {
@@ -99,6 +100,9 @@ function normalizeMessages(messages, warnings) {
       const toolCalls = [];
       const toolIds = new Set();
       for (const block of message.content) {
+        if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
+          continue;
+        }
         if (block?.cache_control !== undefined) {
           throw requestError('assistant cache_control is not supported');
         }
@@ -124,6 +128,7 @@ function normalizeMessages(messages, warnings) {
           function: { name, arguments: JSON.stringify(block.input) },
         });
       }
+      if (!texts.length && !toolCalls.length) continue;
       const converted = {
         role: 'assistant',
         content: texts.length ? texts.join('\n') : null,
@@ -189,9 +194,8 @@ export function normalizeAnthropicRequest(body, {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw requestError('request body must be a JSON object');
   }
-  if (body.thinking !== undefined) {
-    throw requestError('thinking blocks are not supported');
-  }
+  const requestedEffort = body.thinking === undefined ? 'none' : budgetEffort(body.thinking);
+  const thinkingEnabled = body.thinking?.type === 'enabled';
   if (body.mcp_servers !== undefined || body.container !== undefined) {
     throw requestError('mcp_servers and container are not supported');
   }
@@ -260,6 +264,8 @@ export function normalizeAnthropicRequest(body, {
     warnings,
     maxTokens,
     model: body.model,
+    requestedEffort,
+    thinkingEnabled,
     temperature: body.temperature,
     topP: body.top_p,
     stopSequences: body.stop_sequences,

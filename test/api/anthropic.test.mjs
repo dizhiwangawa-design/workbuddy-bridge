@@ -156,14 +156,76 @@ test('tool_result 没有匹配前一条 assistant tool_use 时返回 400', () =>
   }), (error) => error.status === 400 && /tool_use/.test(error.message));
 });
 
-test('Anthropic 对不支持的 thinking、缓存与请求字段返回明确 400', () => {
+test('Anthropic thinking 预算映射为具名档位', () => {
+  const base = {
+    model: 'deepseek-v4.1-flash',
+    max_tokens: 2048,
+    messages: [{ role: 'user', content: 'hello' }],
+  };
+  for (const [thinking, effort, enabled] of [
+    [{ type: 'enabled', budget_tokens: 1024 }, 'low', true],
+    [{ type: 'enabled', budget_tokens: 8000 }, 'high', true],
+    [{ type: 'enabled', budget_tokens: 32000 }, 'max', true],
+    [{ type: 'disabled' }, 'none', false],
+  ]) {
+    const normalized = normalizeAnthropicRequest({ ...base, thinking });
+    assert.equal(normalized.requestedEffort, effort);
+    assert.equal(normalized.thinkingEnabled, enabled);
+  }
+  const absent = normalizeAnthropicRequest(base);
+  assert.equal(absent.requestedEffort, 'none');
+  assert.equal(absent.thinkingEnabled, false);
+});
+
+test('Anthropic thinking 的畸形请求返回 400', () => {
+  const base = {
+    model: 'deepseek-v4.1-flash',
+    max_tokens: 64,
+    messages: [{ role: 'user', content: 'hello' }],
+  };
+  for (const thinking of [
+    {},
+    { type: 'maybe' },
+    { type: 'enabled' },
+    { type: 'enabled', budget_tokens: -1 },
+    { type: 'enabled', budget_tokens: 1.5 },
+  ]) {
+    assert.throws(
+      () => normalizeAnthropicRequest({ ...base, thinking }),
+      (error) => error.status === 400 && error.type === 'invalid_request_error',
+    );
+  }
+});
+
+test('Anthropic 历史回放忽略 thinking 块', () => {
+  const normalized = normalizeAnthropicRequest({
+    model: 'deepseek-v4.1-flash',
+    max_tokens: 64,
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'private', signature: '' },
+          { type: 'redacted_thinking', data: 'private' },
+          { type: 'text', text: 'answer' },
+        ],
+      },
+      { role: 'user', content: 'next' },
+    ],
+  });
+  assert.deepEqual(normalized.messages[0], {
+    role: 'assistant',
+    content: 'answer',
+  });
+});
+
+test('Anthropic 对不支持的缓存与请求字段返回明确 400', () => {
   const base = {
     model: 'deepseek-v4.1-flash',
     max_tokens: 64,
     messages: [{ role: 'user', content: 'hello' }],
   };
   for (const body of [
-    { ...base, thinking: { type: 'enabled', budget_tokens: 1 } },
     { ...base, mcp_servers: [] },
     { ...base, container: 'container_1' },
     { ...base, cache_control: { type: 'ephemeral' } },
