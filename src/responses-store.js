@@ -14,19 +14,38 @@ const MAX_PARTIAL_BYTES = 8 * 1024 * 1024;
 const WRITE_TIMEOUT_MS = 2000;
 const MAX_PERSISTED_TEXT_BYTES = 256 * 1024;
 
+/**
+ * Worker 的 execArgv 白名单。
+ *
+ * 原实现只滤掉 `--eval` 家族，其余照搬 `process.execArgv`。问题是 `node --test`
+ * 会把整族 test-runner 参数塞进 execArgv（`--test-isolation=process`、
+ * `--test-coverage-*`、`--node-snapshot`、`--tls-cipher-list=…` 等），其中好几个
+ * 对普通 worker 是非法参数，worker 起不来，每条持久化写入都报
+ * `ERR_WORKER_INVALID_EXEC_ARGV`——表现出来就像持久化功能坏了。
+ *
+ * 这些参数只配置运行器本身，对 worker 没有任何意义；而 worker 只跑 SQLite 写入，
+ * 真正需要继承的是「加载器行为」这一类。所以改成白名单：只转发明确安全的项。
+ */
+const WORKER_EXEC_ARGV_ALLOW = [
+  '--experimental-addon-modules',
+  '--max-http-header-size',
+  '--max-old-space-size',
+  '--enable-source-maps',
+  '--no-warnings',
+  '--import',
+  '--loader',
+  '--experimental-loader',
+  '--conditions',
+  '--experimental-vm-modules',
+  '--preserve-symlinks',
+];
+
 function workerExecArgv(args = process.execArgv) {
   const filtered = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === '--input-type' || arg === '--eval' || arg === '--print'
-      || arg === '-e' || arg === '-p') {
-      index += 1;
-      continue;
-    }
-    if (arg.startsWith('--input-type=') || arg.startsWith('--eval=')
-      || arg.startsWith('--print=')) {
-      continue;
-    }
+    const name = arg.split('=')[0];
+    if (!WORKER_EXEC_ARGV_ALLOW.includes(name)) continue;
     filtered.push(arg);
   }
   return filtered;
