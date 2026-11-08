@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ApiError } from '../api-errors.js';
+import { reasoningDeclaration } from '../reasoning-effort.js';
 
 function requestError(message, code = 'invalid_request') {
   return new ApiError(400, message, {
@@ -459,6 +460,7 @@ export function createChatEncoder({ id, model, created = Math.floor(Date.now() /
 function modelRow(model) {
   const id = String(model.id || '').trim();
   if (!id || id === 'undefined') return null;
+  const declaration = reasoningDeclaration(model);
   return {
     id,
     object: 'model',
@@ -467,6 +469,13 @@ function modelRow(model) {
     name: model.name || id,
     context_window: model.maxInputTokens ?? null,
     max_output_tokens: model.maxOutputTokens ?? null,
+    wb_reasoning: {
+      form: declaration.form,
+      supported_efforts: declaration.efforts,
+      declared_effort: declaration.declaredEffort,
+      default_effort: declaration.defaultEffort,
+      can_disable_thinking: declaration.canDisableThinking,
+    },
   };
 }
 
@@ -496,5 +505,6 @@ export function mapModelCatalogue(payload, {
     context_window: null,
     max_output_tokens: null,
     wb_source: 'fallback',
+    wb_reasoning: null,
   }));
 }

@@ -10,7 +10,9 @@ import {
 import { ApiError, sendApiError } from './api-errors.js';
 import { createAnthropicRuntime, createOpenAIRuntime } from './api-runtime.js';
 import { createResponsesRuntime } from './api-responses.js';
+import { createReasoningCatalogue } from './reasoning-catalogue.js';
 import { createResponsesStore } from './responses-store.js';
+import { createUpstreamClient } from './upstream-client.js';
 
 function sendJson(res, status, body) {
   res.writeHead(status, {
@@ -172,29 +174,21 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
 
     if (route.operation === 'anthropic.count_tokens') {
       const body = await readBody(req);
-      const runtime = deps.anthropicRuntime || deps.runtime || createAnthropicRuntime({
-        ...deps,
-        cancelPersistence: sharedCancelStore(deps),
-      });
+      const runtime = getApiServices(deps).anthropicRuntime;
       runtime.countTokens({ res, body, config });
       return true;
     }
 
     if (route.operation === 'anthropic.messages') {
       const body = await readBody(req);
-      const runtime = deps.anthropicRuntime || deps.runtime || createAnthropicRuntime({
-        ...deps,
-        cancelPersistence: sharedCancelStore(deps),
-      });
+      const runtime = getApiServices(deps).anthropicRuntime;
       await runtime.messages({ req, res, body, config, clientKey });
       return true;
     }
 
-    const responses = deps.responsesRuntime || getResponsesRuntime(deps);
-    const runtime = deps.openaiRuntime || createOpenAIRuntime({
-      ...deps,
-      cancelPersistence: responses.store,
-    });
+    const services = getApiServices(deps);
+    const responses = services.responsesRuntime;
+    const runtime = services.openaiRuntime;
     if (route.operation === 'openai.responses') {
       const body = await readBody(req);
       await responses.create({ req, res, body, config, clientKey });
@@ -213,7 +207,12 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
       return true;
     }
     if (route.operation === 'openai.models') {
-      await runtime.models({ req, res, config });
+      await runtime.models({
+        req,
+        res,
+        config,
+        refresh: url.searchParams.get('refresh') === 'true',
+      });
       return true;
     }
     if (route.operation === 'openai.model') {
@@ -222,6 +221,7 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
         res,
         config,
         id: pathname.slice('/v1/models/'.length),
+        refresh: url.searchParams.get('refresh') === 'true',
       });
       return true;
     }
@@ -242,20 +242,45 @@ export async function handleApiRequest({ req, res, url, deps = {} }) {
   }
 }
 
-const responsesRuntimes = new WeakMap();
-function sharedCancelStore(deps) {
-  return deps.cancelPersistence || sharedResponsesRuntime(deps).store;
-}
+const apiServices = new WeakMap();
 
-function sharedResponsesRuntime(deps) {
-  if (deps.responsesRuntime) return deps.responsesRuntime;
-  return getResponsesRuntime(deps);
+function getApiServices(deps) {
+  if (apiServices.has(deps)) return apiServices.get(deps);
+
+  const upstreamClient = deps.upstreamClient || createUpstreamClient();
+  const reasoningCatalogue = deps.reasoningCatalogue || createReasoningCatalogue({
+    endpoint: upstreamClient.endpoint,
+    load: ({ credentials }) => upstreamClient.models(credentials),
+  });
+  const responsesRuntime = deps.responsesRuntime || createResponsesRuntime({
+    ...deps,
+    upstreamClient,
+    reasoningCatalogue,
+  });
+  const cancelPersistence = deps.cancelPersistence || responsesRuntime.store;
+  const services = {
+    upstreamClient,
+    reasoningCatalogue,
+    responsesRuntime,
+    openaiRuntime: deps.openaiRuntime || createOpenAIRuntime({
+      ...deps,
+      upstreamClient,
+      reasoningCatalogue,
+      cancelPersistence,
+    }),
+    anthropicRuntime: deps.anthropicRuntime || deps.runtime || createAnthropicRuntime({
+      ...deps,
+      upstreamClient,
+      reasoningCatalogue,
+      cancelPersistence,
+    }),
+  };
+  apiServices.set(deps, services);
+  return services;
 }
 
 function getResponsesRuntime(deps) {
-  if (deps.responsesRuntime) return deps.responsesRuntime;
-  if (!responsesRuntimes.has(deps)) responsesRuntimes.set(deps, createResponsesRuntime(deps));
-  return responsesRuntimes.get(deps);
+  return getApiServices(deps).responsesRuntime;
 }
 
 export function createApiAuthCheck(deps = {}) {

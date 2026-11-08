@@ -1204,6 +1204,7 @@ function openAIUsage(source, fallbackInput = 0, fallbackOutput = 0) {
 
 export function createOpenAIRuntime({
   upstreamClient = createUpstreamClient(),
+  reasoningCatalogue = null,
   readCredentials = readAccountCredentials,
   pick = pickAccount,
   begin = beginTask,
@@ -1942,7 +1943,7 @@ export function createOpenAIRuntime({
     return { ok: false, error: failure };
   }
 
-  async function catalogue(config) {
+  async function catalogue(config, { refresh = false } = {}) {
     const pool = poolLoader();
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
     const tried = [];
@@ -1963,7 +1964,14 @@ export function createOpenAIRuntime({
           });
           if (refreshed?.ok) credentials = refreshed;
         }
-        const payload = await upstreamClient.models(credentials);
+        const snapshot = reasoningCatalogue
+          ? await reasoningCatalogue.snapshot({
+              accountId: picked.name,
+              credentials,
+              refresh,
+            })
+          : null;
+        const payload = snapshot ? { models: snapshot.models } : await upstreamClient.models(credentials);
         const models = mapModelCatalogue(payload, {
           defaultModel: config.defaultModel,
         });
@@ -1973,9 +1981,14 @@ export function createOpenAIRuntime({
           durationMs: now() - startedAt,
           meta: { model: '', usage: {} },
         });
-        return { models, source: models.some((model) => model.wb_source === 'fallback')
-          ? 'fallback'
-          : 'upstream' };
+        return {
+          models,
+          source: models.some((model) => model.wb_source === 'fallback')
+            ? 'fallback'
+            : snapshot?.stale
+              ? 'stale'
+              : 'upstream',
+        };
       } catch (error) {
         debug(`OpenAI model catalogue from ${picked.name} failed: ${error.message}`);
         end(picked.name, {
@@ -1994,8 +2007,8 @@ export function createOpenAIRuntime({
     };
   }
 
-  async function models({ res, config }) {
-    const result = await catalogue(config);
+  async function models({ res, config, refresh = false }) {
+    const result = await catalogue(config, { refresh });
     sendJson(res, 200, {
       object: 'list',
       data: result.models,
@@ -2004,8 +2017,8 @@ export function createOpenAIRuntime({
     });
   }
 
-  async function model({ res, config, id }) {
-    const result = await catalogue(config);
+  async function model({ res, config, id, refresh = false }) {
+    const result = await catalogue(config, { refresh });
     const modelId = decodeURIComponent(String(id || ''));
     const found = result.models.find((item) => item.id === modelId);
     if (!found) {

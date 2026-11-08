@@ -326,7 +326,17 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
   const mapped = mapModelCatalogue({
     data: {
       models: [
-        { id: 'model-a', name: 'Model A', maxInputTokens: 1000, maxOutputTokens: 200 },
+        {
+          id: 'model-a',
+          name: 'Model A',
+          maxInputTokens: 1000,
+          maxOutputTokens: 200,
+          reasoning: {
+            supportedEfforts: ['low', 'high', 'max'],
+            defaultEffort: 'high',
+            canDisableThinking: false,
+          },
+        },
       ],
     },
   });
@@ -338,6 +348,13 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
     name: 'Model A',
     context_window: 1000,
     max_output_tokens: 200,
+    wb_reasoning: {
+      form: 'supported',
+      supported_efforts: ['low', 'high', 'max'],
+      declared_effort: null,
+      default_effort: 'high',
+      can_disable_thinking: false,
+    },
   }]);
 
   const fallback = mapModelCatalogue(null, {
@@ -348,6 +365,66 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
     ['auto', 'deepseek-v4.1-flash'],
   );
   assert(fallback.every((model) => model.wb_source === 'fallback'));
+  assert(fallback.every((model) => model.wb_reasoning === null));
+});
+
+test('模型目录在 TTL 内复用同一份缓存', async (t) => {
+  let catalogueCalls = 0;
+  const { baseUrl } = await startFixture(t, (req, res) => {
+    if (req.url === '/v2/enterprises/personal/models') {
+      catalogueCalls += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        data: {
+          models: [{
+            id: 'deepseek-v4.1-flash',
+            reasoning: {
+              supportedEfforts: ['low', 'high', 'max'],
+              defaultEffort: 'high',
+              canDisableThinking: true,
+            },
+          }],
+        },
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  const first = await fetch(`${baseUrl}/v1/models`);
+  const second = await fetch(`${baseUrl}/v1/models`);
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(catalogueCalls, 1);
+});
+
+test('模型目录 refresh=true 强制刷新', async (t) => {
+  let catalogueCalls = 0;
+  const { baseUrl } = await startFixture(t, (req, res) => {
+    if (req.url === '/v2/enterprises/personal/models') {
+      catalogueCalls += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        data: {
+          models: [{
+            id: 'deepseek-v4.1-flash',
+            reasoning: { effort: 'medium' },
+          }],
+        },
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await fetch(`${baseUrl}/v1/models`);
+  await fetch(`${baseUrl}/v1/models?refresh=true`);
+  await fetch(`${baseUrl}/v1/models`);
+
+  assert.equal(catalogueCalls, 2);
 });
 
 test('POST /v1/chat/completions 返回文本、usage 并释放号池租约', async (t) => {
