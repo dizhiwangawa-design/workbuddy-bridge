@@ -160,12 +160,20 @@ export function baseResponse({
   };
 }
 
-export function responseUsage(prompt = 0, completion = 0, reasoning = 0) {
+/**
+ * Responses usage。
+ *
+ * `cached_tokens` 来自上游的 prompt 缓存命中（WorkBuddy 报
+ * `prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens`），
+ * 以前这里硬编码 0，客户端因此永远显示「缓存命中 0%」。
+ * 注意 input_tokens 仍然包含命中部分，与 OpenAI 的语义一致。
+ */
+export function responseUsage(prompt = 0, completion = 0, reasoning = 0, cached = 0) {
   const input = Math.max(0, Number(prompt || 0));
   const output = Math.max(0, Number(completion || 0));
   return {
     input_tokens: input,
-    input_tokens_details: { cached_tokens: 0 },
+    input_tokens_details: { cached_tokens: Math.max(0, Number(cached || 0)) },
     output_tokens: output,
     output_tokens_details: { reasoning_tokens: Math.max(0, Number(reasoning || 0)) },
     total_tokens: input + output,
@@ -744,7 +752,12 @@ export function completedResponseBody({
     createdAt,
     status,
     output: [...prior, ...current],
-    usage: responseUsage(usage.prompt_tokens, usage.completion_tokens, usage.reasoning_tokens),
+    usage: responseUsage(
+      usage.prompt_tokens,
+      usage.completion_tokens,
+      usage.reasoning_tokens,
+      usage.cached_tokens,
+    ),
     incomplete,
     error,
     store,

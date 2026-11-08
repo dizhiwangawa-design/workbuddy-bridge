@@ -435,6 +435,12 @@ export function createResponsesRuntime(options = {}) {
               ?? usage?.reasoning_tokens
               ?? 0,
           ),
+          // 上游把缓存命中放在两个位置之一，取第一个有值的。
+          cached_tokens: Number(
+            usage?.prompt_cache_hit_tokens
+              ?? usage?.prompt_tokens_details?.cached_tokens
+              ?? 0,
+          ),
         },
         finishReason: truncation ? 'length' : finishReason,
       };

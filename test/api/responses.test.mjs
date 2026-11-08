@@ -2383,3 +2383,49 @@ test('Responses 推理增量必须带出结束事件', async (t) => {
   const textDone = events.find((e) => e.type === 'response.reasoning_summary_text.done');
   assert.equal(textDone.item_id, events.find((e) => e.type === 'response.output_item.added' && e.item?.type === 'reasoning').item.id);
 });
+
+test('Responses 透传上游缓存命中 token', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'ok' } }] }));
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: 4010,
+        completion_tokens: 12,
+        total_tokens: 4022,
+        prompt_cache_hit_tokens: 3840,
+        prompt_tokens_details: { cached_tokens: 3840 },
+      },
+    }));
+    res.end('data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', input: 'cache' }),
+  });
+  const body = await response.json();
+  assert.equal(body.usage.input_tokens, 4010);
+  assert.equal(body.usage.input_tokens_details.cached_tokens, 3840);
+  assert.equal(body.usage.total_tokens, 4022);
+});
+
+test('Responses 上游不报缓存命中时保持 0', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'ok' } }] }));
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+    }));
+    res.end('data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', input: 'plain' }),
+  });
+  const body = await response.json();
+  assert.equal(body.usage.input_tokens_details.cached_tokens, 0);
+});
