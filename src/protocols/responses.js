@@ -7,6 +7,7 @@ import {
 } from '../stream-control.js';
 import { outputFromPartial } from '../responses-store.js';
 import { resolveReasoningEffort } from '../reasoning-effort.js';
+import { withContinuationNudge } from '../continuation-nudge.js';
 
 const SUPPORTED_TOOL_TYPES = new Set([
   'function',
@@ -457,6 +458,7 @@ export function prepareResponsesRequest(body, {
   defaultModel = 'deepseek-v4.1-flash',
   toolsEnabled = true,
   history = [],
+  continuationNudge = true,
 } = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw bad('body must be a JSON object');
   const model = String(body.model || defaultModel || '').trim();
@@ -542,7 +544,12 @@ export function prepareResponsesRequest(body, {
 
   const outbound = {
     model,
-    messages,
+    // 带工具时补一条回合约束：没有工具调用的纯文字回复会被 codex / dsh 当作
+    // 任务结束，导致模型只描述下一步就交还控制权。
+    messages: withContinuationNudge(messages, {
+      tools: tools.length,
+      enabled: continuationNudge,
+    }),
     stream: true,
   };
   const max = body.max_output_tokens;

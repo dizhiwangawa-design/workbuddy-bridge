@@ -191,6 +191,31 @@ if (toolUse) {
 - **SSE 保活**：`message_start` 后每 15 秒发送一次 Anthropic `ping`，防止下游代理因短暂无事件而断开。ping 不代表上游出现了新内容。
 - **乱序工具结果**：user message 中排在 text/image 后的 `tool_result` 会自动移到最前，并保持 result 组与剩余块各自的相对顺序；引用未知 `tool_use_id` 的请求返回 400。
 
+### 回合续跑约束
+
+codex 和 dsh 这类客户端把「这一轮没有发出工具调用」当作任务结束。模型只要在回合
+末尾写一句「先停掉测试：」，客户端就判定完成、把控制权交回用户，用户必须手动打
+「继续」才能往下走。这跟具体模型无关，三条协议都会遇到。
+
+桥接因此对**带工具**的请求在最后一条 user 消息之后补一条 system 约束，要求未完成
+时继续发工具调用。三条路径共用同一份文本（`src/continuation-nudge.js`）：
+
+- Responses（`/v1/responses`）：codex 的 `wire_api = "responses"` 和 dsh 的
+  `api: openai-responses` 都走这条
+- Chat Completions（`/v1/chat/completions`）
+- Anthropic Messages（`/v1/messages`）
+
+不带工具的纯问答请求不插入，避免污染普通 API 用途；同一条约束只插一次，重试和多轮
+拼装不会叠加。
+
+关闭方式二选一：管理接口 `PATCH /api/api-compat` 传 `{"continuationNudge": false}`，
+或设环境变量 `WB_CONTINUATION_NUDGE=0`。环境变量作为应急开关优先于磁盘配置，方便
+不重启配置的情况下临时关掉。
+
+这是提示层约束，不是硬拦截：它降低模型提前收尾的概率，但不改变客户端「无工具调用
+即结束」的判定逻辑。真实客户端验证见 `test/live/codex-client-smoke.mjs` 与
+`test/live/dsh-client-smoke.mjs`。
+
 ### Anthropic thinking
 
 `thinking.type` 为必填字段，只接受 `enabled` 或 `disabled`。缺失 `thinking` 或

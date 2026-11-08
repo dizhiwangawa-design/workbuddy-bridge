@@ -14,6 +14,7 @@ import {
 } from './tool-calls.js';
 import { createStructuredToolAssembler, arbitrateToolCalls } from './protocols/normalize.js';
 import { conservativeTokenEstimate } from './protocols/anthropic.js';
+import { continuationNudgeEnabled } from './continuation-nudge.js';
 import {
   baseResponse,
   completedResponseBody,
@@ -1443,6 +1444,7 @@ export function createResponsesRuntime(options = {}) {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
       history,
+      continuationNudge: continuationNudgeEnabled(config),
     });
     let attempt;
     try {
@@ -1485,6 +1487,7 @@ export function createResponsesRuntime(options = {}) {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
       history: previous.messages,
+      continuationNudge: continuationNudgeEnabled(config),
     });
     if (body?.stream === true && !config.streaming) {
       throw new ApiError(400, 'streaming is disabled', { code: 'streaming_disabled' });
@@ -1609,6 +1612,7 @@ export function createResponsesRuntime(options = {}) {
           defaultModel: config.defaultModel,
           toolsEnabled: config.tools,
           history: history.messages,
+          continuationNudge: continuationNudgeEnabled(config),
         });
       } catch (error) {
         send({ type: 'error', error: { code: error.code || 'invalid_request', message: error.message } });

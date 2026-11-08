@@ -69,6 +69,7 @@ export function defaultConfig() {
       tools: true,
       responsesPersistence: true,
       responsesNudge: false,
+      continuationNudge: true,
       channelSanitize: true,
       requireApiKey: false,
       remoteRequireKey: true,

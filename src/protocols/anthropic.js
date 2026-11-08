@@ -1,5 +1,6 @@
 import { ApiError } from '../api-errors.js';
 import { budgetEffort } from '../reasoning-effort.js';
+import { withContinuationNudge } from '../continuation-nudge.js';
 
 function requestError(message) {
   return new ApiError(400, message, {
@@ -190,6 +191,7 @@ function normalizeMessages(messages, warnings) {
 
 export function normalizeAnthropicRequest(body, {
   requireMaxTokens = true,
+  continuationNudge = true,
 } = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw requestError('request body must be a JSON object');
@@ -257,7 +259,10 @@ export function normalizeAnthropicRequest(body, {
   }
 
   return {
-    messages,
+    messages: withContinuationNudge(messages, {
+      tools: tools.length,
+      enabled: continuationNudge,
+    }),
     tools,
     toolChoice,
     toolNames,
@@ -272,8 +277,8 @@ export function normalizeAnthropicRequest(body, {
   };
 }
 
-export function anthropicToOpenAI(body) {
-  const normalized = normalizeAnthropicRequest(body);
+export function anthropicToOpenAI(body, options = {}) {
+  const normalized = normalizeAnthropicRequest(body, options);
   const outbound = {
     messages: normalized.messages,
     stream: true,
