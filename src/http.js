@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { getSession, latestSession, listSessions, startLogin } from './login.js';
 import { pngDataUrl } from './qr.js';
 import { createServer } from './server.js';
@@ -150,12 +150,61 @@ function readBody(req, limit = 1024 * 1024) {
   });
 }
 
-/** 管理接口的轻量门禁：只有显式设置了 WB_ADMIN_TOKEN 才校验。 */
-function adminAllowed(req, url) {
-  const expected = process.env.WB_ADMIN_TOKEN;
-  if (!expected) return true;
-  const got = req.headers['x-wb-token'] || url.searchParams.get('token');
-  return got === expected;
+/** 监听地址是否只对本机可见。非回环意味着同网段的任何人都能连上来。 */
+function isLoopbackHost(host) {
+  const value = String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return value === 'localhost'
+    || value === '::1'
+    || value === '127.0.0.1'
+    || value.startsWith('127.');
+}
+
+function tokensMatch(got, expected) {
+  const a = Buffer.from(String(got ?? ''), 'utf8');
+  const b = Buffer.from(String(expected ?? ''), 'utf8');
+  if (!b.length || a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * 管理接口门禁。语义由**监听地址**决定，不是由「有没有配 token」决定：
+ *  - 回环监听：只有本机连得上，未设 token 时默认放行（本地开发业态）。
+ *  - 非回环监听：必须设 WB_ADMIN_TOKEN，否则 startHttpServer 直接拒绝启动。
+ *    以前是「没设 token 就全开」，于是 wb http --host 0.0.0.0 等于把
+ *    「关远程鉴权」「建 Key」两个接口送给整个网段。
+ *
+ * token 只从请求头读。查询串里的 token 会进浏览器历史和反代日志，
+ * 因此只有管理页本身（浏览器没法带自定义头）接受它，页面会立刻把它从地址栏抹掉。
+ */
+function createAdminGate({ host, token }) {
+  const expected = String(token ?? '').trim();
+  const required = Boolean(expected);
+  if (!required && !isLoopbackHost(host)) {
+    throw Object.assign(
+      new Error(
+        [
+          '拒绝在 ' + host + ' 上监听：非回环地址必须设置 WB_ADMIN_TOKEN，',
+          '否则同网段的任何人都能通过管理接口改配置或创建 API Key。',
+          '要么设 WB_ADMIN_TOKEN，要么只监听 127.0.0.1。',
+        ].join(''),
+      ),
+      { code: 'ADMIN_TOKEN_REQUIRED' },
+    );
+  }
+  return {
+    required,
+    /** API 请求：只认请求头。 */
+    allows(req) {
+      if (!required) return true;
+      return tokensMatch(req.headers['x-wb-token'], expected);
+    },
+    /** 管理页本身：允许首次用 ?token= 引导，页面随后会清掉地址栏。 */
+    allowsPage(req, url) {
+      if (!required) return true;
+      if (tokensMatch(req.headers['x-wb-token'], expected)) return true;
+      return tokensMatch(url.searchParams.get('token'), expected);
+    },
+  };
 }
 
 /**
@@ -171,7 +220,9 @@ export async function startHttpServer({
   host = '127.0.0.1',
   mcp = false,
   apiDeps = {},
+  adminToken = process.env.WB_ADMIN_TOKEN,
 } = {}) {
+  const admin = createAdminGate({ host, token: adminToken });
   const transports = new Map();
   const activeSockets = new Set();
   const activeWebSockets = new Set();
@@ -195,7 +246,7 @@ export async function startHttpServer({
       }
 
       if (p === '/api/api-compat' || p.startsWith('/api/api-compat/')) {
-        if (!adminAllowed(req, url)) {
+        if (!admin.allows(req)) {
           return json(res, 401, { ok: false, error: '需要管理令牌' });
         }
         await handleApiSettingsApi(req, res, url);
@@ -203,14 +254,14 @@ export async function startHttpServer({
       }
 
       if (p === '/' || p === '/admin') {
-        if (!adminAllowed(req, url)) return send(res, 401, '需要管理令牌：?token=…');
-        send(res, 200, adminPage({ home: BRIDGE_HOME, token: process.env.WB_ADMIN_TOKEN || '' }), 'text/html; charset=utf-8');
+        if (!admin.allowsPage(req, url)) return send(res, 401, '需要管理令牌：?token=…');
+        send(res, 200, adminPage({ home: BRIDGE_HOME, token: admin.required ? String(adminToken) : '' }), 'text/html; charset=utf-8');
         return;
       }
 
       // ------------------------------------------------------- 号池 API
       if (p === '/api/stats') {
-        if (!adminAllowed(req, url)) return json(res, 401, { ok: false, error: '需要管理令牌' });
+        if (!admin.allows(req)) return json(res, 401, { ok: false, error: '需要管理令牌' });
         let range = url.searchParams.get('range') || 'today';
         if (!RANGES[range]) range = 'today';
         const stats = buildStats(loadPool(), range);
@@ -218,7 +269,7 @@ export async function startHttpServer({
       }
 
       if (p.startsWith('/api/pool')) {
-        if (!adminAllowed(req, url)) return json(res, 401, { ok: false, error: '需要管理令牌' });
+        if (!admin.allows(req)) return json(res, 401, { ok: false, error: '需要管理令牌' });
         if (await handlePoolApi(req, res, url, p)) return;
       }
 

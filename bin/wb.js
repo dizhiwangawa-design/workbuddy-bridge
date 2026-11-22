@@ -253,6 +253,7 @@ async function cmdHttp(values) {
   ensureBridgeDirs();
   const port = Number(values.port || 7666);
   const host = values.host || '127.0.0.1';
+  requireAdminTokenFor(host);
   await startHttpServer({ port, host, mcp: !!values.mcp });
   const displayHost = host === '0.0.0.0' ? 'localhost' : host;
   console.log(C.bold(`\n管理界面：${C.cyan(`http://${displayHost}:${port}/admin`)}`));
@@ -382,6 +383,20 @@ async function cmdPool(values, positionals) {
   console.log('');
 }
 
+/**
+ * 非回环监听必须带管理令牌，否则同网段任何人都能改配置、建 Key、关远程鉴权。
+ * 这里在启动前就拦住，而不是只打一行黄字建议——警告挡不住误操作。
+ */
+function requireAdminTokenFor(host) {
+  if (String(process.env.WB_ADMIN_TOKEN || '').trim()) return;
+  const value = String(host || '').trim().toLowerCase();
+  const loopback = value === 'localhost' || value === '::1' || value === '127.0.0.1' || value.startsWith('127.');
+  if (loopback) return;
+  console.error(C.red('拒绝在 ' + host + ' 上监听：未设置 WB_ADMIN_TOKEN。'));
+  console.error(C.dim('非回环地址上管理接口默认没有任何门禁：任何人都能改上游地址、关掉远程鉴权、创建 API Key。'));
+  console.error(C.dim('要么设 WB_ADMIN_TOKEN，要么改为只监听 127.0.0.1（手机扫码可用 SSH 端口转发）。'));
+  process.exit(1);
+}
 /** 中日韩字符占两个终端宽度，不处理会让表格错位。 */
 function strWidth(s) {
   let w = 0;
@@ -395,10 +410,11 @@ async function cmdAdmin(values) {
   ensureBridgeDirs();
   const port = Number(values.port || 7667);
   const host = values.host || '127.0.0.1';
+  requireAdminTokenFor(host);
   await startHttpServer({ port, host, mcp: false });
   console.log(C.bold(`\n管理界面：${C.cyan(`http://${host === '0.0.0.0' ? 'localhost' : host}:${port}/admin`)}`));
-  if (host === '0.0.0.0') {
-    console.log(C.yellow('已监听所有网卡，建议同时设置 WB_ADMIN_TOKEN 环境变量，避免同网段任何人改动账号。'));
+  if (host !== '127.0.0.1') {
+    console.log(C.dim('管理接口已启用 WB_ADMIN_TOKEN 校验；URL 里的 ?token= 只在首次打开时用，页面会自动从地址栏清掉。'));
   }
   console.log(C.dim('Ctrl+C 退出\n'));
 }

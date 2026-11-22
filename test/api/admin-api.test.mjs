@@ -7,6 +7,9 @@ import path from 'node:path';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-admin-api-'));
 process.env.WB_BRIDGE_HOME = path.join(tmp, 'bridge');
 process.env.WB_ADMIN_TOKEN = 'admin-fixture';
+// 测试桩上游就起在 127.0.0.1，必须显式放行内网地址；
+// 生产默认禁止，见 src/api-settings.js 的 assertUpstreamHost。
+process.env.WB_ALLOW_PRIVATE_UPSTREAM = '1';
 
 const settings = await import('../../src/api-settings.js');
 const { startHttpServer } = await import('../../src/http.js');

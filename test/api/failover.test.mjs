@@ -8,6 +8,8 @@ import { once } from 'node:events';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-failover-'));
 process.env.WB_BRIDGE_HOME = path.join(tmp, 'bridge');
+// 测试桩上游就起在 127.0.0.1，必须显式放行内网地址。
+process.env.WB_ALLOW_PRIVATE_UPSTREAM = '1';
 
 const accounts = await import('../../src/accounts.js');
 const pool = await import('../../src/pool.js');

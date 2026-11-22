@@ -501,11 +501,11 @@ export function adminPage({ home = '', token = '' } = {}) {
           <label><input type="checkbox" data-api-config="trustProxy"> 信任反向代理</label>
         </div>
         <div class="api-fields">
-          <label class="api-field wide"><span>上游地址</span><input data-api-field="upstreamBaseUrl" placeholder="https://copilot.tencent.com"/></label>
+          <label class="api-field wide"><span>上游地址</span><input data-api-field="upstreamBaseUrl" placeholder="https://copilot.tencent.com"/>（保存即生效）</label>
           <label class="api-field"><span>默认模型</span><input data-api-field="defaultModel" placeholder="deepseek-v4.1-flash"/></label>
           <label class="api-field"><span>首字节超时 (ms)</span><input data-api-field="firstByteTimeoutMs" inputmode="numeric"/></label>
           <label class="api-field"><span>空闲超时 (ms)</span><input data-api-field="idleTimeoutMs" inputmode="numeric"/></label>
-          <label class="api-field"><span>总超时 (ms)</span><input data-api-field="totalTimeoutMs" inputmode="numeric"/></label>
+          <label class="api-field"><span>总超时 (ms)</span><input data-api-field="totalTimeoutMs" inputmode="numeric"/></label></div><div class="api-fields"><label class="api-field"><span>单次上游超时 (ms，保存即生效)</span><input data-api-field="timeoutMs" inputmode="numeric"/></label>
         </div>
         <div class="api-actions test">
           <button class="ghost" data-act="api-test-openai">测试 OpenAI 文本</button>
@@ -605,6 +605,17 @@ export function adminPage({ home = '', token = '' } = {}) {
 
 <script>
 var TOKEN=${JSON.stringify(token || '')};
+/* 首次引导可以带 ?token=，但它不该留在地址栏（浏览器历史、截图、反代日志都会记下来）。
+   读进内存后立刻用 replaceState 抹掉；之后的请求一律走 x-wb-token 请求头。 */
+(function(){
+  try{
+    var u=new URL(location.href);
+    if(u.searchParams.has('token')){
+      u.searchParams.delete('token');
+      history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams:'')+u.hash);
+    }
+  }catch(e){}
+})();
 var $=function(id){return document.getElementById(id)};
 var state={pool:null,stats:null,api:null,range:'today',metric:'tokens',hover:false};
 var timer=null,loginPoll=null,lastEventSeq=0,firstPaint=true;
