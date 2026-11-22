@@ -59,18 +59,17 @@ test('Anthropic 请求转换支持 tools、图片、tool_result 与 is_error', (
   });
 
   assert.equal(converted.body.stream, true);
-  assert.equal(converted.body.messages[0].role, 'system');
-  // 带工具时会在**消息末尾**补一条回合约束（continuation-nudge）。
-  // 位置从「最后一条 user 之后」改到末尾：真实请求的尾部是工具往返，插在 user
-  // 之后等于把约束塞进历史中段，与这一轮要干嘛隔开。
   const messages = converted.body.messages;
-  assert.equal(messages.at(-1).role, 'system');
-  assert.match(messages.at(-1).content, /运行约束/);
-  assert.equal(messages[2].role, 'assistant');
-  assert.equal(messages[2].tool_calls[0].id, 'toolu_1');
-  assert.equal(messages[3].role, 'tool');
-  assert.equal(messages[3].tool_call_id, 'toolu_1');
-  assert.match(messages[3].content, /^\[tool_error\]/);
+  assert.equal(messages[0].role, 'system');
+  // 约束插在最后一条 user 之后（长期验证过的位置）：放到整串末尾会让 system
+  // 直接跟在 tool 结果后面，模型容易把这条指令当成新一轮对话的开头。
+  assert.equal(messages[2].role, 'system');
+  assert.match(messages[2].content, /运行约束/);
+  assert.equal(messages[3].role, 'assistant');
+  assert.equal(messages[3].tool_calls[0].id, 'toolu_1');
+  assert.equal(messages[4].role, 'tool');
+  assert.equal(messages[4].tool_call_id, 'toolu_1');
+  assert.match(messages[4].content, /^\[tool_error\]/);
   assert.equal(converted.body.tools[0].function.name, 'get_weather');
   assert.equal(converted.body.tool_choice.function.name, 'get_weather');
 });
@@ -203,7 +202,7 @@ test('Anthropic thinking 的畸形请求返回 400', () => {
   }
 });
 
-test('Anthropic 历史回放保留 thinking 文本、丢弃加密思考块', () => {
+test('Anthropic 历史回放忽略 thinking 块', () => {
   const normalized = normalizeAnthropicRequest({
     model: 'deepseek-v4.1-flash',
     max_tokens: 64,
@@ -219,28 +218,12 @@ test('Anthropic 历史回放保留 thinking 文本、丢弃加密思考块', () 
       { role: 'user', content: 'next' },
     ],
   });
-  // 整块丢弃会让依赖推理连续性的多轮对话失忆；保留成可见文本，
-  // 加密块没有可读内容仍然丢弃。
+  // 折成可见文本会让模型把「自己的思考」当成「上一轮说过的话」，进而在正文里
+  // 沿用这个格式（曾把 <prior_reasoning> 泄漏成用户可见输出），所以仍然丢弃。
   assert.deepEqual(normalized.messages[0], {
     role: 'assistant',
-    content: '<prior_reasoning>private</prior_reasoning>\nanswer',
+    content: 'answer',
   });
-});
-
-test('Anthropic 只有 thinking 的历史消息不会整条消失', () => {
-  const normalized = normalizeAnthropicRequest({
-    model: 'deepseek-v4.1-flash',
-    max_tokens: 64,
-    messages: [
-      {
-        role: 'assistant',
-        content: [{ type: 'thinking', thinking: '只想了没说话', signature: '' }],
-      },
-      { role: 'user', content: 'next' },
-    ],
-  });
-  assert.equal(normalized.messages.length, 2);
-  assert.match(normalized.messages[0].content, /只想了没说话/);
 });
 
 test('Anthropic 对不支持的缓存与请求字段返回明确 400', () => {

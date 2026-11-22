@@ -261,14 +261,15 @@ codex 和 dsh 这类客户端把「这一轮没有发出工具调用」当作任
 thinking 签名，因此 `signature` 固定为空字符串；严格校验签名的客户端会退化成普通
 文本（pi-ai 的 `allowEmptySignature` 分支），而不是报错。
 
-**历史里的思考会被保留**，因为它们影响多轮连续性：
+**历史里的思考块不回传给上游**，这条是刻意的：
 
-- Anthropic：assistant 消息里的 `thinking` 块折叠为
-  `<prior_reasoning>…</prior_reasoning>` 文本前缀，与正文同路发给上游（实测上游
-  接受）。`redacted_thinking` 没有可读内容，仍然丢弃。
-- Responses：持久化记录的 `reasoning.summary` 原样保留、只更换 item id；客户端回传
-  的 reasoning item 折叠为一条 assistant 前缀消息，单条截断到 2000 字符。空 summary
-  仍然跳过，不制造空气泡。
+- Anthropic：assistant 消息里的 `thinking` / `redacted_thinking` 块直接丢弃。
+- Responses：客户端回传的 `reasoning` item 丢弃；持久化记录里的 `reasoning.summary`
+  仍然保留（只更换 item id），但那条路径只服务 `GET /v1/responses/:id` 与回放，
+  不进入上游 messages。
+- 为什么不做「折叠成文本再发」：上游只有正文一个通道，把推理写进 assistant 正文等于
+  告诉模型「我上一轮说过这句话」，它会继承同样的格式并在正文里继续写推理 ——
+  曾因此把 `<prior_reasoning>` 标记泄漏成用户可见输出。丢推理的代价远小于泄漏。
 - `include: ["reasoning.encrypted_content"]` 与 `encrypted_content` **不支持**：上游
   不产生该字段，桥接无法伪造，只能忽略。依赖加密思考回放的客户端会退化成普通文本。
 

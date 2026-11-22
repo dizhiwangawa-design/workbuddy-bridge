@@ -35,7 +35,7 @@ test('约束文本自带可识别标记', () => {
   assert.ok(CONTINUATION_NUDGE.startsWith(CONTINUATION_NUDGE_MARKER));
 });
 
-test('带工具时插到消息末尾', () => {
+test('带工具时插到最后一条 user 之后', () => {
   const messages = [user('a'), { role: 'assistant', content: 'b' }, user('c')];
   const patched = withContinuationNudge(messages, { tools: 2 });
   assert.notEqual(patched, messages, '不应原地修改入参');
@@ -51,24 +51,23 @@ test('插入后 assistant 工具调用与结果仍然相邻', () => {
     { role: 'tool', tool_call_id: 'c1', content: 'ok' },
   ];
   const patched = withContinuationNudge(messages, { tools: 1 });
-  // 工具组已经闭合，约束落在整组之后：assistant(tool_calls) 与 tool 仍然紧邻。
-  assert.deepEqual(nudgePositions(patched), [3]);
-  assert.equal(patched[1].role, 'assistant');
-  assert.equal(patched[2].role, 'tool');
-  assert.equal(patched[3].role, 'system');
+  assert.deepEqual(nudgePositions(patched), [1]);
+  assert.equal(patched[2].role, 'assistant');
+  assert.equal(patched[3].role, 'tool');
 });
 
-test('约束落在工具往返之后，而不是历史中段', () => {
+test('约束不落在 tool 结果之后（末尾 system 会被当成新一轮指令）', () => {
   const messages = [
     { role: 'system', content: 'sys' },
     user('refactor the parser'),
     { role: 'assistant', content: null, tool_calls: [{ id: 'c1' }] },
     { role: 'tool', tool_call_id: 'c1', content: 'body' },
-    { role: 'assistant', content: null, tool_calls: [{ id: 'c2' }] },
-    { role: 'tool', tool_call_id: 'c2', content: 'ok' },
   ];
   const patched = withContinuationNudge(messages, { tools: 1 });
-  assert.deepEqual(nudgePositions(patched), [messages.length]);
+  // 位置必须是「最后一条 user 之后」，不能是整串末尾：跟 tool 结果并排会让模型
+  // 把约束读成新一轮对话的开头，表现为说完一句就收工。
+  assert.deepEqual(nudgePositions(patched), [2]);
+  assert.notEqual(patched.at(-1).role, 'system');
 });
 
 test('tool_choice 为 none 时不注入（不与客户端意图冲突）', () => {

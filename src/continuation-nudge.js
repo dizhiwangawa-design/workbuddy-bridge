@@ -94,11 +94,15 @@ function hasCodexMetadata(body) {
  *   - dsh / pi-ai：`user-agent: pi (<platform> <release>; <arch>)`
  */
 export function detectAgentClient({ headers = null, body = null } = {}) {
+  // 判定要「宽进」：漏判的代价是约束不注入，客户端又会回到「说一句就收工」的老 bug；
+  // 误判的代价只是多一段 system 文本。所以任何一条线索命中都算。
   const originator = headerValue(headers, 'originator').toLowerCase();
   if (originator.startsWith('codex')) return 'codex';
   const userAgent = headerValue(headers, 'user-agent');
   if (/^pi\b/i.test(userAgent)) return 'dsh';
+  if (/codex/i.test(userAgent)) return 'codex';
   if (headerValue(headers, 'x-codex-turn-metadata')) return 'codex';
+  if (headerValue(headers, 'x-codex-window-id')) return 'codex';
   if (headerValue(headers, 'session-id') && /codex/i.test(userAgent)) return 'codex';
   if (hasCodexMetadata(body)) return 'codex';
   return null;
@@ -119,10 +123,15 @@ export function continuationNudgeApplies({
   headers = null,
   body = null,
   hasToolLoop = false,
+  protocol = null,
 } = {}) {
   if (mode === 'off') return false;
   if (mode === 'always') return true;
-  return Boolean(detectAgentClient({ headers, body })) || hasToolLoop === true;
+  if (detectAgentClient({ headers, body })) return true;
+  if (hasToolLoop === true) return true;
+  // Responses 协议基本只有编码 Agent 在用（codex 的 wire_api、dsh 的
+  // api: openai-responses）。头识别再漏，这条也能兜住首轮不注入的问题。
+  return protocol === 'responses';
 }
 
 const TOOL_CALL_ITEM_TYPES = new Set([
@@ -226,5 +235,17 @@ export function withContinuationNudge(messages, {
   // 客户端明确不要工具调用时，约束与 tool_choice 冲突，不注入。
   if (choiceIsNone(toolChoice)) return messages;
   if (alreadyNudged(messages)) return messages;
-  return [...messages, { role: 'system', content: CONTINUATION_NUDGE }];
+  const nudge = { role: 'system', content: CONTINUATION_NUDGE };
+  // 插在最后一条 user 之后：这是长期验证过的位置。放到整串末尾会让 system 直接
+  // 跟在 tool 结果后面，模型容易把这条指令当成「新一轮对话的开头」，反而不继续
+  // 工具循环（codex 上表现为说完一句就收工）。
+  let index = -1;
+  for (let cursor = messages.length - 1; cursor >= 0; cursor -= 1) {
+    if (messages[cursor]?.role === 'user') {
+      index = cursor;
+      break;
+    }
+  }
+  if (index < 0) return [...messages, nudge];
+  return [...messages.slice(0, index + 1), nudge, ...messages.slice(index + 1)];
 }

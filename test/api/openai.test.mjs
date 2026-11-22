@@ -891,13 +891,17 @@ test('OpenAI SSE 流式文本、思考提示与多轮工具完成', async (t) =>
   assert.match(second, /"finish_reason":"stop"/);
   assert.match(second, /data: \[DONE\]/);
   assert.equal(upstreamBodies.length, 2);
-  // 约束现在追加在整条消息列表末尾（工具组之后），所以末尾是 system，
-  // 工具结果仍然紧跟在 assistant(tool_calls) 后面。
+  // 约束插在最后一条 user 之后，所以末尾仍是 tool 结果；assistant(tool_calls)
+  // 与 tool 结果紧邻。
   const secondMessages = upstreamBodies[1].messages;
-  assert.equal(secondMessages.at(-1).role, 'system');
-  const toolResult = secondMessages.findLast((message) => message.role === 'tool');
-  assert.equal(toolResult.tool_call_id, 'call_read');
-  assert.equal(secondMessages[secondMessages.indexOf(toolResult) - 1].role, 'assistant');
+  assert.equal(secondMessages.at(-1).role, 'tool');
+  assert.equal(secondMessages.at(-1).tool_call_id, 'call_read');
+  assert.equal(secondMessages.at(-2).role, 'assistant');
+  assert.equal(
+    secondMessages.filter((message) => JSON.stringify(message.content).includes('运行约束')).length,
+    1,
+    '约束只注入一次',
+  );
 });
 
 test('OpenAI 工具结果引用缺失或工具开关关闭时返回明确错误', () => {

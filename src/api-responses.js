@@ -1574,6 +1574,7 @@ export function createResponsesRuntime(options = {}) {
         headers: req?.headers || null,
         body,
         hasToolLoop: responsesHasToolLoop(body),
+        protocol: 'responses',
       }),
     });
     let attempt;
@@ -1622,6 +1623,7 @@ export function createResponsesRuntime(options = {}) {
         headers: req?.headers || null,
         body,
         hasToolLoop: responsesHasToolLoop(body),
+        protocol: 'responses',
       }),
     });
     if (body?.stream === true && !config.streaming) {

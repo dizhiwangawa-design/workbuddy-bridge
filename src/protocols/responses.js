@@ -473,23 +473,12 @@ function replayHistory(input) {
       positions.set(id, position);
       continue;
     }
-    if (type === 'reasoning') {
-      // 回放历史里的推理：上游没有 reasoning 通道，整条丢弃会让模型看不到
-      // 自己上一轮想过什么（gpt-5-codex 这类客户端明确依赖它）。
-      // 折叠成一条 assistant 前缀消息；空 summary 仍然跳过，不制造空气泡。
-      const summary = summaryTextOf(item).trim();
-      if (summary) {
-        const clipped = summary.length > REASONING_REPLAY_LIMIT
-          ? `${summary.slice(0, REASONING_REPLAY_LIMIT)}…`
-          : summary;
-        messages.push({
-          role: 'assistant',
-          content: `<prior_reasoning>${clipped}</prior_reasoning>`,
-          position,
-        });
-      }
-      continue;
-    }
+    // 推理 item 不进上游 messages：上游没有 reasoning 通道，把它折成 assistant
+    // 正文会让模型把自己的思考当成「上一轮说过的话」，进而在正文里继续这个格式
+    // —— 就是曾经把 <prior_reasoning> 泄漏到用户可见输出的那条路径。
+    // 丢弃是安全默认；raw reasoning_content 若被擅自塞进正文，后果比「看不到上一轮
+    // 想过什么」严重得多。
+    if (type === 'reasoning') continue;
     if (typeof item.text === 'string') {
       messages.push({ role: 'user', content: item.text, position });
       continue;

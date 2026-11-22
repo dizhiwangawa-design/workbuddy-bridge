@@ -2761,7 +2761,7 @@ test('historyForResponse 保留 reasoning 摘要，只更换 item 身份', () =>
   assert.deepEqual(reasoning.summary, [{ type: 'summary_text', text: '先读 a.js' }]);
 });
 
-test('replayHistory 把历史 reasoning 折叠成 assistant 前缀而不是丢弃', () => {
+test('历史 reasoning 不进上游 messages，且不泄漏成可见文本', () => {
   const prepared = responses.prepareResponsesRequest({
     model: 'deepseek-v4.1-flash',
     input: [
@@ -2769,30 +2769,8 @@ test('replayHistory 把历史 reasoning 折叠成 assistant 前缀而不是丢�
       { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续' }] },
     ],
   });
-  assert.deepEqual(prepared.body.messages.map((m) => m.role), ['assistant', 'user']);
-  assert.match(prepared.body.messages[0].content, /先看语法树/);
-});
-
-test('空 summary 的 reasoning 不制造空气泡', () => {
-  const prepared = responses.prepareResponsesRequest({
-    model: 'deepseek-v4.1-flash',
-    input: [
-      { type: 'reasoning', summary: [] },
-      { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续' }] },
-    ],
-  });
+  // 上游没有 reasoning 通道；折成 assistant 正文会让模型把自己的思考当成
+  // 「上一轮说过的话」，进而在正文里沿用那个格式 —— 曾把标记泄漏给用户。
   assert.deepEqual(prepared.body.messages.map((m) => m.role), ['user']);
-});
-
-test('超长 reasoning 摘要回放时被截断', () => {
-  const long = 'think '.repeat(1000);
-  const prepared = responses.prepareResponsesRequest({
-    model: 'deepseek-v4.1-flash',
-    input: [
-      { type: 'reasoning', summary: [{ type: 'summary_text', text: long }] },
-      { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续' }] },
-    ],
-  });
-  assert.ok(prepared.body.messages[0].content.length < long.length);
-  assert.match(prepared.body.messages[0].content, /…<\/prior_reasoning>$/);
+  assert.equal(JSON.stringify(prepared.body.messages).includes('先看语法树'), false);
 });

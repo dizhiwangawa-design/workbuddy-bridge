@@ -60,13 +60,17 @@
   Anthropic runtime re-read the catalogue after switching accounts, so the other
   two paths kept sending the old account's effort. All three now share
   `applyEffortToBody`.
-- **Historical reasoning is no longer discarded.** Anthropic `thinking` blocks are
-  folded into a `<prior_reasoning>…</prior_reasoning>` text prefix (upstream
-  accepts it); `redacted_thinking` is still dropped for having no readable
-  content. Persisted Responses `reasoning.summary` is kept verbatim and only the
-  item id is regenerated, while client-replayed reasoning items are folded into
-  one assistant prefix message capped at 2000 characters. Empty summaries still
-  produce no message.
+- **A reasoning-history experiment was reverted: it leaked the model's thinking
+  into visible output.** `5157f0b` folded Anthropic `thinking` blocks and
+  Responses `reasoning` items into assistant messages tagged
+  `<prior_reasoning>…</prior_reasoning>`, so the model would not forget what it
+  had worked out. The upstream has only a content channel, so that wrapper read
+  to the model as "something I said last turn" — it adopted the format and wrote
+  its reasoning into visible text, which codex then rendered to the user. Both
+  injection paths are gone again: `thinking` / `redacted_thinking` blocks and
+  replayed `reasoning` items are dropped. Persisted `reasoning.summary` is still
+  preserved for `GET /v1/responses/:id`, but that path never enters upstream
+  messages. Losing prior thinking is cheaper than leaking it.
 - **The 256 KiB persistence budget is allocated per item instead of sequentially.**
   A 300 KB `apply_patch` used to consume the whole budget, leaving the following
   `function_call.arguments` and assistant message as empty strings — and
@@ -98,11 +102,18 @@
   two sentences of progress explanation and only forbids describing a plan
   without acting on it. Rule 4 no longer overrides the client's approval policy,
   and rule 5 gives repeated patch failures a termination condition.
-- **The nudge is appended at the end of the message list** rather than after the
-  last user message. Real requests end with tool round trips, so the old
-  placement buried the constraint mid-history; upstream accepts a trailing
-  system message (verified for start / after-user / after-tool / very end).
-  `tool_choice: "none"` suppresses the nudge entirely.
+- **The nudge stays after the last user message.** Moving it to the end of the
+  list put a `system` message directly after a tool result, which codex read as
+  the start of a new instruction and answered instead of continuing the tool
+  loop — the "stops right after a tool call or a progress note" regression.
+  `tool_choice: "none"` still suppresses it.
+- **Coding-agent detection is deliberately loose.** `auto` mode matched only
+  `originator: codex_*` and `user-agent: pi (…)`, so a codex front end that sends
+  neither header, on a first turn that has no tool history yet, got no nudge at
+  all and fell back to the old "say one sentence and stop" behaviour. Detection
+  now also accepts any `user-agent` containing `codex`, the `x-codex-*` headers,
+  and — because `/v1/responses` is effectively coding-agent-only — injects for
+  Responses requests carrying tools regardless of headers.
 - The dashboard gained a "回合续跑约束" switch; the setting previously had no UI at
   all and could only be changed through `PATCH /api/api-compat` or the
   environment.
