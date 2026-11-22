@@ -163,10 +163,15 @@ function stripTomlBlock(text, table) {
  * 另外 dsh 采用「插件即依赖」的模型，@deepseek-ai/dsh-mcp-client 必须装进
  * 该 profile 的 node_modules，且版本要和 dsh 本体对齐 —— npm 上 latest 标签
  * 还停在 0.0.1-rc.1，与 0.2.x 的 dsh 不兼容，dsh 会直接把整行禁用。
+ *
+ * DSH_HOME 要在调用时读，不能固化成模块常量：测试和嵌套调用都会在 import
+ * 之后再改 HOME / DSH_HOME。
  */
-const DSH_HOME = process.env.DSH_HOME
-  ? path.resolve(process.env.DSH_HOME)
-  : path.join(HOME, '.dsh');
+function dshHome() {
+  return process.env.DSH_HOME
+    ? path.resolve(process.env.DSH_HOME)
+    : path.join(HOME, '.dsh');
+}
 
 const DSH_MARK_START = '# >>> workbuddy-bridge >>>';
 const DSH_MARK_END = '# <<< workbuddy-bridge <<<';
@@ -177,7 +182,7 @@ function yamlStr(s) {
 }
 
 function dshProfiles() {
-  const dir = path.join(DSH_HOME, 'profiles');
+  const dir = path.join(dshHome(), 'profiles');
   if (!fs.existsSync(dir)) return [];
   return fs
     .readdirSync(dir, { withFileTypes: true })
@@ -294,15 +299,15 @@ function writeDshPatch(file, env) {
 const dshAdapter = {
   id: 'dsh',
   label: 'DeepSeek Harness',
-  file: path.join(DSH_HOME, 'profiles'),
+  get file() { return path.join(dshHome(), 'profiles'); },
   detect() {
-    return fs.existsSync(DSH_HOME);
+    return fs.existsSync(dshHome());
   },
   apply(env) {
     const profiles = dshProfiles();
     if (!profiles.length) {
       throw new Error(
-        `没找到 dsh profile（${path.join(DSH_HOME, 'profiles')} 为空）。先运行一次 dsh web 初始化，再回来执行 wb install。`,
+        `没找到 dsh profile（${path.join(dshHome(), 'profiles')} 为空）。先运行一次 dsh web 初始化，再回来执行 wb install。`,
       );
     }
 
@@ -311,7 +316,7 @@ const dshAdapter = {
     const notes = [];
 
     for (const p of profiles) {
-      const dir = path.join(DSH_HOME, 'profiles', p);
+      const dir = path.join(dshHome(), 'profiles', p);
       if (process.env.WB_DSH_SKIP_PLUGIN_INSTALL !== '1') {
         if (!installDshPlugin(dir, version)) {
           notes.push(
@@ -333,7 +338,7 @@ const dshAdapter = {
   remove() {
     const files = [];
     for (const p of dshProfiles()) {
-      const file = path.join(DSH_HOME, 'profiles', p, 'cordis.patch.yml');
+      const file = path.join(dshHome(), 'profiles', p, 'cordis.patch.yml');
       const text = fs.readFileSync(file, 'utf8');
       const stripped = stripDshBlock(text).trim();
       const meaningful = stripped

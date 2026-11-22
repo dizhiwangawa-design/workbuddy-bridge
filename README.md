@@ -187,6 +187,7 @@ if (toolUse) {
 - **真实流式**：可见文本到达即转发。工具调用延后到响应结束统一裁决，随后按 Anthropic 事件格式追加 `tool_use` blocks。
 - **结构优先**：合法结构化 `tool_calls` 优先；只有结构化调用全部无效时才回退到文本 DSML。两者同时有效会记录安全 warning，只包含模型、请求 ID、账号、数量和参数哈希，不记录原始参数。
 - **DSML 上限**：扫描器默认最多缓冲 2 MiB。超限、畸形或截断时失败关闭，不向正文泄漏 DSML，流式错误后不发送 `message_stop`。
+- **推理通道同样过扫描器**：模型有时把工具调用写进思考而非正文。三条协议都为 reasoning 单独跑一个 DSML 扫描器，把调用剥离出来并入仲裁，推理正文里只留可见部分；正文与推理各自独立缓冲，互不串味。推理是辅助通道，**片段畸形只丢弃并告警，不判整轮失败**（正文通道仍然失败关闭）。
 - **四层超时**：首字节 60 秒、流中空闲 120 秒、`finish_reason` 后宽限 2 秒、总时长 600 秒。流开始后无法安全换号，只会终止当前响应；账号 inflight 始终释放。
 - **SSE 保活**：`message_start` 后每 15 秒发送一次 Anthropic `ping`，防止下游代理因短暂无事件而断开。ping 不代表上游出现了新内容。
 - **乱序工具结果**：user message 中排在 text/image 后的 `tool_result` 会自动移到最前，并保持 result 组与剩余块各自的相对顺序；引用未知 `tool_use_id` 的请求返回 400。
@@ -197,20 +198,43 @@ codex 和 dsh 这类客户端把「这一轮没有发出工具调用」当作任
 末尾写一句「先停掉测试：」，客户端就判定完成、把控制权交回用户，用户必须手动打
 「继续」才能往下走。这跟具体模型无关，三条协议都会遇到。
 
-桥接因此对**带工具**的请求在最后一条 user 消息之后补一条 system 约束，要求未完成
-时继续发工具调用。三条路径共用同一份文本（`src/continuation-nudge.js`）：
+桥接因此对**带工具**的请求在**消息列表末尾**补一条 system 约束，要求未完成时继续
+发工具调用。三条路径共用同一份文本（`src/continuation-nudge.js`）：
 
 - Responses（`/v1/responses`）：codex 的 `wire_api = "responses"` 和 dsh 的
   `api: openai-responses` 都走这条
 - Chat Completions（`/v1/chat/completions`）
 - Anthropic Messages（`/v1/messages`）
 
-不带工具的纯问答请求不插入，避免污染普通 API 用途；同一条约束只插一次，重试和多轮
-拼装不会叠加。
+**位置为什么是末尾**：真实请求的尾部是工具往返（`function_call` / `tool_use`），
+不是 user。插在最后一条 user 之后等于把约束塞进历史中段，与这一轮要干嘛隔开。工具
+组此时已闭合，末尾追加不会破坏 assistant/tool 的相邻性；上游接受末尾 system。
 
-关闭方式二选一：管理接口 `PATCH /api/api-compat` 传 `{"continuationNudge": false}`，
-或设环境变量 `WB_CONTINUATION_NUDGE=0`。环境变量作为应急开关优先于磁盘配置，方便
-不重启配置的情况下临时关掉。
+**生效范围**（`continuationNudgeMode`）：
+
+| 模式 | 何时注入 |
+| --- | --- |
+| `off` | 永不（配置 `false` 或 `WB_CONTINUATION_NUDGE=0`） |
+| `auto`（默认） | 识别为编码 Agent，或历史里已有工具往返 |
+| `always` | 只要带工具就注入（`WB_CONTINUATION_NUDGE=1` 应急强制） |
+
+`auto` 的识别依据：codex 的 `originator: codex_exec` / `x-codex-*` 请求头 /
+`client_metadata` 里的 `x-codex-*` 键；dsh 的 `user-agent: pi (...)`。纯问答与其它
+客户端不再被污染。
+
+**不注入的两种例外**：不带工具的请求；`tool_choice` 为 `none`（客户端明确说这次别用
+工具，约束不能硬顶）。
+
+**约束文本要点**（共 5 条）：只有第 1 条是「必须调用工具」；第 2 条**允许一两句话
+说明进度**，只禁止「只写计划却不调用工具」——旧版禁止一切叙述，代价是过程完全不可
+见，出问题时看不出模型在做什么；第 4 条与客户端的 approval 策略解耦；第 5 条给补丁
+失败加了终止条件（同一处连续失败两次就改写，不无限重试）。
+
+同一条约束只插一次，重试和多轮拼装不会叠加。
+
+关闭方式三选一：管理页「回合续跑约束」开关、管理接口
+`PATCH /api/api-compat` 传 `{"continuationNudge": false}`、或环境变量
+`WB_CONTINUATION_NUDGE=0`。环境变量作为应急开关优先于磁盘配置。
 
 这是提示层约束，不是硬拦截：它降低模型提前收尾的概率，但不改变客户端「无工具调用
 即结束」的判定逻辑。真实客户端验证见 `test/live/codex-client-smoke.mjs` 与
@@ -233,17 +257,32 @@ codex 和 dsh 这类客户端把「这一轮没有发出工具调用」当作任
 | `>= 16384` | `max` |
 
 流式响应使用 `thinking` 内容块、`thinking_delta` 和 `signature_delta`；非流式响应
-在正文前返回 `{type:"thinking",thinking:string,signature:""}`。历史中的
-`thinking` / `redacted_thinking` 块不会回传给上游。上游没有可验证的 thinking
-签名，因此 `signature` 固定为空字符串。
+在正文前返回 `{type:"thinking",thinking:string,signature:""}`。上游没有可验证的
+thinking 签名，因此 `signature` 固定为空字符串；严格校验签名的客户端会退化成普通
+文本（pi-ai 的 `allowEmptySignature` 分支），而不是报错。
+
+**历史里的思考块不回传给上游**，这条是刻意的：
+
+- Anthropic：assistant 消息里的 `thinking` / `redacted_thinking` 块直接丢弃。
+- Responses：客户端回传的 `reasoning` item 丢弃；持久化记录里的 `reasoning.summary`
+  仍然保留（只更换 item id），但那条路径只服务 `GET /v1/responses/:id` 与回放，
+  不进入上游 messages。
+- 为什么不做「折叠成文本再发」：上游只有正文一个通道，把推理写进 assistant 正文等于
+  告诉模型「我上一轮说过这句话」，它会继承同样的格式并在正文里继续写推理 ——
+  曾因此把 `<prior_reasoning>` 标记泄漏成用户可见输出。丢推理的代价远小于泄漏。
+- `include: ["reasoning.encrypted_content"]` 与 `encrypted_content` **不支持**：上游
+  不产生该字段，桥接无法伪造，只能忽略。依赖加密思考回放的客户端会退化成普通文本。
 
 流式和非流式的 usage 都在 `output_tokens_details.reasoning_tokens` 中报告 reasoning
 token。上游可能在 `reasoning_tokens:0` 时仍通过 `reasoning_content` 返回有效的思考
 内容，判断是否思考时应同时检查这两个信号。
 
-`none` 是尽最大努力关闭，不保证所有上游模型都停止思考。禁用 thinking 时，
-bridge 不返回 reasoning 正文；若上游仍返回非空 `reasoning_content`，服务端会为该
-请求记录一条不含正文的 warning，并如实保留上游报告的 reasoning token。
+`none` 是尽最大努力关闭，不保证所有上游模型都停止思考。三条协议用同一套判定：
+**只有客户端显式要求关闭**（Anthropic `thinking.type:"disabled"`、Responses
+`reasoning.effort:"none"`、Chat `reasoning_effort:"none"`）时，bridge 才隐藏上游返回的
+reasoning 正文；若此时上游仍返回非空 `reasoning_content`，服务端为该请求记录一条不含
+正文的 warning，并如实保留上游报告的 reasoning token。**没写档位不等于要求关闭**——
+那种请求照常返回推理正文，否则会静默砍掉既有功能。
 
 `count_tokens` 是确定性本地估算，不是 Anthropic 官方 tokenizer。中英文混合和长上下文可能有明显误差，**不得用于精确计费或裁剪刚好达到上下文上限的请求**；实际请求仍应处理上游的 `context_length_exceeded`。
 
@@ -332,6 +371,8 @@ OpenAI 与 Anthropic 路由共用客户端 Key，也共用现有号池和扫码�
 - Chat `stream: true` 返回标准 SSE：文本立即转发，思考提示透传
   `reasoning_content`，最后只发送一个合法的 `finish_reason` 和 `[DONE]`。生产环境每
   15 秒发送一次 keepalive 空 `choices` chunk，不伪造完成或工具调用。
+- 思考提示来自上游 `reasoning_content`，同样会过 DSML 扫描器：写进思考通道的
+  `tool_calls` 会被剥离成真正的工具调用，`reasoning_content` 里不会留下原始标记。
 - `tools` 支持 OpenAI function 工具；`tool_choice` 支持 `auto` / `none` /
   `required` / 指定函数。历史 assistant `tool_calls` 与 `role:"tool"` 的
   `tool_call_id` 可续传。关闭 API 配置中的工具开关时返回
@@ -343,8 +384,14 @@ OpenAI 与 Anthropic 路由共用客户端 Key，也共用现有号池和扫码�
 - Chat 与 Responses 接受 URL 和 data URL 图片；`file_id` 明确返回
   `400 file_id_not_supported`，不读取或上传文件。
 - Responses 支持 `function`、`custom`、`namespace`、`local_shell`、`shell`、
-  `apply_patch` 工具声明；不支持的工具返回 `400 unsupported_tool_type`。Response
-  的 reasoning 事件来自上游文本，不代表新增了独立的私有推理通道。
+  `apply_patch` 工具声明；其余未识别的工具返回 `400 unsupported_tool_type`。响应式
+  客户端常驻声明的上游托管工具 `web_search*`、`web_fetch`、`computer_use*`、
+  `file_search`、`code_interpreter`、`image_generation`、`mcp`、`container` 不会转给
+  上游，也不报错：它们被静默剔除，指向它们的 `tool_choice` 降级为 `auto`。Codex 的
+  `web_search` 取值为 `live` / `cached`（默认就是 `live`）时会声明
+  `{type:"web_search"}`，dsh 的 `web_fetch` 同理；两者都走这条剔除路径，所以客户端
+  侧不必再关掉内置搜索。Response 的 reasoning 事件来自上游文本，不代表新增了
+  独立的私有推理通道。
 - 上游给出 `finish_reason` 前的无完成原因断流会失败关闭并返回
   `502` / Responses failed 事件，不把半截回答伪装成正常完成。Responses 的
   `length` 截断返回 `status:"incomplete"`：明确达到 `max_output_tokens` 时原因是
@@ -366,9 +413,15 @@ Chat Completions 的顶层 `reasoning_effort` 与 Responses 的
 - 单值 `reasoning.effort` 表示该模型唯一的非关闭档位；例如声明 `medium` 的模型
   会接收 `medium`，不会因为客户端要求 `high` 就改成 `high`。
 - 已知支持 reasoning 的模型在请求缺少档位时显式接收 `none`。
-- 模型目录明确声明无 reasoning，或缓存中没有该模型时，不向上游发送
-  `reasoning_effort`。
+- **只有**「目录明确知道该模型且明确说它没有可用档位」才不发送（`wb_reasoning.known`
+  为 `true` 且 `form: "none"`）。两种「目录给不出答案」都**透传客户端声明的档位**：
+  模型不在目录里（未预热、超时），以及上游只是没写 `reasoning` 字段
+  （`known: false`，真实目录 36 个模型里有 9 个，如 `default`、`glm-4.6`）。后者是
+  本次修复的重点：元数据缺失不等于不支持，实测上游对这些模型照样接受任意档位。
+- 客户端显式要求 `none` 时一律照发，不会因模型元数据被改写。
 - Responses 的 `reasoning.effort` 回显实际转发值；它可能与客户端请求值不同。
+- 401 换号重试后，三条协议都会按**新账号**的模型目录重新解析档位。历史上只有
+  Anthropic 这么做，另两条会带着旧目录的结论继续发请求。
 - 未知档位名返回 `400 invalid_reasoning_effort`。这是对 Chat 过去静默透传行为的
   有意变更。
 
@@ -386,6 +439,12 @@ Responses 的持久化和可靠性规则：
   可见片段写入 `node:sqlite` 数据库；最多 256 条、32 MiB、24 小时，内存热缓存最多
   64 条。`previous_response_id` 续接会按 `call_id` 配对工具历史，并支持内嵌 item 和
   output 早于 call 的稳定排序。
+- 每条记录的文本总量上限 256 KiB，按**条目保底**分配：每个文本槽（assistant 文本、
+  reasoning 摘要、`function_call.arguments`、`custom_tool_call.input`）先拿走
+  `min(自身字节, 4 KiB)`，剩余预算再按顺序分配。这样一段大 `apply_patch` 不会把后面的
+  assistant 消息清成空串。截断处写 `…[bridge-truncated: N bytes]`；
+  被截断的 `function_call.arguments` 会替换为合法 JSON
+  `{"_bridge_truncated":true,"bytes":N,"preview":"…"}`，避免回放拿到坏参数。
 - SQLite 事务写入预算 2 秒；数据库失败时才写独立 JSONL 死信，权限固定 `0600`，
   预写、`response_id` 幂等，进程启动只重试一次，成功保存后原子移除。普通 RST 或
   WS 断连在 SQLite 成功时不会虚报死信成功。
@@ -424,7 +483,7 @@ v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调
 | 情况 | 处理 |
 |:---|:---|
 | 未登录 / 登录失效 | 标记 `unauthorized`，立刻换下一个号；重新扫码后自动恢复 |
-| 429 / 额度不足 | 按失败模型指数退避冷却 1 → 2 → 4 … 分钟，上限 30 分钟；该模型暂不接活 |
+| 429 / 额度不足 | 上游给了恢复时刻（`Retry-After`、`retry-after-ms`、`x-ratelimit-reset`、报文里的「将在 … 重置」）就按时刻冷却；给不出来才指数退避 1 → 2 → 4 … 分钟、上限 30 分钟。冷却绑定到失败模型 |
 | 超时 / 调用方取消 | 不重试，原样返回 |
 | 其他错误 | 记一次失败，原样返回 |
 
@@ -434,6 +493,38 @@ v0.2 起，多个扫码账号不再只是「手动切换」，而是一个可调
 
 **换号有个前提**：任务还没产出任何内容。已经写了文件、或已经吐出半截答案的任务不会重跑——重复执行的副作用比失败更麻烦。
 
+**只有一个号时换号等于原地重试**，只会把限流放大一轮：这种情况直接把 429 和 `Retry-After`
+透给客户端，由调用方自己等，而不是替它反复撞墙。
+
+### 单账号并发怎么开
+
+一个账号能否同时承接多个请求，由该账号的 `maxConcurrency` 决定，默认 **1**（串行）。改它是运行时配置，
+不需要重启，也不需要发版：
+
+```bash
+wb pool concurrency alice 3                  # 单号放到 3 个槽位
+wb pool concurrency alice 1                  # 出问题立刻改回来
+curl -X PATCH localhost:7667/api/pool/alice -d '{"maxConcurrency":3}'   # 等价的管理接口
+```
+
+管理面板的账号卡片上也有「并发 N」按钮，1–10 之间可调（写入前会夹在这个区间里，手滑写 999 不会打穿号池）。
+
+档位建议：
+
+| 场景 | 建议 |
+|:---|:---|
+| 单人使用、偶尔并行 | 1（默认）就够 |
+| 2–3 个会话并行（编码代理多开） | **3** —— 实测安全区 |
+| 批量任务 / 多客户端 | 3–5，并盯住 429 次数 |
+| ≥8 | 不作为默认；短请求实测能过，长流式高并发没有验证 |
+
+真实约束是三条取小：`账号数 × 每号槽位`（软件闸门）、上游 token 速率（未知，需实测）、当日额度剩余
+（并发只缩短排队，不改变总配额，反而更早烧完）。并发上限提上去之前先看两个数——面板卡片的
+**峰值并发**与**今日 429 次数**；爆发 429 就把槽位改回 1，这是配置项，随时可退。
+
+`maxConcurrency=3` 时打 4 个并发，第 4 个会在选号阶段被拒（503 `POOL_EMPTY`，原因写明「并发已满」），
+前 3 个不受影响。
+
 ### 额度怎么算
 
 WorkBuddy 没有公开的额度查询接口，桥接只使用 CLI 或 API 实际返回的用量，所以这里刻意不编数字：
@@ -441,7 +532,18 @@ WorkBuddy 没有公开的额度查询接口，桥接只使用 CLI 或 API 实际
 - **已用**：真实数据。MCP 路径从 CLI `result.usage` 取 `input_tokens` / `output_tokens` / `cache_read_input_tokens`；API 路径从上游 `usage.prompt_tokens` / `completion_tokens` 记账。
   实测 CLI 0.2.x 的 `input_tokens` **已经包含**缓存读取部分，所以总输入就是 `input_tokens`，不再二次相加——之前多算一遍会让用量虚高近一倍
 - **剩余**：需要给账号设一个每日预算（`budgetTokens`）。设了才算得出剩余和百分比，并据此停派；不设就只显示用量，不做拦截
-- **缓存命中率** = `cache_read_input_tokens ÷ input_tokens`
+- **缓存命中率** = `cache_read_input_tokens ÷ input_tokens`（夹在 100% 以内：上游偶尔会报一个比
+  `input_tokens` 还大的 cached，那是原生 Anthropic 口径，不是我们算错了）
+- **三种速度口径互不替代**：
+
+  | 指标 | 分子 / 分母 | 回答什么 |
+  |:---|:---|:---|
+  | 首字延迟 `ttftMs` | 请求发出 → 首个可见增量（正文 / 推理 / 工具调用任一） | 首字多慢 |
+  | 解码速度 `decodeThroughput` | `decodeTokens ÷ decodeMs`（首增量 → 结束） | 模型本身多快，与 dsh 的 `decodeTokens/decodeMs` 同口径 |
+  | 端到端吞吐 `throughput` | `output_tokens ÷ 全时长`（含排队、首字节、慢客户端写） | 这个客户端有多快 |
+
+  面板 KPI 显示的是**解码速度**；首字延迟与端到端吞吐作为副行。只有后两者都观测不到时对应字段为
+  `null`（而不是 0），避免把「没有样本」画成「速度是 0」
 - **费用**：优先用 CLI 返回的 `total_cost_usd`；没有就按 `WB_PRICE_IN` / `WB_PRICE_OUT` 估算；两者都没配时显示未上报计价，不猜
 
 明细保留：小时桶 16 天、天桶 400 天、最近请求 160 条。够画一整年热力图，又不会让 `pool.json` 无限膨胀。
@@ -467,7 +569,7 @@ wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
 
 | 区块 | 内容 |
 |:---|:---|
-| KPI | Token 消耗（输入 / 输出 / 缓存读写拆分）、请求数、生成速度、缓存命中率、API 等价费用、成功率环 |
+| KPI | Token 消耗（输入 / 输出 / 缓存读写拆分）、请求数、解码速度（副行给首字与端到端）、缓存命中率、API 等价费用、成功率环 |
 | 时序图 | Token / 请求数 / 吞吐量三视图，柱状叠折线，悬停看逐点明细；按区间自动切小时或按天聚合 |
 | 最近请求 | 实时活动流：时间、模型、账号、token、耗时，失败的标红 |
 | 工作回潮 | GitHub 风格年度热力图，按 token 量分五档；右侧是活跃天数、总请求、总 token、峰值日 |
@@ -503,9 +605,34 @@ wb pool weight alice 3         # 权重调到 3
 wb pool disable alice          # 停用
 wb pool reset alice            # 清冷却与失败计数
 wb pool test alice             # 发一条最小请求验证
+wb pool concurrency alice 3    # 单号并发槽位（1-10，超出会被夹住）
 ```
 
 > 并发计数是进程内运行态，重启后自动归零。同一个 bridge 进程内的 MCP 任务和 API 流会共同遵守账号的 `maxConcurrency`；如果分别启动多个 stdio MCP 进程或多个 HTTP 服务，各进程会独立计数，需要全局并发限制时应统一连接同一个 HTTP 服务。
+
+### 号池落盘：为什么不是每个请求写一次
+
+`pool.json` 接近 100 KB，其中约六成是面板的时序数据（`series.events` 160 条 + 小时 / 天桶）。
+过去 `beginTask` 和 `endTask` 各做一次 `loadPool()` + `savePool()`，等于**每个请求两次全量解析 + 两次全量
+重写**；12 并发时每波就是 24 次、约 2.3 MB 的同步 I/O。现在分两层：
+
+| 写入类型 | 触发点 | 策略 |
+|:---|:---|:---|
+| 配置 / 结构 | `updateAccount`、`setStrategy`、加删账号、`syncPool` 对齐 | 同步立刻落盘 |
+| 冷却 / 未登录 | 429、额度不足、`AUTH_REQUIRED`、重置冷却 | 同步落盘（丢了会立刻再撞一次限流） |
+| 统计 | `beginTask` 的 `lastUsedAt`、`endTask` 的 req/token/ms/事件样本、`rrCursor` | 合并写：空闲 500 ms 后写，持续有流量时最多 2 秒一次 |
+
+读取侧同样有缓存：只有磁盘签名（ino + mtime + size）变了才重新解析，所以「每个请求两次 100 KB 解析」
+降到每秒一次 `statSync`。退出时会把合并窗口里的统计补完（`exit` + `SIGINT`/`SIGTERM`/`SIGHUP`，
+没有别的信号处理者时才由这里 `exit(0)`，Ctrl+C 仍然可用）。
+
+别的进程（`wb pool concurrency`、另一个 bridge）改了文件时按「**配置以磁盘为准、统计以内存为准**」合并：
+用户刚改的槽位立刻生效，本进程还没落盘的计数也不会被一份更旧的快照覆盖。已知代价：对方写入时若把
+尚未落盘的冷却带走了，那个号会再撞一次 429 才重新进冷却——所以冷却写是同步的。
+
+实测（`node .wbperf/bench-pool-writes.mjs`，100 KB 的池）：一波 12 并发的 24 次 begin/end 从
+**24 次 / 2.34 MB** 降到 **1 次 / 96 KB**；`beginTask` 从 1.04 ms 降到 0.01 ms，`endTask` 从
+1.11 ms 降到 0.02 ms。
 
 ## 扫码登录怎么工作的
 
@@ -620,6 +747,35 @@ models:
 `input` 与 `wb_reasoning`，但当前 dsh 网络发现只采纳 id、名称和容量，因此手写条目
 仍需把能力字段写在 `cordis.patch.yml` 中。
 
+**4. dsh 的 tok/s 本身是虚高的，桥接改不了。**
+
+dsh 的 `sessionStats` 折叠把速度算成 `ΣoutputTokens / Σ(t_message − t_firstToken)`。
+纯工具调用步的可见内容（参数 JSON）在上游是一帧下发的，那个窗口塌成 0–3ms，
+于是分子照算、分母近零 —— 两个真实会话里分别有 63.4% 与 44.5% 的输出 token 落在这种步上，
+读数就成了 527 / 252 tok/s。
+
+这不是桥接能修的（它在 dsh 包里），所以仓库里带了一份最小改动的 fork：
+`vendor/dsh-session-stats-0.2.1-rc.5/`。它把零窗口步剔出 decode 统计，并按通道把
+provider 报的总数拆成 `decodeFrameTokens` / `decodeTextTokens` / `decodeReasoningTokens`；
+既有字段名与语义一个没改，`stateVersion` 从 1 提到 2 让旧缓存行整批重算。
+同一批会话复算后为 193.5 / 141.3 tok/s。
+
+部署方式、为什么门槛取 5ms、以及「拆分是比例归因而非精确计数」这一条限制，都在
+`vendor/dsh-session-stats-0.2.1-rc.5/README.md` 里。要点：**loader 不允许只按 `id` 改插件名**
+（会报 `patch: name mismatch for "session-stats" ... skipping`），必须禁用原行再 insert 新行：
+
+```yaml
+- id: session-stats
+  disabled: true
+- insert:
+    - id: session-stats-patched
+      name: 'dsh-session-stats-patched'
+```
+
+插件名由 profile 目录的 `node_modules` 解析，所以要把 fork 软链进去（与 `dsh-computer-use-linux`
+同一套做法）。改完 `dsh --profile <p> --dump-config` 应看到 `disabled: true` 与新行、且无 mismatch 警告，
+然后**重启 dsh** —— 插件树是启动时快照的，不重启不生效。
+
 ## 工具一览
 
 | 工具 | 作用 |
@@ -726,7 +882,7 @@ wb login --site ioa         # 腾讯内网
     "alice": {
       "enabled": true,
       "weight": 2,
-      "maxConcurrency": 1,
+      "maxConcurrency": 1,          // 单号并发槽位，1–10；默认 1，建议 ≤3
       "budgetTokens": 120000,    // 0 = 不限额
       "today": { "req": 34, "ok": 34, "tokensIn": 50184, "tokensOut": 11016, "ms": 727600 }
     }
@@ -744,7 +900,16 @@ wb login --site ioa         # 腾讯内网
 - **DSML 失败关闭**：识别到 DSML envelope 后，畸形、截断或超过 2 MiB 会终止响应，不回退为工具调用，也不把原始标记混入正文。
 - **stdio 不污染**：MCP 的 stdout 是协议通道，桥接所有日志走 stderr 和 `~/.workbuddy-bridge/logs/`。
 - **导出包敏感**：`wb export` 的 tgz 等同账号权限，自行保管。
-- **管理界面默认只监听 127.0.0.1**：`wb http --host 0.0.0.0` 会把账号、Key 和 API 管理能力暴露到网络；务必同时设置 `WB_ADMIN_TOKEN`，并给远程 API 客户端配置独立 Key。
+- **管理接口门禁由监听地址决定**：回环监听时本机免令牌；**非回环监听且未设 `WB_ADMIN_TOKEN` 时
+  `wb http` / `wb admin` 直接拒绝启动**（以前只打一行黄字建议）。设了令牌后，`/api/api-compat`、
+  `/api/pool`、`/api/stats` 只接受 `x-wb-token` 请求头；URL 里的 `?token=` 仅用于首次打开管理页，
+  页面会立刻用 `history.replaceState` 把它从地址栏抹掉（避免进浏览器历史与反代日志）。
+  手机扫码场景建议用 SSH 端口转发，而不是 `--host 0.0.0.0`。
+- **上游地址白名单**：`upstreamBaseUrl` 直接决定 accessToken 发往哪里，因此禁止指向本机/内网/
+  链路本地地址（含 169.254.169.254 元数据）。自建网关需要内网时设 `WB_ALLOW_PRIVATE_UPSTREAM=1`；
+  要限制到固定域名就设 `WB_UPSTREAM_ALLOW_HOSTS=gw.example.com,*.corp.example`。
+- **上游地址与超时是热更新**：编辑后保存即生效，不需要重启。（旧版本在启动时把它们固化进闭包，
+  PATCH 返回 200、页面显示已保存，但实际仍走老地址。）
 
 ## 常见问题
 
@@ -930,7 +1095,8 @@ src/
   login.js      扫码登录状态机
   ansi.js       TUI 输出解析 / URL 提取
   runner.js     codebuddy 进程封装 + stream-json 解析
-  pool.js       号池状态：选号、记账、冷却、额度
+  pool.js       号池状态：选号、记账、冷却、额度、落盘节流与内存缓存
+  rate-limit.js 429 恢复时刻解析（Retry-After / x-ratelimit-reset / 报文日期）
   stats.js      用量时序：小时/天桶、区间聚合、热力图
   dispatch.js   选号 → 执行 → 失败换号
   accounts.js   多账号

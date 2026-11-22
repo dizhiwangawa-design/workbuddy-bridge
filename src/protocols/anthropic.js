@@ -102,6 +102,9 @@ function normalizeMessages(messages, warnings) {
       const toolIds = new Set();
       for (const block of message.content) {
         if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
+          // 历史思考块不进上游正文：折成可见文本会让模型把「自己的思考」当成
+          // 「上一轮说过的话」，进而在正文里沿用这个格式（<prior_reasoning> 泄漏）。
+          // 丢弃是安全默认。
           continue;
         }
         if (block?.cache_control !== undefined) {
@@ -262,6 +265,7 @@ export function normalizeAnthropicRequest(body, {
     messages: withContinuationNudge(messages, {
       tools: tools.length,
       enabled: continuationNudge,
+      toolChoice,
     }),
     tools,
     toolChoice,
@@ -355,12 +359,32 @@ export function createAnthropicEncoder({
     ];
   }
 
-  function usage(outputTokens, reasoningTokens) {
+  // Anthropic 的 prompt 缓存是原生字段；上游没报（或为 0）时不输出，
+  // 保持既有响应形状，避免严格 schema 的客户端因多出字段报错。
+  function usage(
+    outputTokens,
+    reasoningTokens,
+    cacheReadTokens = 0,
+    cacheWriteTokens = 0,
+    inputTokens = null,
+  ) {
     return {
+      // message_start 只能给估算值（上游还没上报）。message_delta 是最后一次机会，
+      // 客户端（Anthropic SDK / pi-ai）会用这里的 input_tokens 覆盖初值，
+      // 因此有真实值时必须带上，否则上下文占用会一直停在 bytes/3 的估算上。
+      ...(Number.isFinite(inputTokens) && inputTokens > 0
+        ? { input_tokens: Math.max(0, inputTokens) }
+        : {}),
       output_tokens: Math.max(0, Number(outputTokens) || 0),
       output_tokens_details: {
         reasoning_tokens: Math.max(0, Number(reasoningTokens) || 0),
       },
+      ...(Number(cacheReadTokens) > 0
+        ? { cache_read_input_tokens: Math.max(0, Number(cacheReadTokens)) }
+        : {}),
+      ...(Number(cacheWriteTokens) > 0
+        ? { cache_creation_input_tokens: Math.max(0, Number(cacheWriteTokens)) }
+        : {}),
     };
   }
 
@@ -435,6 +459,9 @@ export function createAnthropicEncoder({
       finishReason,
       outputTokens = 0,
       reasoningTokens = 0,
+      cacheReadTokens = 0,
+      cacheWriteTokens = 0,
+      inputTokens = null,
     } = {}) {
       if (finished) return [];
       finished = true;
@@ -473,7 +500,13 @@ export function createAnthropicEncoder({
           stop_reason: stopReason(finishReason, calls.length > 0),
           stop_sequence: null,
         },
-        usage: usage(outputTokens, reasoningTokens),
+        usage: usage(
+          outputTokens,
+          reasoningTokens,
+          cacheReadTokens,
+          cacheWriteTokens,
+          inputTokens,
+        ),
       }));
       events.push(event('message_stop', {
         type: 'message_stop',
@@ -486,14 +519,19 @@ export function createAnthropicEncoder({
       return [event('ping', { type: 'ping' })];
     },
 
-    cancel({ outputTokens = 0, reasoningTokens = 0 } = {}) {
+    cancel({
+      outputTokens = 0,
+      reasoningTokens = 0,
+      cacheReadTokens = 0,
+      cacheWriteTokens = 0,
+    } = {}) {
       if (finished) return [];
       finished = true;
       const events = started ? [...closeThinking(), ...closeText()] : this.start();
       events.push(event('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: 'canceled', stop_sequence: null },
-        usage: usage(outputTokens, reasoningTokens),
+        usage: usage(outputTokens, reasoningTokens, cacheReadTokens, cacheWriteTokens),
       }));
       events.push(event('message_stop', { type: 'message_stop' }));
       return events;

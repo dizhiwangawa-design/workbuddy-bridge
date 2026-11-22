@@ -1,0 +1,18 @@
+{
+  "name": "dsh-session-stats-patched",
+  "description": "Patched fork of @deepseek-ai/dsh-session-stats 0.2.1-rc.5: decode speed excludes instant bursts and publishes a per-channel token split",
+  "version": "0.2.1-rc.5-wb.1",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.5",
+    "@deepseek-ai/cordis": "~4.0.5"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
+}

@@ -501,11 +501,11 @@ export function adminPage({ home = '', token = '' } = {}) {
           <label><input type="checkbox" data-api-config="trustProxy"> 信任反向代理</label>
         </div>
         <div class="api-fields">
-          <label class="api-field wide"><span>上游地址</span><input data-api-field="upstreamBaseUrl" placeholder="https://copilot.tencent.com"/></label>
+          <label class="api-field wide"><span>上游地址</span><input data-api-field="upstreamBaseUrl" placeholder="https://copilot.tencent.com"/>（保存即生效）</label>
           <label class="api-field"><span>默认模型</span><input data-api-field="defaultModel" placeholder="deepseek-v4.1-flash"/></label>
           <label class="api-field"><span>首字节超时 (ms)</span><input data-api-field="firstByteTimeoutMs" inputmode="numeric"/></label>
           <label class="api-field"><span>空闲超时 (ms)</span><input data-api-field="idleTimeoutMs" inputmode="numeric"/></label>
-          <label class="api-field"><span>总超时 (ms)</span><input data-api-field="totalTimeoutMs" inputmode="numeric"/></label>
+          <label class="api-field"><span>总超时 (ms)</span><input data-api-field="totalTimeoutMs" inputmode="numeric"/></label></div><div class="api-fields"><label class="api-field"><span>单次上游超时 (ms，保存即生效)</span><input data-api-field="timeoutMs" inputmode="numeric"/></label>
         </div>
         <div class="api-actions test">
           <button class="ghost" data-act="api-test-openai">测试 OpenAI 文本</button>
@@ -557,6 +557,10 @@ export function adminPage({ home = '', token = '' } = {}) {
           <div><b>续跑提示</b><small>在 Responses 请求中提示模型可续接取消片段</small></div>
           <button class="switch" id="api-responses-nudge-switch" role="switch" aria-checked="false" data-act="api-responses-nudge-toggle" title="启用/停用 Responses 续跑提示"></button>
         </div>
+        <div class="api-option">
+          <div><b>回合续跑约束</b><small>对编码 Agent（codex / dsh）在消息末尾追加「未完成必须继续调用工具」的 system 约束</small></div>
+          <button class="switch" id="api-continuation-nudge-switch" role="switch" aria-checked="false" data-act="api-continuation-nudge-toggle" title="启用/停用回合续跑约束"></button>
+        </div>
       </div>
     </div>
   </section>
@@ -605,6 +609,17 @@ export function adminPage({ home = '', token = '' } = {}) {
 
 <script>
 var TOKEN=${JSON.stringify(token || '')};
+/* 首次引导可以带 ?token=，但它不该留在地址栏（浏览器历史、截图、反代日志都会记下来）。
+   读进内存后立刻用 replaceState 抹掉；之后的请求一律走 x-wb-token 请求头。 */
+(function(){
+  try{
+    var u=new URL(location.href);
+    if(u.searchParams.has('token')){
+      u.searchParams.delete('token');
+      history.replaceState(null,'',u.pathname+(u.searchParams.toString()?'?'+u.searchParams:'')+u.hash);
+    }
+  }catch(e){}
+})();
 var $=function(id){return document.getElementById(id)};
 var state={pool:null,stats:null,api:null,range:'today',metric:'tokens',hover:false};
 var timer=null,loginPoll=null,lastEventSeq=0,firstPaint=true;
@@ -754,10 +769,13 @@ function renderKpis(){
       spark:sparkline(pts,'req','var(--brand)')
     })+
     kpiCard({
-      icon:'⚡', label:'生成速度', value:(t.throughput||0).toFixed(1), unit:'tok/s',
+      icon:'⚡', label:'解码速度', value:(t.decodeThroughput||0).toFixed(1), unit:'tok/s',
       delta:undefined,
-      lines:['平均耗时 '+dur(t.avgMs)+' · 单次 '+num(t.avgTokens)+' tok','峰值 '+Math.round(t.peakThroughput)+' tok/s · 按任务时长'],
-      spark:sparkline(pts,'throughput','var(--brand)')
+      lines:[
+        '首字 '+(t.ttftMs===null?'—':dur(t.ttftMs))+' · 端到端 '+(t.throughput||0).toFixed(1)+' tok/s',
+        '按首增量→结束计算 · 样本 '+int(t.ttftReq||0)+' 次',
+      ],
+      spark:sparkline(pts,'decodeThroughput','var(--brand)')
     })+
     kpiCard({
       icon:'❄', label:'缓存命中率', value:pct(t.cacheHitRate,1),
@@ -951,10 +969,15 @@ function card(a){
       '<div class="kpi2"><b>'+num(a.today.tokens)+'</b><span>今日 token</span></div>'+
       '<div class="kpi2"><b>'+a.inflight+'/'+a.maxConcurrency+'</b><span>并发</span></div>'+
     '</div>'+
+    ((a.today.peakInflight||a.today.rateLimited)
+      ? '<div class="qline sub2"><span>峰值并发 '+(a.today.peakInflight||0)+'/'+a.maxConcurrency+
+        '</span><span>今日 429 '+(a.today.rateLimited||0)+' 次</span></div>'
+      : '')+
     '<div class="foot">'+
       '<button class="mini" data-act="login" data-name="'+a.name+'">扫码登录</button>'+
       '<button class="mini" data-act="test" data-name="'+a.name+'">测试</button>'+
       '<button class="mini" data-act="budget" data-name="'+a.name+'">预算</button>'+
+      '<button class="mini" data-act="concurrency" data-name="'+a.name+'" title="单号并发槽位：默认 1，建议不超过 3">并发 '+a.maxConcurrency+'</button>'+
       (a.cooldownLeftMs>0?'<button class="mini" data-act="reset" data-name="'+a.name+'">重置冷却</button>':'')+
       '<span class="grow"></span>'+
       '<span class="stepper" title="权重：越高分到的任务越多">'+
@@ -1065,6 +1088,11 @@ function renderApi(){
   var nudgeEnabled=!!(persistenceEnabled&&s.responsesNudge);
   $('api-responses-nudge-switch').setAttribute('aria-checked',nudgeEnabled?'true':'false');
   $('api-responses-nudge-switch').disabled=!persistenceEnabled;
+  // 回合续跑约束与协议无关（三条协议都会注入），只受总开关约束。
+  // 注意不能读下面的 masterEnabled —— var 会提升但此刻还是 undefined。
+  var continuationNudgeOn=!!(s.enabled&&s.continuationNudge);
+  $('api-continuation-nudge-switch').setAttribute('aria-checked',continuationNudgeOn?'true':'false');
+  $('api-continuation-nudge-switch').disabled=!s.enabled;
   var authMode=s.requireApiKey?'所有连接强制 Key':
     !s.remoteRequireKey?'不强制 Key':
     s.trustProxy?'可信代理强制 Key':'回环免 Key · 远程强制 Key';
@@ -1260,6 +1288,13 @@ document.addEventListener('click',function(ev){
         .then(function(){toast(!nudgeOn?'Responses 续跑提示已启用':'Responses 续跑提示已关闭')});
     });
   }
+  if(a==='api-continuation-nudge-toggle'){
+    var continuationOn=el.getAttribute('aria-checked')==='true';
+    return act(function(){
+      return api('/api/api-compat',{method:'PATCH',body:JSON.stringify({continuationNudge:!continuationOn})})
+        .then(function(){toast(!continuationOn?'回合续跑约束已启用':'回合续跑约束已关闭')});
+    });
+  }
   if(a==='api-key-create'){
     return openCreateApiKey();
   }
@@ -1309,6 +1344,7 @@ document.addEventListener('click',function(ev){
   }
   if(a==='login') return openLogin(name);
   if(a==='budget') return openBudget(name);
+  if(a==='concurrency') return openConcurrency(name);
   if(a==='remove'){
     if(!confirm('删除账号「'+name+'」？其本地凭证目录也会一并删除，需要重新扫码。')) return;
     return act(function(){return api('/api/pool/'+encodeURIComponent(name),{method:'DELETE'}).then(function(){toast('已删除 '+name)})});
@@ -1443,6 +1479,28 @@ function openBudget(name){
     act(function(){
       return api('/api/pool/'+encodeURIComponent(name),{method:'PATCH',body:JSON.stringify({budgetTokens:v})})
         .then(function(){ closeModal(); toast(v?('预算已设为 '+num(v)+' tokens'):'已取消预算限制') });
+    });
+  };
+}
+
+function openConcurrency(name){
+  var acc=state.pool.accounts.filter(function(x){return x.name===name})[0]||{};
+  var cur=acc.maxConcurrency||1;
+  var cap=state.pool.maxConcurrencyMax||10;
+  $('mask').className='mask on';
+  $('modal').innerHTML='<h2>单号并发 · '+name+'</h2>'+
+    '<p>同一个账号同时在跑的请求上限，'+1+'–'+cap+'。默认 1（串行）；实测安全区是 3，'+
+    '再高吞吐不会变多，只会更早撞限流——撞一次可能要等几小时。</p>'+
+    '<input id="conc" type="number" min="1" max="'+cap+'" step="1" value="'+cur+'"/>'+
+    '<div class="row"><button data-x="close">取消</button><button class="primary" id="do-conc">保存</button></div>';
+  var input=$('conc');
+  input.focus(); input.select();
+  $('modal').querySelector('[data-x=close]').onclick=closeModal;
+  $('do-conc').onclick=function(){
+    var v=Math.max(1,Math.min(cap,Math.round(Number(input.value||1))));
+    act(function(){
+      return api('/api/pool/'+encodeURIComponent(name),{method:'PATCH',body:JSON.stringify({maxConcurrency:v})})
+        .then(function(){ closeModal(); toast('并发槽位已设为 '+v+(v>3?'（高于推荐值 3）':'')) });
     });
   };
 }

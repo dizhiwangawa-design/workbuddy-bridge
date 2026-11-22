@@ -15,6 +15,9 @@ const timeoutMs = Math.max(
 );
 const expectFiles = /^(1|true|yes)$/i.test(process.env.WB_CODEX_EXPECT_FILES || '')
   || !process.env.WB_CODEX_PROMPT;
+// live / cached 都会让 codex 声明 `{type:"web_search"}`；除非显式指定，用例就用
+// 默认的 live，确保托管工具剔除这条路径一直被覆盖。
+const webSearchMode = process.env.WB_CODEX_WEB_SEARCH?.trim() || 'live';
 const prompt = process.env.WB_CODEX_PROMPT?.trim() || [
   'You are in an isolated temporary coding workspace.',
   'Complete this multi-step coding task without asking questions:',
@@ -136,7 +139,10 @@ function codexConfig(baseUrl) {
     'model_reasoning_effort = "none"',
     'approval_policy = "never"',
     'sandbox_mode = "danger-full-access"',
-    'web_search = "disabled"',
+    // 默认值 live 会让 codex 声明 {type:"web_search"}。桥接必须把它剔除而不是
+    // 400 tools[N] type web_search is not supported —— 这条就是当初踩到的坑，
+    // 所以这里保持默认值，让用例真的覆盖它。
+    `web_search = ${JSON.stringify(webSearchMode)}`,
     '',
     '[model_providers.workbuddy]',
     'name = "WorkBuddy"',
@@ -179,6 +185,18 @@ function codexArgs(lastMessage) {
 function eventCount(output) {
   return output.split('\n').filter((line) => line.trim().startsWith('{')).length;
 }
+
+// codex 声明、但上游 codebuddy 没有执行器的托管工具。桥接必须剔除它们，
+// 而不是回 400 unsupported_tool_type —— 那会让整轮对话直接失败。
+const HOSTED_TOOL_NAMES = new Set([
+  'web_search',
+  'web_search_preview',
+  'web_fetch',
+  'file_search',
+  'code_interpreter',
+  'image_generation',
+]);
+const hostedExpected = webSearchMode !== 'disabled';
 
 function summarizeResponseEvents() {
   const raw = Buffer.concat(responseChunks).toString('utf8');
@@ -260,6 +278,9 @@ function createObservedUpstreamClient() {
               description_length: String(tool?.function?.description || tool?.description || '').length,
               parameter_keys: Object.keys(tool?.function?.parameters?.properties || {}),
             }))
+          : [],
+        tool_names: Array.isArray(body.tools)
+          ? body.tools.map((tool) => tool?.function?.name || tool?.name || null)
           : [],
         tool_choice: body.tool_choice || null,
         parallel_tool_calls: body.parallel_tool_calls ?? null,
@@ -381,10 +402,24 @@ try {
   const nudgeDelivered = upstreamAttempts.some(
     (attempt) => attempt.continuation_nudge && attempt.tools?.length,
   );
+  // 结构性断言：codex 声明了托管工具时，上游不得收到它（桥接应静默剔除），
+  // 请求也不能因为 unsupported_tool_type 失败。不依赖模型随机性。
+  const hostedSkipped = !hostedExpected || upstreamAttempts.some((attempt) => (
+    attempt.tool_names?.length
+    && attempt.tool_names.every((name) => !HOSTED_TOOL_NAMES.has(String(name || '')))
+  ));
+  const statuses = upstreamAttempts.map((attempt) => attempt.status ?? null);
+  const statusOk = statuses.length > 0 && statuses.every((status) => status === null || status === 200);
+  // 只匹配桥接自己的 400 形状，避免模型正文里恰好写到这些词造成误判。
+  const unsupportedError = /"code":"unsupported_tool_type"|tools\[\d+\] type .+ is not supported/
+    .test(`${result.stdout}\n${result.stderr}`);
   const passed = result.code === 0
     && leaseReleased
     && summarizeResponseEvents().tool_identity_ok
     && (!nudgeExpected || nudgeDelivered)
+    && hostedSkipped
+    && statusOk
+    && !unsupportedError
     && (!expectFiles
       ? fs.existsSync(lastMessage)
       : files.length === 3 && testResult?.code === 0);
@@ -397,6 +432,8 @@ try {
       test_exit_code: testResult?.code ?? null,
       lease_released: leaseReleased,
       continuation_nudge_delivered: nudgeDelivered,
+      hosted_tool_skipped: hostedSkipped,
+      unsupported_error: unsupportedError,
       upstream_attempts: upstreamAttempts,
       response_events: summarizeResponseEvents(),
       output_tail: safeOutput,
@@ -416,6 +453,10 @@ try {
     transport: {
       websocket_upgrades: wsUpgrades,
       http_response_requests: httpResponses,
+    },
+    hosted_tools: {
+      declared_by_codex: hostedExpected,
+      skipped_before_upstream: hostedSkipped,
     },
     continuation_nudge: {
       expected: nudgeExpected,

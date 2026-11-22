@@ -30,6 +30,62 @@ const POSITIVE_INTEGER_FIELDS = {
   totalTimeoutMs: 24 * 60 * 60 * 1000,
 };
 
+/** 本机/内网地址判断：上游地址指向这些就等于把 accessToken 交给本地进程或同网段。 */
+function isPrivateHostname(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === '::1' || host === '::' || host === '0.0.0.0') return true;
+  // IPv6 唯一本地地址 (fc00::/7) 与链路本地 (fe80::/10)
+  if (/^f[cd][0-9a-f]{2}:/.test(host) || /^fe[89ab][0-9a-f]:/.test(host)) return true;
+  const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!v4) return false;
+  const a = Number(v4[1]);
+  const b = Number(v4[2]);
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true; // 链路本地，含云厂商元数据地址
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  return false;
+}
+
+/**
+ * 上游地址白名单。
+ *
+ * 这个值直接决定 accessToken 发往哪里（upstream-client 会带 authorization: Bearer），
+ * 所以只校验「是不是 http(s)」远远不够：把它改成 attacker.example 就等于把账号
+ * token 送出去。这里禁止私有网段与链路本地地址；确实需要连自建网关的部署，
+ * 用 WB_ALLOW_PRIVATE_UPSTREAM=1 显式放行。
+ */
+function assertUpstreamHost(url) {
+  const allowPrivate = /^(1|true|yes)$/i.test(String(process.env.WB_ALLOW_PRIVATE_UPSTREAM || ''));
+  // 可选的域名白名单：设了就只认列出的主机（逗号分隔，支持 *.example.com）。
+  // 不设时保持「任意公网 https 主机」，避免把自建网关的用户挡在门外。
+  const allowList = String(process.env.WB_UPSTREAM_ALLOW_HOSTS || '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  if (allowList.length) {
+    const host = String(url.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+    const ok = allowList.some((pattern) => (pattern.startsWith('*.') 
+      ? host.endsWith(pattern.slice(1))
+      : host === pattern));
+    if (!ok) {
+      throw new Error(
+        'upstreamBaseUrl 的主机不在 WB_UPSTREAM_ALLOW_HOSTS 白名单里（' + host + '）。',
+      );
+    }
+  }
+  if (allowPrivate) return;
+  if (isPrivateHostname(url.hostname)) {
+    throw new Error(
+      'upstreamBaseUrl 不能指向本机或内网地址（' + url.hostname + '）：'
+      + '上游请求会携带账号 accessToken。确需自建网关时设 WB_ALLOW_PRIVATE_UPSTREAM=1。',
+    );
+  }
+}
+
 function publicKey(record) {
   return {
     id: record.id,
@@ -95,6 +151,7 @@ export function updateApiSettings(patch = {}) {
     if (!['http:', 'https:'].includes(url.protocol)) {
       throw new Error('upstreamBaseUrl must use http or https');
     }
+    assertUpstreamHost(url);
     next.upstreamBaseUrl = value.replace(/\/+$/, '');
   }
 

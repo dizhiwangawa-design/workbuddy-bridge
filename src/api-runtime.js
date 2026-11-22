@@ -18,10 +18,16 @@ import {
   createDsmlScanner,
   structuredToolArgumentLimit,
 } from './tool-calls.js';
-import { continuationNudgeEnabled } from './continuation-nudge.js';
+import {
+  anthropicHasToolLoop,
+  chatHasToolLoop,
+  continuationNudgeApplies,
+  continuationNudgeMode,
+} from './continuation-nudge.js';
 import { createSseParser, encodeSseEvent } from './sse.js';
 import { ApiError, sendApiError } from './api-errors.js';
 import { withClientKeyAttribution } from './api-attribution.js';
+import { resetAtFromResponse } from './rate-limit.js';
 import {
   readAccountCredentials,
   refreshAccountCredentials,
@@ -46,7 +52,7 @@ import {
 } from './stream-control.js';
 import { createDeadLetter, createResponsesStore } from './responses-store.js';
 import { createChatEncoder } from './protocols/openai.js';
-import { resolveReasoningEffort } from './reasoning-effort.js';
+import { applyEffortToBody } from './reasoning-effort.js';
 
 const ANTHROPIC_ESTIMATOR = 'wb-conservative-v1';
 const PING_INTERVAL_MS = PRODUCTION_KEEPALIVE_MS;
@@ -170,10 +176,22 @@ function usageFromChunk(chunk, usage) {
     ?? source.reasoning_tokens
     ?? usage.reasoningTokens
     ?? 0;
+  // 上游把 prompt 缓存命中放在两个位置之一；缓存读与写入是 Anthropic 的原生字段。
+  const cacheRead = source.prompt_cache_hit_tokens
+    ?? source.prompt_tokens_details?.cached_tokens
+    ?? source.cache_read_input_tokens
+    ?? usage.cacheReadTokens
+    ?? 0;
+  const cacheWrite = source.prompt_cache_write_tokens
+    ?? source.cache_creation_input_tokens
+    ?? usage.cacheWriteTokens
+    ?? 0;
   return {
     inputTokens: Number(source.prompt_tokens ?? source.input_tokens ?? usage.inputTokens ?? 0),
     outputTokens: Number(source.completion_tokens ?? source.output_tokens ?? usage.outputTokens ?? 0),
     reasoningTokens: Math.max(0, Number(reasoning) || 0),
+    cacheReadTokens: Math.max(0, Number(cacheRead) || 0),
+    cacheWriteTokens: Math.max(0, Number(cacheWrite) || 0),
   };
 }
 
@@ -221,6 +239,26 @@ function upstreamError(status, detail = '') {
   });
 }
 
+/**
+ * 还有没有别的号能接这个模型。
+ *
+ * 单号部署下 429 换号就是原地重试：同一个号刚被打上冷却，pick 只会返回空，
+ * 循环白跑一轮再把同样的错误抛出去。这里提前判定，省掉那次无用重试。
+ */
+function hasAnotherAccount(tried, model) {
+  return Boolean(pickAccount({ exclude: tried, model })?.name);
+}
+
+/**
+ * 429 会带「什么时候能再来」。把这句解析成 resetAt 挂在失败对象上，
+ * endTask 会用它打冷却：按上游给的时刻等，而不是拿指数退避去猜。
+ */
+function withResetHint(failure, headers, detail = '') {
+  const resetAt = resetAtFromResponse(headers, detail);
+  if (resetAt) failure.resetAt = resetAt;
+  return failure;
+}
+
 async function upstreamErrorDetail(response) {
   try {
     const raw = await response.text();
@@ -261,7 +299,7 @@ function streamHeaders() {
   };
 }
 
-function normalizeBody(body, config) {
+function normalizeBody(body, config, headers = null) {
   if (body?.stream === true && config.streaming === false) {
     throw new ApiError(400, 'streaming is disabled', { code: 'streaming_disabled' });
   }
@@ -270,7 +308,12 @@ function normalizeBody(body, config) {
     model: body?.model || config.defaultModel,
   };
   const converted = anthropicToOpenAI(candidate, {
-    continuationNudge: continuationNudgeEnabled(config),
+    continuationNudge: continuationNudgeApplies({
+      mode: continuationNudgeMode(config),
+      headers,
+      body,
+      hasToolLoop: anthropicHasToolLoop(body),
+    }),
   });
   for (const warning of converted.warnings) {
     warn(
@@ -349,6 +392,13 @@ export function createAnthropicRuntime({
     let encoder;
     let usage = { inputTokens: inputEstimate, outputTokens: 0 };
     let warnedThinkingWhileDisabled = false;
+    // 首个「可见」增量的时刻（正文或推理，非空）。decode 窗口从这里算起，
+    // 与 dsh 的 t_firstToken 同口径；工具调用本身也算可见内容。
+    let firstVisibleAt = 0;
+    const markVisible = () => { if (!firstVisibleAt) firstVisibleAt = now(); };
+    // 推理通道单独一把扫描器：模型常把工具调用写进思考里，那条通道以前不过扫描器，
+    // 于是原始标记既泄漏给客户端，又少执行一次本该发生的调用。
+    const reasoningScanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
     let finishReason = null;
     let sawDone = false;
     let leaseResult = {
@@ -549,11 +599,16 @@ export function createAnthropicRuntime({
       ensureStarted();
       const scanned = scanner.push(text);
       if (scanned.error) throwScannerError(scanned.error);
-      if (scanned.calls.length) dsmlCalls.push(...scanned.calls);
+      if (scanned.calls.length) {
+        dsmlCalls.push(...scanned.calls);
+        markVisible();
+      }
       if (scanned.visibleText && stream) {
+        markVisible();
         appendRuntimeText(visibleText, scanned.visibleText);
         write(encoder.textDelta(scanned.visibleText));
       } else if (scanned.visibleText) {
+        markVisible();
         appendRuntimeText(visibleText, scanned.visibleText);
       }
     }
@@ -582,25 +637,44 @@ export function createAnthropicRuntime({
         if (Array.isArray(messageTools)) pushStructured(messageTools);
         if (Array.isArray(delta.tool_calls)) pushStructured(delta.tool_calls);
         if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
-          appendRuntimeText(reasoningText, delta.reasoning_content);
-          if (body.normalized.thinkingEnabled) {
-            ensureStarted();
-            if (encoder && !cancelKind) {
-              write(encoder.thinkingDelta(delta.reasoning_content));
-            }
-          } else if (!warnedThinkingWhileDisabled) {
-            warnedThinkingWhileDisabled = true;
-            logWarn(
-              `Anthropic request ${requestId} received reasoning content while thinking `
-              + 'was disabled; the model may not honor none',
-            );
-          }
+          applyReasoningDocument(delta.reasoning_content);
         }
         if (delta.content !== undefined) feedContent(delta.content);
         if (choice.finish_reason) {
           finishReason = choice.finish_reason;
           armFinishGrace();
         }
+      }
+    }
+
+    /**
+     * 推理通道的清洗：只把可见文本交给 thinking 块，DSML 调用合并进 dsmlCalls。
+     *
+     * 与正文通道的差别在于失败策略——推理是辅助通道，畸形片段只丢不判整轮失败。
+     */
+    function applyReasoningDocument(text) {
+      if (!text) return;
+      if (!body.normalized.thinkingEnabled && !warnedThinkingWhileDisabled) {
+        warnedThinkingWhileDisabled = true;
+        logWarn(
+          `Anthropic request ${requestId} received reasoning content while thinking `
+          + 'was disabled; the model may not honor none',
+        );
+      }
+      const scannedReasoning = reasoningScanner.push(text);
+      if (scannedReasoning.calls.length) dsmlCalls.push(...scannedReasoning.calls);
+      if (scannedReasoning.error) {
+        logWarn(
+          `Anthropic reasoning channel carried malformed DSML: ${scannedReasoning.error.code}`,
+        );
+        return;
+      }
+      if (!body.normalized.thinkingEnabled || !scannedReasoning.visibleText) return;
+      markVisible();
+      appendRuntimeText(reasoningText, scannedReasoning.visibleText);
+      ensureStarted();
+      if (encoder && !cancelKind) {
+        write(encoder.thinkingDelta(scannedReasoning.visibleText));
       }
     }
 
@@ -659,12 +733,14 @@ export function createAnthropicRuntime({
         credentials,
         model: body.normalized.model || body.requestBody.model,
       }) || null;
-      const forwardedEffort = resolveReasoningEffort(
+      const applied = applyEffortToBody(
+        body.body,
         body.normalized.requestedEffort,
         declaration,
       );
-      if (forwardedEffort === null) delete body.body.reasoning_effort;
-      else body.body.reasoning_effort = forwardedEffort;
+      // 实际转发值：客户端回显与排查都读它，而不是读请求里的原始值。
+      body.forwardedEffort = applied.forwardedEffort;
+      body.reasoningSuppressed = applied.suppressed;
     }
 
     try {
@@ -696,7 +772,8 @@ export function createAnthropicRuntime({
         response = await requestUpstream(credentials);
       }
       if (!response.ok) {
-        throw upstreamError(response.status, await upstreamErrorDetail(response));
+        const detail = await upstreamErrorDetail(response);
+        throw withResetHint(upstreamError(response.status, detail), response.headers, detail);
       }
       if (!response.body) throw new RuntimeFailure('upstream response has no body');
 
@@ -792,6 +869,16 @@ export function createAnthropicRuntime({
         appendRuntimeText(visibleText, scannedEnd.visibleText);
         if (stream) write(encoder.textDelta(scannedEnd.visibleText));
       }
+      // 推理通道的收尾与正文同口径：补回缓冲里的可见尾巴，把调用交给仲裁。
+      const scannedReasoningEnd = reasoningScanner.finish();
+      if (scannedReasoningEnd.calls.length) dsmlCalls.push(...scannedReasoningEnd.calls);
+      if (scannedReasoningEnd.error) {
+        logWarn(`Anthropic reasoning channel ended with ${scannedReasoningEnd.error.code}`);
+      } else if (scannedReasoningEnd.visibleText && body.normalized.thinkingEnabled) {
+        appendRuntimeText(reasoningText, scannedReasoningEnd.visibleText);
+        ensureStarted();
+        if (stream) write(encoder.thinkingDelta(scannedReasoningEnd.visibleText));
+      }
       const structuredEnd = structured.finish();
       if (
         structuredEnd.invalid.length > 0
@@ -845,6 +932,13 @@ export function createAnthropicRuntime({
           output_tokens_details: {
             reasoning_tokens: reasoningTokens,
           },
+          // Anthropic 的原生缓存字段；只在非零时输出，保持既有响应形状。
+          ...(Number(usage.cacheReadTokens) > 0
+            ? { cache_read_input_tokens: Math.max(0, Number(usage.cacheReadTokens)) }
+            : {}),
+          ...(Number(usage.cacheWriteTokens) > 0
+            ? { cache_creation_input_tokens: Math.max(0, Number(usage.cacheWriteTokens)) }
+            : {}),
         },
       };
       if (body.normalized.thinkingEnabled && reasoningText.value()) {
@@ -871,6 +965,13 @@ export function createAnthropicRuntime({
           finishReason,
           outputTokens: Math.max(0, outputTokens),
           reasoningTokens,
+          cacheReadTokens: Math.max(0, Number(usage.cacheReadTokens) || 0),
+          cacheWriteTokens: Math.max(0, Number(usage.cacheWriteTokens) || 0),
+          // 上游已经报了真实的 prompt_tokens 就用它收尾，不要再让客户端停在
+          // message_start 的 bytes/3 估算上。
+          inputTokens: Number.isFinite(Number(usage.inputTokens)) && Number(usage.inputTokens) > 0
+            ? Number(usage.inputTokens)
+            : null,
         }));
         if (!cancelKind && !writer?.failed && writer?.ended) {
           terminate('client', clientWriteFailure());
@@ -903,9 +1004,17 @@ export function createAnthropicRuntime({
         durationMs: now() - startedAt,
         meta: {
           model: body.requestBody.model,
+          // 与 dsh 的 decodeTokens/decodeMs 同口径：首增量 → 结束。
+          ttftMs: firstVisibleAt ? firstVisibleAt - startedAt : 0,
+          decodeMs: firstVisibleAt ? now() - firstVisibleAt : 0,
           usage: {
+            // usage.inputTokens 来自上游 prompt_tokens；只有上游完全没报时才退回估算。
             input_tokens: usage.inputTokens || inputEstimate,
             output_tokens: Math.max(0, outputTokens),
+            // 号池按 cache_read_input_tokens / cache_creation_input_tokens 记账；
+            // 这里不漏字段，面板的缓存命中率才不会恒为 0。
+            cache_read_input_tokens: Math.max(0, Number(usage.cacheReadTokens) || 0),
+            cache_creation_input_tokens: Math.max(0, Number(usage.cacheWriteTokens) || 0),
           },
         },
       };
@@ -951,7 +1060,12 @@ export function createAnthropicRuntime({
           ensureStarted({ allowCanceled: true });
           if (encoder && writer && !writer.failed) {
             writer.writeComment('bridge-anthropic-canceled');
-            write(encoder.cancel({ outputTokens, reasoningTokens }));
+            write(encoder.cancel({
+              outputTokens,
+              reasoningTokens,
+              cacheReadTokens: Math.max(0, Number(usage.cacheReadTokens) || 0),
+              cacheWriteTokens: Math.max(0, Number(usage.cacheWriteTokens) || 0),
+            }));
           }
         } else if (stream && !persisted.ok) {
           writer?.fail(persisted.error);
@@ -990,7 +1104,7 @@ export function createAnthropicRuntime({
         code: failure.code,
         error: `${failure.message} ${failure.code}`,
         durationMs: now() - startedAt,
-        meta: { model: body.requestBody.model, usage: {} },
+        meta: { model: body.requestBody.model, usage: {}, resetAt: failure.resetAt || 0 },
       };
       if (downstreamStarted && stream && failure.code !== 'ABORTED') {
         if (!responseEnded) {
@@ -1192,7 +1306,7 @@ export function createAnthropicRuntime({
   }
 
   async function messages({ req, res, body, config, clientKey = null, interruptSignal = null }) {
-    const normalized = normalizeBody(body, config);
+    const normalized = normalizeBody(body, config, req?.headers || null);
     const pool = poolLoader();
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
     const tried = [];
@@ -1229,6 +1343,9 @@ export function createAnthropicRuntime({
       if (result.started) return result;
       lastFailure = result.error;
       if (!result.error?.retryable) break;
+      // 限流且没有别的号可用：换号等于原地重试，只会把 429 放大。
+      // 直接把 429 和 Retry-After 透给客户端。
+      if (lastFailure.code === 'RATE_LIMITED' && !hasAnotherAccount(tried, normalized.requestBody.model)) break;
     }
 
     const failure = lastFailure || new RuntimeFailure('all account attempts failed');
@@ -1265,6 +1382,12 @@ function openAIUsage(source, fallbackInput = 0, fallbackOutput = 0) {
   const completionTokens = Number.isFinite(completion) ? completion : fallbackOutput;
   const reasoning = source?.completion_tokens_details?.reasoning_tokens;
   const reasoningTokens = Number(reasoning);
+  // 上游把 prompt 缓存命中放在两个位置之一；只在非零时输出，保持旧响应形状。
+  const cached = Number(
+    source?.prompt_cache_hit_tokens
+    ?? source?.prompt_tokens_details?.cached_tokens
+    ?? 0,
+  );
   return {
     prompt_tokens: Math.max(0, promptTokens),
     completion_tokens: Math.max(0, completionTokens),
@@ -1277,6 +1400,9 @@ function openAIUsage(source, fallbackInput = 0, fallbackOutput = 0) {
             reasoning_tokens: Math.max(0, reasoningTokens),
           },
         }
+      : {}),
+    ...(Number.isFinite(cached) && cached > 0
+      ? { prompt_tokens_details: { cached_tokens: Math.max(0, cached) } }
       : {}),
   };
 }
@@ -1337,6 +1463,9 @@ export function createOpenAIRuntime({
     const reasoningText = createRuntimeTextCache({ hardBytes });
     const refusalText = createRuntimeTextCache({ hardBytes });
     const scanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
+    // 推理通道单独一把扫描器：模型常把工具调用写进思考里，那条通道以前不过扫描器，
+    // 于是原始标记既泄漏给用户，又少执行一次本该发生的调用。
+    const reasoningScanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
     const writer = body.stream
       ? createHttpEventWriter(res, {
           protocol: 'openai',
@@ -1351,6 +1480,10 @@ export function createOpenAIRuntime({
     let encoder = null;
     let pingTimer = null;
     let responseEnded = false;
+    let warnedReasoningWhileDisabled = false;
+    // 首个「可见」增量的时刻（正文/推理/工具调用任一）。decode 窗口从这里算起。
+    let firstVisibleAt = 0;
+    const markVisible = () => { if (!firstVisibleAt) firstVisibleAt = now(); };
     let leaseResult = {
       ok: false,
       code: 'ABORTED',
@@ -1509,6 +1642,8 @@ export function createOpenAIRuntime({
       } catch (error) {
         throw structuredRuntimeFailure(error);
       }
+      // 工具调用同样是「可见内容」：dsh 的首 token 判定把它算在内。
+      if (Array.isArray(deltas) ? deltas.length : Boolean(deltas)) markVisible();
     }
 
     function feedContent(content) {
@@ -1516,11 +1651,46 @@ export function createOpenAIRuntime({
       if (!text) return '';
       const scanned = scanner.push(text);
       if (scanned.error) scannerError(scanned.error);
-      dsmlCalls.push(...scanned.calls);
+      if (scanned.calls.length) {
+        dsmlCalls.push(...scanned.calls);
+        markVisible();
+      }
       if (scanned.visibleText) {
+        markVisible();
         appendRuntimeText(visibleText, scanned.visibleText);
       }
       return scanned.visibleText;
+    }
+
+    /**
+     * 推理通道的清洗：只把可见文本交出去，DSML 调用合并进 dsmlCalls。
+     *
+     * 与正文通道的差别在于失败策略——推理是辅助通道，畸形片段只丢不判整轮失败，
+     * 否则一段跑偏的思考会把本来能成功的回合打成错误。
+     */
+    function applyReasoningDocument(text) {
+      if (!text) return;
+      if (body.reasoningSuppressed && !warnedReasoningWhileDisabled) {
+        warnedReasoningWhileDisabled = true;
+        warn(
+          `Chat request ${chatResponseId} received reasoning content while `
+          + 'reasoning_effort was none; the model may not honor none',
+        );
+      }
+      const scannedReasoning = reasoningScanner.push(text);
+      if (scannedReasoning.calls.length) dsmlCalls.push(...scannedReasoning.calls);
+      if (scannedReasoning.error) {
+        warn(`Chat reasoning channel carried malformed DSML: ${scannedReasoning.error.code}`);
+        return;
+      }
+      if (body.reasoningSuppressed || !scannedReasoning.visibleText) return;
+      markVisible();
+      appendRuntimeText(reasoningText, scannedReasoning.visibleText);
+      if (body.stream) {
+        ensureStreamStarted();
+        if (!encoder || cancelKind) return;
+        emit(encoder.reasoningDelta(scannedReasoning.visibleText));
+      }
     }
 
     function processDocument(document) {
@@ -1547,12 +1717,7 @@ export function createOpenAIRuntime({
       finishReason = choice.finish_reason || finishReason;
       const payload = choice.delta || choice.message || {};
       if (typeof payload.reasoning_content === 'string') {
-        appendRuntimeText(reasoningText, payload.reasoning_content);
-        if (body.stream) {
-          ensureStreamStarted();
-          if (!encoder || cancelKind) return;
-          emit(encoder.reasoningDelta(payload.reasoning_content));
-        }
+        applyReasoningDocument(payload.reasoning_content);
       }
       if (typeof payload.refusal === 'string') {
         appendRuntimeText(refusalText, payload.refusal);
@@ -1634,24 +1799,34 @@ export function createOpenAIRuntime({
         });
       }
       if (credentials.needsRefresh) credentials = await refreshCredentials(credentials);
-      const declaration = reasoningCatalogue?.getDeclaration({
-        accountId: account,
-        credentials,
-        model: body.model,
-      }) || null;
-      const forwardedEffort = resolveReasoningEffort(body.requestedEffort, declaration);
-      if (forwardedEffort === null) delete body.body.reasoning_effort;
-      else body.body.reasoning_effort = forwardedEffort;
+      const applyChatEffort = () => {
+        const declaration = reasoningCatalogue?.getDeclaration({
+          accountId: account,
+          credentials,
+          model: body.model,
+        }) || null;
+        const applied = applyEffortToBody(body.body, body.requestedEffort, declaration);
+        body.forwardedEffort = applied.forwardedEffort;
+        // 客户端**显式**要求 none，上游却仍返回 reasoning_content（CHANGELOG 的
+        // 已知限制）——此时正文不该透给客户端，与 Anthropic 路径对齐。
+        // 只认显式意图：没声明档位（source: 'default'）不是「要求关闭思考」，
+        // 那种情况照常透出推理，否则会静默砍掉既有功能。
+        body.reasoningSuppressed = applied.suppressed;
+      };
+      applyChatEffort();
 
       armTotal();
       armFirstByte();
       let response = await requestUpstream(credentials);
       if (response.status === 401 && credentials.refreshToken) {
         credentials = await refreshCredentials(credentials);
+        // 换号后目录可能完全不同（另一个账号的模型声明），档位必须按新目录重解析。
+        applyChatEffort();
         response = await requestUpstream(credentials);
       }
       if (!response.ok) {
-        throw upstreamError(response.status, await upstreamErrorDetail(response));
+        const detail = await upstreamErrorDetail(response);
+        throw withResetHint(upstreamError(response.status, detail), response.headers, detail);
       }
 
       const contentType = String(response.headers.get('content-type') || '');
@@ -1706,7 +1881,27 @@ export function createOpenAIRuntime({
       const scannedEnd = scanner.finish();
       if (scannedEnd.error) scannerError(scannedEnd.error);
       dsmlCalls.push(...scannedEnd.calls);
-      appendRuntimeText(visibleText, scannedEnd.visibleText);
+      // 缓冲里可能留着一截「看着像 DSML 开头」的可见尾巴（例如正文以 "<" 结尾）。
+      // 非流式靠 visibleText 收尾即可，流式必须把它补发一次，否则客户端字面上丢字符。
+      if (scannedEnd.visibleText) {
+        appendRuntimeText(visibleText, scannedEnd.visibleText);
+        if (body.stream && encoder && !cancelKind) {
+          ensureStreamStarted();
+          emit(encoder.textDelta(scannedEnd.visibleText));
+        }
+      }
+      // 推理通道的收尾与正文同口径：补回缓冲里的可见尾巴，把调用交给仲裁。
+      const scannedReasoningEnd = reasoningScanner.finish();
+      if (scannedReasoningEnd.calls.length) dsmlCalls.push(...scannedReasoningEnd.calls);
+      if (scannedReasoningEnd.error) {
+        warn(`Chat reasoning channel ended with ${scannedReasoningEnd.error.code}`);
+      } else if (scannedReasoningEnd.visibleText && !body.reasoningSuppressed) {
+        appendRuntimeText(reasoningText, scannedReasoningEnd.visibleText);
+        if (body.stream && encoder && !cancelKind) {
+          ensureStreamStarted();
+          emit(encoder.reasoningDelta(scannedReasoningEnd.visibleText));
+        }
+      }
       if (cancelKind) {
         const outputTokens = conservativeTokenEstimate(visibleText.value());
         const usage = openAIUsage(upstreamUsage, inputEstimate, outputTokens);
@@ -1862,9 +2057,16 @@ export function createOpenAIRuntime({
         durationMs: now() - startedAt,
         meta: {
           model: body.model,
+          // 与 dsh 的 decodeTokens/decodeMs 同口径：首增量 → 结束。
+          ttftMs: firstVisibleAt ? firstVisibleAt - startedAt : 0,
+          decodeMs: firstVisibleAt ? now() - firstVisibleAt : 0,
           usage: {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
+            // 号池按 cache_read_input_tokens / cache_creation_input_tokens 记账；
+            // 这里不漏字段，面板的缓存命中率才不会恒为 0。
+            cache_read_input_tokens: Math.max(0, Number(usage.prompt_tokens_details?.cached_tokens) || 0),
+            cache_creation_input_tokens: 0,
           },
         },
       };
@@ -1892,7 +2094,7 @@ export function createOpenAIRuntime({
         code: failure.code,
         error: `${failure.message} ${failure.code}`,
         durationMs: now() - startedAt,
-        meta: { model: body.model, usage: {} },
+        meta: { model: body.model, usage: {}, resetAt: failure.resetAt || 0 },
       };
       if (cancelKind) {
         leaseResult = {
@@ -1991,7 +2193,12 @@ export function createOpenAIRuntime({
     const normalized = prepareOpenAIRequest(body, {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
-      continuationNudge: continuationNudgeEnabled(config),
+      continuationNudge: continuationNudgeApplies({
+        mode: continuationNudgeMode(config),
+        headers: req?.headers || null,
+        body,
+        hasToolLoop: chatHasToolLoop(body),
+      }),
     });
     const pool = poolLoader();
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
@@ -2024,6 +2231,8 @@ export function createOpenAIRuntime({
       if (result.ok || result.started) return result;
       lastFailure = result.error;
       if (!result.error?.retryable) break;
+      // 见 anthropic 同名逻辑：只有一个号时限流不该触发换号重试
+      if (lastFailure.code === 'RATE_LIMITED' && !hasAnotherAccount(tried, normalized.model)) break;
     }
 
     const failure = lastFailure || new RuntimeFailure('all account attempts failed');

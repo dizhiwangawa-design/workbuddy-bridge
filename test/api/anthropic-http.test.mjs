@@ -1929,3 +1929,321 @@ test('Anthropic 租约释放保留客户端 Key 归因', async () => {
   assert.equal(released[0].result.meta.clientKeyId, 'key-anthropic');
   assert.equal(released[0].result.meta.clientKeyName, 'laptop');
 });
+
+test('Anthropic usage 透传上游 prompt 缓存命中', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4010,"completion_tokens":12,"total_tokens":4022,'
+      + '"prompt_cache_hit_tokens":3840,"prompt_cache_write_tokens":64}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'cache' }],
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.usage.cache_read_input_tokens, 3840);
+  assert.equal(body.usage.cache_creation_input_tokens, 64);
+});
+
+test('Anthropic usage 上游不报缓存时保持旧形状', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'plain' }],
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal('cache_read_input_tokens' in body.usage, false);
+  assert.equal('cache_creation_input_tokens' in body.usage, false);
+});
+
+test('Anthropic thinking 禁用与显式 none 的抑制口径一致（回归守卫）', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"reasoning_content":"secret"}}]}\n\n');
+    res.end(
+      'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+
+  const disabled = await (await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: 'quiet' }],
+    }),
+  })).json();
+  assert.equal(disabled.content.some((block) => block.type === 'thinking'), false);
+  assert.equal(JSON.stringify(disabled).includes('secret'), false);
+});
+
+
+test('Anthropic 推理通道里的 DSML 调用被剥离并执行', async (t) => {
+  const BAR = '\uFF5C\uFF5C';
+  const dsml = `<${BAR}DSML${BAR} calls><${BAR}DSML${BAR} invoke name="run_shell">`
+    + `<${BAR}DSML${BAR} parameter name="command" string="true">ls -la</${BAR}DSML${BAR} parameter>`
+    + `</${BAR}DSML${BAR} invoke></${BAR}DSML${BAR} calls>`;
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: `I should call it: ${dsml}` } }] })}\n\n`);
+    res.end(
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } })}\n\n`
+      + 'data: [DONE]\n\n',
+    );
+  });
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 512,
+      thinking: { type: 'enabled', budget_tokens: 9000 },
+      messages: [{ role: 'user', content: 'go' }],
+      tools: [{
+        name: 'run_shell',
+        description: 'run',
+        input_schema: { type: 'object', properties: { command: { type: 'string' } } },
+      }],
+    }),
+  });
+  const body = await response.json();
+  const serialized = JSON.stringify(body);
+
+  assert.equal(response.status, 200);
+  assert.equal(serialized.includes('DSML'), false, serialized);
+  const thinking = body.content.find((block) => block.type === 'thinking');
+  assert.equal(thinking.thinking, 'I should call it: ');
+  const toolUse = body.content.find((block) => block.type === 'tool_use');
+  assert.deepEqual(toolUse.input, { command: 'ls -la' });
+});
+
+
+test('Anthropic 流式正文以尖括号结尾时不得丢字符', async (t) => {
+  const cases = [
+    ['plain', 'no markers here at all'],
+    ['less-than', 'trailing less-than <'],
+    ['bar', `bar-style <\uFF5C`],
+    ['double-bar', `prefix <\uFF5C\uFF5C`],
+  ];
+  let current = '';
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    const chunks = [];
+    for (let i = 0; i < current.length; i += 4) {
+      chunks.push(`data: ${JSON.stringify({ choices: [{ delta: { content: current.slice(i, i + 4) } }] })}\n\n`);
+    }
+    chunks.push(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } })}\n\n`);
+    chunks.push('data: [DONE]\n\n');
+    res.end(chunks.join(''));
+  });
+
+  for (const [label, text] of cases) {
+    current = text;
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        max_tokens: 128,
+        stream: true,
+        messages: [{ role: 'user', content: 'go' }],
+      }),
+    });
+    const { events, raw } = await parseResponse(response);
+    const acc = events
+      .filter((event) => event.data?.delta?.type === 'text_delta')
+      .map((event) => event.data.delta.text)
+      .join('');
+    assert.equal(acc, text, `${label}: streamed text lost characters`);
+  }
+});
+
+
+test('Anthropic 租约把上游缓存命中写进号池记账字段', async () => {
+  const { createAnthropicRuntime } = await import('../../src/api-runtime.js');
+  const released = [];
+  const runtime = createAnthropicRuntime({
+    pick: () => ({ name: 'cache-anthropic' }),
+    begin: () => {},
+    end: (account, result) => released.push({ account, result }),
+    readCredentials: () => ({
+      ok: true,
+      accessToken: 'test-access',
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    }),
+    upstreamClient: {
+      chat: async () => ({
+        status: 200,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+              + '"usage":{"prompt_tokens":4010,"completion_tokens":12,"total_tokens":4022,'
+              + '"prompt_cache_hit_tokens":3840,"prompt_cache_write_tokens":64}}' + '\n\n'
+              + 'data: [DONE]' + '\n\n',
+            ));
+            controller.close();
+          },
+        }),
+      }),
+    },
+  });
+  const res = {
+    headersSent: false,
+    writable: true,
+    writableEnded: false,
+    destroyed: false,
+    writeHead() { this.headersSent = true; },
+    end() { this.writableEnded = true; },
+    on() {},
+    off() {},
+  };
+
+  await runtime.messages({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'cache' }],
+    },
+    config: settings.getApiSettings(),
+  });
+
+  assert.equal(released.length, 1);
+  const usage = released[0].result.meta.usage;
+  assert.equal(usage.input_tokens, 4010);
+  assert.equal(usage.cache_read_input_tokens, 3840);
+  assert.equal(usage.cache_creation_input_tokens, 64);
+});
+
+test('Chat 租约把上游缓存命中写进号池记账字段', async () => {
+  const { createOpenAIRuntime } = await import('../../src/api-runtime.js');
+  const released = [];
+  const runtime = createOpenAIRuntime({
+    pick: () => ({ name: 'cache-chat' }),
+    begin: () => {},
+    end: (account, result) => released.push({ account, result }),
+    readCredentials: () => ({
+      ok: true,
+      accessToken: 'test-access',
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    }),
+    upstreamClient: {
+      chat: async () => ({
+        status: 200,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+              + '"usage":{"prompt_tokens":4010,"completion_tokens":12,"total_tokens":4022,'
+              + '"prompt_cache_hit_tokens":3840}}' + '\n\n'
+              + 'data: [DONE]' + '\n\n',
+            ));
+            controller.close();
+          },
+        }),
+      }),
+    },
+  });
+  const res = {
+    headersSent: false,
+    writable: true,
+    writableEnded: false,
+    destroyed: false,
+    writeHead() { this.headersSent = true; },
+    end() { this.writableEnded = true; },
+    write() { return true; },
+    on() {},
+    off() {},
+  };
+
+  await runtime.chat({
+    req: { once() {}, off() {} },
+    res,
+    body: {
+      model: 'deepseek-v4.1-flash',
+      stream: false,
+      messages: [{ role: 'user', content: 'cache' }],
+    },
+    config: settings.getApiSettings(),
+  });
+
+  assert.equal(released.length, 1);
+  const usage = released[0].result.meta.usage;
+  assert.equal(usage.input_tokens, 4010);
+  assert.equal(usage.cache_read_input_tokens, 3840);
+});
+
+
+test('Anthropic 流式 message_delta 用上游真实 input_tokens 覆盖估算值', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"ok"}}]}' + '\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":805,"completion_tokens":12,"total_tokens":817,'
+      + '"prompt_cache_hit_tokens":640}}' + '\n\n'
+      + 'data: [DONE]' + '\n\n',
+    );
+  });
+
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      max_tokens: 64,
+      stream: true,
+      messages: [{ role: 'user', content: 'x'.repeat(4000) }],
+    }),
+  });
+  const { events } = await parseResponse(response);
+
+  const start = events.find((event) => event.event === 'message_start');
+  const delta = events.find((event) => event.event === 'message_delta');
+  assert.ok(start && delta, JSON.stringify(events.map((event) => event.event)));
+
+  // message_start 只能给估算值；上游真实值 805 远小于 bytes/3 估出来的数。
+  assert.notEqual(start.data.message.usage.input_tokens, 805);
+  assert.equal(delta.data.usage.input_tokens, 805);
+  assert.equal(delta.data.usage.cache_read_input_tokens, 640);
+});
+

@@ -62,8 +62,27 @@ export function parseDayKey(key) {
 
 // ------------------------------------------------------------------ 桶
 
+// ttftMs / decodeMs 与 ms 三者口径不同，别混用：
+//   ms      = 整个请求的墙钟（含排队、上游首字节、慢客户端写）
+//   ttftMs  = 请求发出 → 首个可见增量，只回答「首字多慢」
+//   decodeMs= 首个可见增量 → 结束，只回答「生成多快」
+// tok/s 只有除以 decodeMs 才是解码速度；除以 ms 得到的是端到端吞吐。
 export function emptyMetrics() {
-  return { req: 0, ok: 0, fail: 0, tin: 0, tout: 0, cacheRead: 0, cacheWrite: 0, ms: 0, cost: 0 };
+  return {
+    req: 0,
+    ok: 0,
+    fail: 0,
+    tin: 0,
+    tout: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    ms: 0,
+    ttftMs: 0,
+    ttftReq: 0,
+    decodeMs: 0,
+    decodeTokens: 0,
+    cost: 0,
+  };
 }
 
 export function emptyBucket() {
@@ -83,6 +102,10 @@ function addMetrics(target, src) {
   target.cacheRead += src?.cacheRead || 0;
   target.cacheWrite += src?.cacheWrite || 0;
   target.ms += src?.ms || 0;
+  target.ttftMs += src?.ttftMs || 0;
+  target.ttftReq += src?.ttftReq || 0;
+  target.decodeMs += src?.decodeMs || 0;
+  target.decodeTokens += src?.decodeTokens || 0;
   target.cost += src?.cost || 0;
   return target;
 }
@@ -153,6 +176,11 @@ export function recordSample(pool, sample, now = Date.now()) {
     cacheRead: sample.cacheRead || 0,
     cacheWrite: sample.cacheWrite || 0,
     ms: sample.ms || 0,
+    // 只有上游真的给出过首个增量与结束时刻时才有解码窗口，否则留 0 不污染均值。
+    ttftMs: sample.ttftMs || 0,
+    ttftReq: sample.ttftMs > 0 ? 1 : 0,
+    decodeMs: sample.decodeMs || 0,
+    decodeTokens: sample.decodeMs > 0 ? (sample.tout || 0) : 0,
     cost: sample.cost || 0,
   };
 
@@ -273,9 +301,10 @@ export function priceConfig() {
 function costOf(b, price) {
   if (b.cost > 0) return { cny: b.cost * price.usdCny, source: 'cli', usd: b.cost };
   if (price.pin || price.pout) {
-    const fresh = Math.max(0, (b.tin || 0) - (b.cacheRead || 0));
+    const cached = cacheReadSafe(b);
+    const fresh = Math.max(0, (b.tin || 0) - cached);
     const cny =
-      (fresh * price.pin + (b.tout || 0) * price.pout + (b.cacheRead || 0) * price.pcache) / 1e6;
+      (fresh * price.pin + (b.tout || 0) * price.pout + cached * price.pcache) / 1e6;
     return { cny, source: 'price', usd: price.usdCny ? cny / price.usdCny : 0 };
   }
   return { cny: null, source: 'none', usd: 0 };
@@ -310,6 +339,13 @@ export function summarize(points, price = priceConfig()) {
   return { ...summary, byApi, byKey };
 }
 
+/** 缓存读不可能超过总输入；越界说明上游换了口径，夹住比让面板显示 180% 诚实。 */
+function cacheReadSafe(b) {
+  const read = Math.max(0, Number(b.cacheRead) || 0);
+  const tin = Math.max(0, Number(b.tin) || 0);
+  return Math.min(read, tin);
+}
+
 function summarizeMetrics(b, price) {
   let peakThroughput = 0;
   const v = b.ms ? (b.tout || 0) / (b.ms / 1000) : 0;
@@ -317,6 +353,9 @@ function summarizeMetrics(b, price) {
 
   const tokens = b.tin + b.tout;
   const cost = costOf(b, price);
+
+  const decodeMs = b.decodeMs || 0;
+  const decodeTokens = b.decodeTokens || 0;
 
   return {
     req: b.req,
@@ -326,15 +365,25 @@ function summarizeMetrics(b, price) {
     tout: b.tout,
     cacheRead: b.cacheRead,
     cacheWrite: b.cacheWrite,
-    freshIn: Math.max(0, b.tin - b.cacheRead),
+    freshIn: Math.max(0, b.tin - cacheReadSafe(b)),
     tokens,
     ms: b.ms,
     avgMs: b.req ? Math.round(b.ms / b.req) : 0,
     avgTokens: b.req ? Math.round(tokens / b.req) : 0,
     successRate: b.req ? b.ok / b.req : null,
-    cacheHitRate: b.tin ? b.cacheRead / b.tin : null,
+    // 命中率的分母是「总输入」（缓存读已含在其中），与 dsh 的 formatCacheHitPercent 同口径。
+    // 上游偶尔会回一个比 input 还大的 cached（原生 Anthropic 口径），这里夹住不让它超过 100%。
+    cacheHitRate: b.tin ? cacheReadSafe(b) / b.tin : null,
+    // 端到端吞吐：把排队、首字节、慢客户端全算进分母。回答「这个客户端有多快」。
     throughput: b.ms ? b.tout / (b.ms / 1000) : 0,
     peakThroughput,
+    // 首字延迟：只有真的观测到首增量才有样本。
+    ttftMs: b.ttftReq ? b.ttftMs / b.ttftReq : null,
+    ttftReq: b.ttftReq || 0,
+    // 解码速度：与 dsh 的 decodeTokens/decodeMs 同口径，回答「模型本身多快」。
+    decodeMs,
+    decodeTokens,
+    decodeThroughput: decodeMs ? decodeTokens / (decodeMs / 1000) : null,
     costCny: cost.cny,
     costSource: cost.source,
     costUsd: cost.usd,
@@ -438,6 +487,8 @@ export function buildStats(pool, range = 'today', { now = Date.now() } = {}) {
       cacheRead: p.cacheRead,
       ms: p.ms,
       throughput: p.ms ? p.tout / (p.ms / 1000) : 0,
+      ttftMs: p.ttftReq ? p.ttftMs / p.ttftReq : null,
+      decodeThroughput: p.decodeMs ? p.decodeTokens / (p.decodeMs / 1000) : null,
     })),
     events,
     heatmap: buildHeatmap(pool, now),

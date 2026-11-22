@@ -59,16 +59,17 @@ test('Anthropic 请求转换支持 tools、图片、tool_result 与 is_error', (
   });
 
   assert.equal(converted.body.stream, true);
-  assert.equal(converted.body.messages[0].role, 'system');
-  // 带工具时会在最后一条 user 之后补一条回合约束（continuation-nudge），
-  // 因此 assistant 及之后的消息整体后移一位。
-  assert.equal(converted.body.messages[2].role, 'system');
-  assert.match(converted.body.messages[2].content, /运行约束/);
-  assert.equal(converted.body.messages[3].role, 'assistant');
-  assert.equal(converted.body.messages[3].tool_calls[0].id, 'toolu_1');
-  assert.equal(converted.body.messages[4].role, 'tool');
-  assert.equal(converted.body.messages[4].tool_call_id, 'toolu_1');
-  assert.match(converted.body.messages[4].content, /^\[tool_error\]/);
+  const messages = converted.body.messages;
+  assert.equal(messages[0].role, 'system');
+  // 约束插在最后一条 user 之后（长期验证过的位置）：放到整串末尾会让 system
+  // 直接跟在 tool 结果后面，模型容易把这条指令当成新一轮对话的开头。
+  assert.equal(messages[2].role, 'system');
+  assert.match(messages[2].content, /运行约束/);
+  assert.equal(messages[3].role, 'assistant');
+  assert.equal(messages[3].tool_calls[0].id, 'toolu_1');
+  assert.equal(messages[4].role, 'tool');
+  assert.equal(messages[4].tool_call_id, 'toolu_1');
+  assert.match(messages[4].content, /^\[tool_error\]/);
   assert.equal(converted.body.tools[0].function.name, 'get_weather');
   assert.equal(converted.body.tool_choice.function.name, 'get_weather');
 });
@@ -217,6 +218,8 @@ test('Anthropic 历史回放忽略 thinking 块', () => {
       { role: 'user', content: 'next' },
     ],
   });
+  // 折成可见文本会让模型把「自己的思考」当成「上一轮说过的话」，进而在正文里
+  // 沿用这个格式（曾把 <prior_reasoning> 泄漏成用户可见输出），所以仍然丢弃。
   assert.deepEqual(normalized.messages[0], {
     role: 'assistant',
     content: 'answer',

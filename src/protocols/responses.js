@@ -8,6 +8,7 @@ import {
 import { outputFromPartial } from '../responses-store.js';
 import { resolveReasoningEffort } from '../reasoning-effort.js';
 import { withContinuationNudge } from '../continuation-nudge.js';
+import { warn } from '../log.js';
 
 const SUPPORTED_TOOL_TYPES = new Set([
   'function',
@@ -17,6 +18,31 @@ const SUPPORTED_TOOL_TYPES = new Set([
   'shell',
   'apply_patch',
 ]);
+
+/** 回放历史推理时的单条上限：够表达思路，又不至于把上下文顶满。 */
+const REASONING_REPLAY_LIMIT = 2000;
+
+/**
+ * 上游托管的工具（web_search / file_search / computer_use……）：客户端会无条件
+ * 把这些工具塞进每一次请求，但上游没有对应执行器，也不需要模型知道它们。
+ * 直接 400 会让整轮对话失败（dsh 报 `tools[14] type web_search is not supported`），
+ * 所以这里静默剔除；引用这些名称的 tool_choice 也随之降级为 auto。
+ */
+const HOSTED_TOOL_TYPES = new Set([
+  'web_fetch',
+  'file_search',
+  'code_interpreter',
+  'image_generation',
+  'mcp',
+  'container',
+]);
+
+function isHostedToolType(type) {
+  const value = String(type || '').trim().toLowerCase();
+  return value.startsWith('web_search')
+    || value.startsWith('computer_use')
+    || HOSTED_TOOL_TYPES.has(value);
+}
 
 function bad(message, code = 'invalid_request') {
   return new ApiError(400, message, { type: 'invalid_request_error', code });
@@ -59,6 +85,13 @@ export function reasoningItem(summary = '', status = 'completed') {
   };
 }
 
+/**
+ * 空推理 item。
+ *
+ * 注意：回放历史**不再**用它替换已有 reasoning（那会让模型看到空壳），
+ * 见 historyForResponse。保留导出是因为它是 reasoning item 的标准空形状，
+ * 上游协商时仍可能用到。
+ */
 export function emptyCompletedReasoning() {
   return reasoningItem('', 'completed');
 }
@@ -137,12 +170,20 @@ export function baseResponse({
   };
 }
 
-export function responseUsage(prompt = 0, completion = 0, reasoning = 0) {
+/**
+ * Responses usage。
+ *
+ * `cached_tokens` 来自上游的 prompt 缓存命中（WorkBuddy 报
+ * `prompt_cache_hit_tokens` / `prompt_tokens_details.cached_tokens`），
+ * 以前这里硬编码 0，客户端因此永远显示「缓存命中 0%」。
+ * 注意 input_tokens 仍然包含命中部分，与 OpenAI 的语义一致。
+ */
+export function responseUsage(prompt = 0, completion = 0, reasoning = 0, cached = 0) {
   const input = Math.max(0, Number(prompt || 0));
   const output = Math.max(0, Number(completion || 0));
   return {
     input_tokens: input,
-    input_tokens_details: { cached_tokens: 0 },
+    input_tokens_details: { cached_tokens: Math.max(0, Number(cached || 0)) },
     output_tokens: output,
     output_tokens_details: { reasoning_tokens: Math.max(0, Number(reasoning || 0)) },
     total_tokens: input + output,
@@ -198,10 +239,16 @@ export function convertResponsesTools(input) {
   const tools = [];
   const registry = new Map();
   const names = new Set();
+  const hosted = [];
 
   for (const [index, tool] of input.entries()) {
     if (!tool || typeof tool !== 'object') throw bad(`tools[${index}] must be an object`);
     const type = String(tool.type || '');
+    if (isHostedToolType(type)) {
+      // 客户端常驻声明的托管工具，上游没有执行器：跳过而不是 400。
+      hosted.push(`${index}:${type}`);
+      continue;
+    }
     if (type === 'custom' && tool.name === 'apply_patch') {
       // The canonical Codex custom tool may be followed by its host counterpart.
     } else if (!SUPPORTED_TOOL_TYPES.has(type)) {
@@ -292,6 +339,9 @@ export function convertResponsesTools(input) {
     });
     names.add(declaration.function.name);
     names.add(name);
+  }
+  if (hosted.length) {
+    warn(`Responses 跳过上游不支持的托管工具: ${hosted.join(', ')}`);
   }
   return { tools, registry, names };
 }
@@ -423,6 +473,11 @@ function replayHistory(input) {
       positions.set(id, position);
       continue;
     }
+    // 推理 item 不进上游 messages：上游没有 reasoning 通道，把它折成 assistant
+    // 正文会让模型把自己的思考当成「上一轮说过的话」，进而在正文里继续这个格式
+    // —— 就是曾经把 <prior_reasoning> 泄漏到用户可见输出的那条路径。
+    // 丢弃是安全默认；raw reasoning_content 若被擅自塞进正文，后果比「看不到上一轮
+    // 想过什么」严重得多。
     if (type === 'reasoning') continue;
     if (typeof item.text === 'string') {
       messages.push({ role: 'user', content: item.text, position });
@@ -528,12 +583,17 @@ export function prepareResponsesRequest(body, {
   }
   if (choice === 'required' && !tools.length) throw bad('tool_choice requires at least one tool');
   if (choice && typeof choice === 'object') {
-    if (
+    if (isHostedToolType(choice.type)) {
+      // 被剔除的托管工具不能成为 tool_choice：降级为 auto，让请求继续可用。
+      choice = undefined;
+    } else if (
       choice.type !== undefined
       && !['function', 'custom', 'apply_patch', 'shell', 'local_shell'].includes(choice.type)
     ) {
       throw bad(`tool_choice type ${choice.type || '(missing)'} is not supported`);
     }
+  }
+  if (choice && typeof choice === 'object') {
     const builtin = ['apply_patch', 'shell', 'local_shell'].includes(choice.type) ? choice.type : '';
     const chosen = String(builtin || choice.name || choice.function?.name || '');
     if (!chosen) throw bad('tool_choice must name a tool');
@@ -545,10 +605,12 @@ export function prepareResponsesRequest(body, {
   const outbound = {
     model,
     // 带工具时补一条回合约束：没有工具调用的纯文字回复会被 codex / dsh 当作
-    // 任务结束，导致模型只描述下一步就交还控制权。
+    // 任务结束，导致模型只描述下一步就交还控制权。tool_choice 明确为 none 时
+    // 不注入，否则约束会与客户端的意图硬顶。
     messages: withContinuationNudge(messages, {
       tools: tools.length,
       enabled: continuationNudge,
+      toolChoice: choice,
     }),
     stream: true,
   };
@@ -587,7 +649,9 @@ export function prepareResponsesRequest(body, {
     ]),
     toolsDeclared: tools.length > 0,
     toolChoice: choice || 'auto',
-    requestedToolChoice: body.tool_choice === undefined ? 'auto' : body.tool_choice,
+    requestedToolChoice: body.tool_choice === undefined || choice === undefined
+      ? 'auto'
+      : body.tool_choice,
     parallelToolCalls: body.parallel_tool_calls !== false,
     requestedMax: max !== undefined,
     maxOutputTokens: max,
@@ -705,7 +769,12 @@ export function completedResponseBody({
     createdAt,
     status,
     output: [...prior, ...current],
-    usage: responseUsage(usage.prompt_tokens, usage.completion_tokens, usage.reasoning_tokens),
+    usage: responseUsage(
+      usage.prompt_tokens,
+      usage.completion_tokens,
+      usage.reasoning_tokens,
+      usage.cached_tokens,
+    ),
     incomplete,
     error,
     store,
@@ -742,9 +811,22 @@ export function historyForResponse(record) {
     ? meta.outputOffset
     : 0;
   return [...storedInput, ...output.slice(outputOffset).map((item) => {
-    if (item.type === 'reasoning') return emptyCompletedReasoning();
+    // 换 id 是因为 reasoning item 的身份属于上一次响应；但 summary 文本必须留下，
+    // 否则回放的是一具空壳，依赖推理连续性的模型看不到上一轮想过什么。
+    if (item.type === 'reasoning') {
+      return reasoningItem(summaryTextOf(item), 'completed');
+    }
     return item;
   })];
+}
+
+/** 取 reasoning item 里可见的 summary 文本（兼容 summary/summary_text 两种形状）。 */
+function summaryTextOf(item) {
+  const parts = Array.isArray(item?.summary) ? item.summary : [];
+  return parts
+    .map((part) => (typeof part === 'string' ? part : part?.text || ''))
+    .filter(Boolean)
+    .join('\n');
 }
 
 /** Live stdout lifecycle for Responses SSE. Final output is emitted only at
@@ -755,37 +837,44 @@ export function createResponsesStreamEncoder({
   retain = 'tail',
 }) {
   let sequence = 2;
+  let nextOutputIndex = Array.isArray(response.output) ? response.output.length : 0;
   let reasoningItem = null;
+  let reasoningIndex = -1;
+  let reasoningClosed = false;
   let messageItem = null;
+  let messageIndex = -1;
   const reasoningText = createTextCache({ maxBytes, retain });
   const outputText = createTextCache({ maxBytes, retain });
-  let outputIndex = Array.isArray(response.output) ? response.output.length : 0;
   const output = [];
   const event = (type, data) => ({
     type,
     data: { type, sequence_number: sequence++, ...data },
   });
+  // 每块一次性取号，绝不事后修正：output_index 必须等于该 item 在终态
+  // response.output 里的下标，两者是同一条不变量（见 alignLiveOutputIds）。
+  const nextIndex = () => nextOutputIndex++;
 
   function reasoningDelta(delta) {
     if (!delta) return [];
     reasoningText.append(delta);
     if (!reasoningItem) {
       reasoningItem = reasoningItemFor(response.id);
+      reasoningIndex = nextIndex();
       output.push(reasoningItem);
       return [
         event('response.output_item.added', {
-          output_index: outputIndex,
+          output_index: reasoningIndex,
           item: { ...reasoningItem, status: 'in_progress', summary: [] },
         }),
         event('response.reasoning_summary_part.added', {
           item_id: reasoningItem.id,
-          output_index: outputIndex,
+          output_index: reasoningIndex,
           summary_index: 0,
           part: { type: 'summary_text', text: '' },
         }),
         event('response.reasoning_summary_text.delta', {
           item_id: reasoningItem.id,
-          output_index: outputIndex,
+          output_index: reasoningIndex,
           summary_index: 0,
           delta,
         }),
@@ -793,10 +882,40 @@ export function createResponsesStreamEncoder({
     }
     return [event('response.reasoning_summary_text.delta', {
       item_id: reasoningItem.id,
-      output_index: outputIndex,
+      output_index: reasoningIndex,
       summary_index: 0,
       delta,
     })];
+  }
+
+  /**
+   * 关闭推理块。上游只会给出增量，不会给「思考结束」这个事实，所以必须由这里
+   * 补出 done 事件；否则客户端要靠终态自己推断，块一直停在 in_progress。
+   * 幂等：重复调用返回空数组。
+   */
+  function reasoningSummaryDone() {
+    const item = reasoningItem;
+    if (!item || reasoningClosed) return [];
+    reasoningClosed = true;
+    const text = reasoningText.value();
+    return [
+      event('response.reasoning_summary_text.done', {
+        item_id: item.id,
+        output_index: reasoningIndex,
+        summary_index: 0,
+        text,
+      }),
+      event('response.reasoning_summary_part.done', {
+        item_id: item.id,
+        output_index: reasoningIndex,
+        summary_index: 0,
+        part: { type: 'summary_text', text },
+      }),
+      event('response.output_item.done', {
+        output_index: reasoningIndex,
+        item: { ...item, status: 'completed', summary: [{ type: 'summary_text', text }] },
+      }),
+    ];
   }
 
   function textDelta(delta) {
@@ -804,22 +923,22 @@ export function createResponsesStreamEncoder({
     outputText.append(delta);
     if (!messageItem) {
       messageItem = responseMessage('', 'in_progress');
+      messageIndex = nextIndex();
       output.push(messageItem);
-      outputIndex += reasoningItem ? 1 : 0;
       return [
         event('response.output_item.added', {
-          output_index: outputIndex,
+          output_index: messageIndex,
           item: { ...messageItem, content: [] },
         }),
         event('response.content_part.added', {
           item_id: messageItem.id,
-          output_index: outputIndex,
+          output_index: messageIndex,
           content_index: 0,
           part: { type: 'output_text', text: '', annotations: [] },
         }),
         event('response.output_text.delta', {
           item_id: messageItem.id,
-          output_index: outputIndex,
+          output_index: messageIndex,
           content_index: 0,
           delta,
         }),
@@ -827,7 +946,7 @@ export function createResponsesStreamEncoder({
     }
     return [event('response.output_text.delta', {
       item_id: messageItem.id,
-      output_index: outputIndex,
+      output_index: messageIndex,
       content_index: 0,
       delta,
     })];
@@ -835,7 +954,17 @@ export function createResponsesStreamEncoder({
 
   return {
     reasoningDelta,
+    reasoningSummaryDone,
     textDelta,
+    /**
+     * live 已经完整走完的 item 类型，供终态事件去重。
+     * 只有真正发过 output_item.done 的类型才列在这里。
+     */
+    closedItemTypes() {
+      const closed = [];
+      if (reasoningClosed) closed.push('reasoning');
+      return closed;
+    },
     snapshot() {
       return {
         reasoning: reasoningText.value(),

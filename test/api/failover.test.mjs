@@ -8,6 +8,8 @@ import { once } from 'node:events';
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-failover-'));
 process.env.WB_BRIDGE_HOME = path.join(tmp, 'bridge');
+// 测试桩上游就起在 127.0.0.1，必须显式放行内网地址。
+process.env.WB_ALLOW_PRIVATE_UPSTREAM = '1';
 
 const accounts = await import('../../src/accounts.js');
 const pool = await import('../../src/pool.js');
@@ -252,6 +254,41 @@ test('模型级 429 不会阻断同一账号的其他模型', async (t) => {
   assert.equal(entry.inflight, 0);
   assert.ok(entry.cooldownLeftMs > 0);
   assert.deepEqual(entry.cooldownModels, ['deepseek-v4.1-flash']);
+});
+
+test('单号 429 不换号重试，直接把 Retry-After 透给客户端', async (t) => {
+  resetAccounts(['solo-rate']);
+  const resetInSeconds = 90;
+  const upstream = await startUpstream((_req, res) => {
+    res.writeHead(429, {
+      'content-type': 'application/json',
+      'retry-after': String(resetInSeconds),
+    });
+    res.end('{"error":{"message":"too many requests"}}');
+  });
+  t.after(() => upstream.close());
+
+  await withBridge(async (baseUrl) => {
+    const response = await chatRequest(baseUrl);
+    assert.equal(response.status, 429);
+    const header = response.headers.get('retry-after');
+    assert.ok(header, '必须带上 Retry-After，客户端才知道该等多久');
+    assert.equal(Number(header), resetInSeconds);
+    const body = await response.json();
+    assert.equal(body.error.type, 'rate_limit_error');
+  }, upstream.url);
+
+  // 单号时限流后换号等于原地重试：只有一次上游调用
+  assert.equal(upstream.calls.length, 1, '只有一个号时不该重试');
+  const entry = row('solo-rate');
+  assert.equal(entry.inflight, 0);
+  assert.equal(entry.today.rateLimited, 1, '面板要能看见 429 次数');
+  const until = pool.loadPool().accounts['solo-rate'].cooldowns['deepseek-v4.1-flash'].until;
+  const leftMs = until - Date.now();
+  assert.ok(
+    Math.abs(leftMs - resetInSeconds * 1000) < 5000,
+    `冷却应按上游给的时刻，实际剩余 ${leftMs}ms`,
+  );
 });
 
 test('OpenAI 流式首帧后失败不会换号重放，并释放租约', async (t) => {

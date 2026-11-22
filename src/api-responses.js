@@ -14,7 +14,11 @@ import {
 } from './tool-calls.js';
 import { createStructuredToolAssembler, arbitrateToolCalls } from './protocols/normalize.js';
 import { conservativeTokenEstimate } from './protocols/anthropic.js';
-import { continuationNudgeEnabled } from './continuation-nudge.js';
+import {
+  continuationNudgeApplies,
+  continuationNudgeMode,
+  responsesHasToolLoop,
+} from './continuation-nudge.js';
 import {
   baseResponse,
   completedResponseBody,
@@ -38,7 +42,7 @@ import {
   mergePartialOutput,
 } from './responses-store.js';
 import { debug, warn } from './log.js';
-import { resolveReasoningEffort } from './reasoning-effort.js';
+import { applyEffortToBody } from './reasoning-effort.js';
 
 function runtimeError(message, code, {
   status = 502,
@@ -139,14 +143,18 @@ export function createResponsesRuntime(options = {}) {
       credentials,
       model: prepared.model,
     }) || null;
-    const forwardedEffort = resolveReasoningEffort(
+    const applied = applyEffortToBody(
+      prepared.body,
       prepared.requestedEffort,
       declaration,
     );
-    if (forwardedEffort === null) delete prepared.body.reasoning_effort;
-    else prepared.body.reasoning_effort = forwardedEffort;
-    prepared.forwardedEffort = forwardedEffort;
-    return forwardedEffort;
+    prepared.forwardedEffort = applied.forwardedEffort;
+    // 客户端**显式**要求 none，上游却仍返回 reasoning_content（CHANGELOG 的
+    // 已知限制）——此时正文不该透给客户端，与 Anthropic 路径对齐。
+    // 只认显式意图：没声明档位（source: 'default'）不是「要求关闭思考」，
+    // 那种情况照常透出推理，否则会静默砍掉既有功能。
+    prepared.reasoningSuppressed = applied.suppressed;
+    return applied.forwardedEffort;
   }
 
   async function ensureDeadLetterRetry() {
@@ -259,6 +267,11 @@ export function createResponsesRuntime(options = {}) {
     let usage = null;
     let phase = 'opening';
     let sawDone = false;
+    let warnedReasoningWhileDisabled = false;
+    // 首个「可见」增量的时刻（正文/推理/工具调用任一）。decode 窗口从这里算起，
+    // 与 dsh 的 t_firstToken 同口径。
+    let firstVisibleAt = 0;
+    const markVisible = () => { if (!firstVisibleAt) firstVisibleAt = now(); };
     let parser = null;
     let liveEncoder = null;
     const visibleText = createResponseTextCache({ hardBytes });
@@ -267,6 +280,11 @@ export function createResponsesRuntime(options = {}) {
       maxBytes: structuredToolArgumentLimit(config.dsmlMaxBufferBytes, hardBytes),
     });
     const scanner = createDsmlScanner({
+      maxBufferBytes: config.dsmlMaxBufferBytes,
+    });
+    // 推理通道单独一把扫描器：模型常把工具调用写进思考里，那条通道以前不过扫描器，
+    // 于是原始标记既泄漏给用户，又少执行一次本该发生的调用。
+    const reasoningScanner = createDsmlScanner({
       maxBufferBytes: config.dsmlMaxBufferBytes,
     });
     const dsmlCalls = [];
@@ -378,6 +396,8 @@ export function createResponsesRuntime(options = {}) {
           error?.code || 'UPSTREAM_INVALID_TOOL_CALL',
         );
       }
+      // 工具调用同样是「可见内容」：dsh 的首 token 判定把它算在内。
+      if (Array.isArray(deltas) ? deltas.length : Boolean(deltas)) markVisible();
     }
 
     function snapshot(final = false) {
@@ -385,9 +405,21 @@ export function createResponsesRuntime(options = {}) {
       const calls = Array.isArray(snapshotValue) ? snapshotValue : (snapshotValue.calls || []);
       const invalidCalls = Array.isArray(snapshotValue) ? [] : (snapshotValue.invalid || []);
       const scanned = final ? scanner.finish() : { visibleText: '', calls: [], error: null };
+      const scannedReasoning = final
+        ? reasoningScanner.finish()
+        : { visibleText: '', calls: [], error: null };
       const truncation = scanned.error?.code === 'DSML_TRUNCATED';
       if (scanned.error && !truncation) {
         throw runtimeError('upstream DSML tool call is malformed', scanned.error.code);
+      }
+      if (final) {
+        // 推理通道的收尾与正文同口径：把缓冲里的可见尾巴补回去，把调用交给仲裁。
+        if (scannedReasoning.calls.length) dsmlCalls.push(...scannedReasoning.calls);
+        if (scannedReasoning.error) {
+          warn(`Responses reasoning channel ended with ${scannedReasoning.error.code}`);
+        } else if (scannedReasoning.visibleText && !prepared.reasoningSuppressed) {
+          appendResponseText(reasoningText, scannedReasoning.visibleText);
+        }
       }
       if (
         final
@@ -433,6 +465,12 @@ export function createResponsesRuntime(options = {}) {
           reasoning_tokens: Number(
             usage?.completion_tokens_details?.reasoning_tokens
               ?? usage?.reasoning_tokens
+              ?? 0,
+          ),
+          // 上游把缓存命中放在两个位置之一，取第一个有值的。
+          cached_tokens: Number(
+            usage?.prompt_cache_hit_tokens
+              ?? usage?.prompt_tokens_details?.cached_tokens
               ?? 0,
           ),
         },
@@ -528,10 +566,28 @@ export function createResponsesRuntime(options = {}) {
       finalDeltas = false,
       finalReasoningDeltas = false,
     } = {}) {
-      alignLiveOutputIds(finalBody);
       const live = liveEncoder?.snapshot();
+      const closedTypes = new Set(liveEncoder?.closedItemTypes?.() || []);
+      const closedIds = new Set(
+        (live?.output || [])
+          .filter((item) => closedTypes.has(item.type))
+          .map((item) => item.id),
+      );
+      alignLiveOutputIds(finalBody);
       const events = protocolEvents(finalBody, false).slice(2);
       for (const event of events) {
+        // live 已经完整关闭的块，终态里的 done 系列一律跳过，避免同一 item 被关闭两次。
+        const closedHere = closedIds.has(event.data.item?.id)
+          || closedIds.has(event.data.item_id);
+        const doneLike = event.type === 'response.output_item.done'
+          || event.type.endsWith('_text.done')
+          || event.type.endsWith('_part.done')
+          || event.type.endsWith('_arguments.done')
+          || event.type.endsWith('_input.done');
+        if (closedHere && doneLike) {
+          event.markRemoved = true;
+          continue;
+        }
         const duplicateLiveItem = live
           && event.type === 'response.output_item.added'
           && ['message', 'reasoning'].includes(event.data.item?.type);
@@ -580,16 +636,39 @@ export function createResponsesRuntime(options = {}) {
         });
     }
 
+    // live 的 output_index 按到达顺序分配，终态必须与它逐项对齐——
+    // output_index 等于该 item 在 response.output 里的下标是同一条不变量。
+    // 只搬 id 不搬顺序会让「正文先到」的响应出现流与终态错位（正文重复挂载）。
     function alignLiveOutputIds(finalBody) {
       const live = liveEncoder?.snapshot();
       if (!live?.output?.length) return finalBody;
-      finalBody.output = finalBody.output.map((item, index) => {
-        if (index < prior.length || !['message', 'reasoning'].includes(item.type)) {
-          return item;
-        }
-        const liveItem = live.output.find((candidate) => candidate.type === item.type);
-        return liveItem ? { ...item, id: liveItem.id } : item;
-      });
+      const head = finalBody.output.slice(0, prior.length);
+      const tail = finalBody.output.slice(prior.length);
+      // 同类型可能有多个块（并行工具调用），必须按**出现次序**配对，不能只按类型取第一个，
+      // 否则两个 function_call 会拿到同一个 live id，身份就串了。
+      const queues = new Map();
+      for (const [position, liveItem] of live.output.entries()) {
+        queueFor(liveItem.type).push({ liveItem, position });
+      }
+      function queueFor(type) {
+        if (!queues.has(type)) queues.set(type, []);
+        return queues.get(type);
+      }
+      // 带 live 身份的块按 live 顺序排在前面，其余（未走 live 的调用）保持原有相对顺序。
+      const withLive = [];
+      const withoutLive = [];
+      for (const item of tail) {
+        const queue = queues.get(item.type);
+        const match = queue?.shift();
+        if (match) withLive.push({ item, liveItem: match.liveItem, index: match.position });
+        else withoutLive.push(item);
+      }
+      withLive.sort((a, b) => a.index - b.index);
+      finalBody.output = [
+        ...head,
+        ...withLive.map((entry) => ({ ...entry.item, id: entry.liveItem.id })),
+        ...withoutLive,
+      ];
       return finalBody;
     }
 
@@ -1111,6 +1190,36 @@ export function createResponsesRuntime(options = {}) {
       }
     }
 
+    /**
+     * 推理通道的清洗：只把可见文本交出去，DSML 调用合并进 dsmlCalls。
+     *
+     * 与正文通道的差别在于失败策略——推理是辅助通道，畸形片段只丢不判整轮失败，
+     * 否则一段跑偏的思考会把本来能成功的回合打成 502。
+     */
+    function applyReasoningDocument(text) {
+      if (!text) return;
+      if (prepared.reasoningSuppressed && !warnedReasoningWhileDisabled) {
+        warnedReasoningWhileDisabled = true;
+        warn(
+          `Responses request ${responseId} received reasoning content while `
+          + 'reasoning_effort was none; the model may not honor none',
+        );
+      }
+      const scannedReasoning = reasoningScanner.push(text);
+      if (scannedReasoning.calls.length) {
+        dsmlCalls.push(...scannedReasoning.calls);
+        phase = 'tool_call';
+      }
+      if (scannedReasoning.error) {
+        warn(`Responses reasoning channel carried malformed DSML: ${scannedReasoning.error.code}`);
+        return;
+      }
+      if (prepared.reasoningSuppressed || !scannedReasoning.visibleText) return;
+      markVisible();
+      appendResponseText(reasoningText, scannedReasoning.visibleText);
+      publishLive(liveEncoder?.reasoningDelta(scannedReasoning.visibleText));
+    }
+
     function applyDocument(rawDocument) {
       let document = rawDocument;
       if (typeof document === 'string') {
@@ -1134,10 +1243,7 @@ export function createResponsesRuntime(options = {}) {
       phase = 'generation';
       const payload = choice.delta || choice.message || {};
       if (typeof payload.reasoning_content === 'string') {
-        appendResponseText(reasoningText, payload.reasoning_content);
-        if (payload.reasoning_content) {
-          publishLive(liveEncoder?.reasoningDelta(payload.reasoning_content));
-        }
+        applyReasoningDocument(payload.reasoning_content);
       }
       if (Array.isArray(payload.tool_calls)) {
         pushStructured(payload.tool_calls);
@@ -1157,8 +1263,10 @@ export function createResponsesRuntime(options = {}) {
         if (scanned.calls.length) {
           dsmlCalls.push(...scanned.calls);
           phase = 'tool_call';
+          markVisible();
         }
         if (scanned.visibleText) {
+          markVisible();
           appendResponseText(visibleText, scanned.visibleText);
           if (liveEncoder) publishLive(liveEncoder.textDelta(scanned.visibleText));
         }
@@ -1199,6 +1307,8 @@ export function createResponsesRuntime(options = {}) {
         });
         if (upstream.status === 401 && credentials.refreshToken) {
           credentials = await refresh(account, credentials);
+          // 换号后目录可能完全不同，档位必须按新账号的模型声明重解析。
+          applyReasoningEffort(prepared, account, credentials);
           upstream = await upstreamClient.chat({
             accountId: account,
             credentials,
@@ -1242,8 +1352,14 @@ export function createResponsesRuntime(options = {}) {
         }
         clearTimers();
         const result = snapshot(true);
-        if (liveEncoder?.snapshot().content) {
-          result.content = liveEncoder.snapshot().content;
+        // live 只是「已经流出去的那部分」；scanner.finish() 之后的终态可能更长
+        // （缓冲区里还有可见尾巴），用它覆盖会把尾巴吞掉，所以只在 live 更长时取 live。
+        const liveSnapshot = liveEncoder?.snapshot();
+        if (liveSnapshot?.content && liveSnapshot.content.length > result.content.length) {
+          result.content = liveSnapshot.content;
+        }
+        if (liveSnapshot?.reasoning && liveSnapshot.reasoning.length > result.reasoning.length) {
+          result.reasoning = liveSnapshot.reasoning;
         }
         if (result.calls.length > 1 && prepared.parallelToolCalls === false) {
           result.calls = result.calls.slice(0, 1);
@@ -1264,6 +1380,8 @@ export function createResponsesRuntime(options = {}) {
           previousResponseId,
           request: prepared,
         });
+        // 先关闭 live 的推理块，再对齐终态；终态里同源的 done 事件由 cancelEvents 去掉。
+        publishLive(liveEncoder?.reasoningSummaryDone());
         alignLiveOutputIds(finalBody);
         release({
           ok: true,
@@ -1271,9 +1389,16 @@ export function createResponsesRuntime(options = {}) {
           durationMs: now() - requestStarted,
           meta: {
             model: prepared.model,
+            // 与 dsh 的 decodeTokens/decodeMs 同口径：首增量 → 结束。
+            ttftMs: firstVisibleAt ? firstVisibleAt - requestStarted : 0,
+            decodeMs: firstVisibleAt ? now() - firstVisibleAt : 0,
             usage: {
               input_tokens: result.usage.prompt_tokens,
               output_tokens: result.usage.completion_tokens,
+              // 号池按 cache_read_input_tokens / cache_creation_input_tokens 记账；
+              // 这里不漏字段，面板的缓存命中率才不会恒为 0。
+              cache_read_input_tokens: Math.max(0, Number(result.usage.cached_tokens) || 0),
+              cache_creation_input_tokens: 0,
             },
           },
         });
@@ -1444,7 +1569,13 @@ export function createResponsesRuntime(options = {}) {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
       history,
-      continuationNudge: continuationNudgeEnabled(config),
+      continuationNudge: continuationNudgeApplies({
+        mode: continuationNudgeMode(config),
+        headers: req?.headers || null,
+        body,
+        hasToolLoop: responsesHasToolLoop(body),
+        protocol: 'responses',
+      }),
     });
     let attempt;
     try {
@@ -1487,7 +1618,13 @@ export function createResponsesRuntime(options = {}) {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
       history: previous.messages,
-      continuationNudge: continuationNudgeEnabled(config),
+      continuationNudge: continuationNudgeApplies({
+        mode: continuationNudgeMode(config),
+        headers: req?.headers || null,
+        body,
+        hasToolLoop: responsesHasToolLoop(body),
+        protocol: 'responses',
+      }),
     });
     if (body?.stream === true && !config.streaming) {
       throw new ApiError(400, 'streaming is disabled', { code: 'streaming_disabled' });
@@ -1612,7 +1749,12 @@ export function createResponsesRuntime(options = {}) {
           defaultModel: config.defaultModel,
           toolsEnabled: config.tools,
           history: history.messages,
-          continuationNudge: continuationNudgeEnabled(config),
+          // WebSocket 会话拿不到 HTTP 请求头，靠 client_metadata 与工具往返识别。
+          continuationNudge: continuationNudgeApplies({
+            mode: continuationNudgeMode(config),
+            body: command,
+            hasToolLoop: responsesHasToolLoop(command),
+          }),
         });
       } catch (error) {
         send({ type: 'error', error: { code: error.code || 'invalid_request', message: error.message } });

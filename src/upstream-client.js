@@ -135,14 +135,29 @@ export function createUpstreamClient({
   baseUrl,
   timeoutMs,
 } = {}) {
-  const apiConfig = loadConfig().apiCompat || {};
-  const endpoint = String(baseUrl || apiConfig.upstreamBaseUrl || DEFAULT_BASE_URL)
-    .replace(/\/+$/, '');
-  const requestTimeoutMs = Number(timeoutMs ?? apiConfig.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  // 端点与超时都做成「每次请求读一次配置」：管理页保存后立刻生效。
+  // 以前是启动时把值固化进闭包，PATCH 返回 200、页面显示已保存，但真正发请求还是老地址，
+  // 属于最糟的那种假热更新——看起来生效了，实际要重启。
+  const pinnedEndpoint = baseUrl === undefined ? null : String(baseUrl).replace(/\/+$/, '');
+  const pinnedTimeoutMs = timeoutMs === undefined ? null : Number(timeoutMs);
+
+  function currentEndpoint() {
+    if (pinnedEndpoint !== null) return pinnedEndpoint;
+    const live = loadConfig().apiCompat || {};
+    return String(live.upstreamBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
+  }
+
+  function currentTimeoutMs() {
+    if (pinnedTimeoutMs !== null && Number.isFinite(pinnedTimeoutMs)) return pinnedTimeoutMs;
+    const live = loadConfig().apiCompat || {};
+    return Number(live.timeoutMs) > 0 ? Number(live.timeoutMs) : DEFAULT_TIMEOUT_MS;
+  }
 
   return {
     get endpoint() {
-      return endpoint;
+      // 解析器（api-server 的模型目录缓存键）每次读都会拿到当前值；
+      // 换地址后缓存键随之变化，不会继续复用旧 endpoint 的目录快照。
+      return currentEndpoint();
     },
 
     async chat({
@@ -181,13 +196,13 @@ export function createUpstreamClient({
 
       return request(
         fetchImpl,
-        `${endpoint}/v2/chat/completions`,
+        `${currentEndpoint()}/v2/chat/completions`,
         {
           method: 'POST',
           headers,
           body: JSON.stringify(prepared),
         },
-        { signal, timeoutMs: requestTimeoutMs },
+        { signal, timeoutMs: currentTimeoutMs() },
       );
     },
 
@@ -195,7 +210,7 @@ export function createUpstreamClient({
       if (!credentials.refreshToken) throw new Error('账号没有可用的 refresh token');
       const response = await request(
         fetchImpl,
-        `${endpoint}/v2/plugin/auth/token/refresh`,
+        `${currentEndpoint()}/v2/plugin/auth/token/refresh`,
         {
           method: 'POST',
           headers: {
@@ -207,7 +222,7 @@ export function createUpstreamClient({
           },
           body: '{}',
         },
-        { timeoutMs: requestTimeoutMs },
+        { timeoutMs: currentTimeoutMs() },
       );
       const document = await readJsonResponse(response, 'token refresh');
       const data = document?.data;
@@ -225,7 +240,7 @@ export function createUpstreamClient({
     async models(credentials) {
       const response = await request(
         fetchImpl,
-        `${endpoint}/v2/enterprises/personal/models`,
+        `${currentEndpoint()}/v2/enterprises/personal/models`,
         {
           method: 'GET',
           headers: {
@@ -234,7 +249,7 @@ export function createUpstreamClient({
             accept: 'application/json',
           },
         },
-        { timeoutMs: requestTimeoutMs },
+        { timeoutMs: currentTimeoutMs() },
       );
       return readJsonResponse(response, 'models');
     },

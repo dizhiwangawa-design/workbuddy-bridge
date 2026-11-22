@@ -14,54 +14,142 @@ const MAX_PARTIAL_BYTES = 8 * 1024 * 1024;
 const WRITE_TIMEOUT_MS = 2000;
 const MAX_PERSISTED_TEXT_BYTES = 256 * 1024;
 
+/**
+ * Worker 的 execArgv 白名单。
+ *
+ * 原实现只滤掉 `--eval` 家族，其余照搬 `process.execArgv`。问题是 `node --test`
+ * 会把整族 test-runner 参数塞进 execArgv（`--test-isolation=process`、
+ * `--test-coverage-*`、`--node-snapshot`、`--tls-cipher-list=…` 等），其中好几个
+ * 对普通 worker 是非法参数，worker 起不来，每条持久化写入都报
+ * `ERR_WORKER_INVALID_EXEC_ARGV`——表现出来就像持久化功能坏了。
+ *
+ * 这些参数只配置运行器本身，对 worker 没有任何意义；而 worker 只跑 SQLite 写入，
+ * 真正需要继承的是「加载器行为」这一类。所以改成白名单：只转发明确安全的项。
+ */
+const WORKER_EXEC_ARGV_ALLOW = [
+  '--experimental-addon-modules',
+  '--max-http-header-size',
+  '--max-old-space-size',
+  '--enable-source-maps',
+  '--no-warnings',
+  '--import',
+  '--loader',
+  '--experimental-loader',
+  '--conditions',
+  '--experimental-vm-modules',
+  '--preserve-symlinks',
+];
+
 function workerExecArgv(args = process.execArgv) {
   const filtered = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === '--input-type' || arg === '--eval' || arg === '--print'
-      || arg === '-e' || arg === '-p') {
-      index += 1;
-      continue;
-    }
-    if (arg.startsWith('--input-type=') || arg.startsWith('--eval=')
-      || arg.startsWith('--print=')) {
-      continue;
-    }
+    const name = arg.split('=')[0];
+    if (!WORKER_EXEC_ARGV_ALLOW.includes(name)) continue;
     filtered.push(arg);
   }
   return filtered;
 }
 
+/** 每个文本槽的保底配额。保证大补丁不会把后面的 assistant 消息清成空串。 */
+const PER_ITEM_FLOOR_BYTES = 4 * 1024;
+
+/** 截断标记写入条数上限，避免标记本身吃掉预算。 */
+const TRUNCATION_MARK_CAP = 64;
+
+function truncationMark(droppedBytes) {
+  return `…[bridge-truncated: ${droppedBytes} bytes]`;
+}
+
+/**
+ * 持久化前的文本裁剪。
+ *
+ * 旧实现是**单一顺序预算**：从头到尾消耗 256KB，谁排在后面谁被清空。实测一段
+ * 300KB 的 `apply_patch` 之后，`function_call.arguments` 与随后的 assistant 消息
+ * 双双变成空串 —— 回放时模型看到的是残缺对话，`arguments: ""` 还是非法 JSON。
+ *
+ * 现在改成两步：
+ *   1. **保底**：每个文本槽先拿走 min(自身字节, PER_ITEM_FLOOR_BYTES)，
+ *      保证每条消息 / 每个工具参数都至少留下开头一段。
+ *   2. **余额**：剩余预算再按原顺序分配给超出保底的部分。
+ * 截断处写标记，让回放时能看出「这里缺内容」，而不是看到空串。
+ */
 export function compactResponseForStore(response) {
-  let textBudget = MAX_PERSISTED_TEXT_BYTES;
-  const clip = (value) => {
-    const text = String(value ?? '');
-    const bytes = Buffer.byteLength(text, 'utf8');
-    if (bytes <= textBudget) {
-      textBudget -= bytes;
-      return text;
-    }
-    const kept = textBudget > 0 ? utf8Prefix(text, textBudget) : '';
-    textBudget = 0;
-    return kept;
-  };
+  // 先克隆再写。入参是最终响应体，调用方可能还在读它（发送、重试、resumedPrior），
+  // 原地改写会污染外部状态；旧实现用 spread 生成新对象，这里保持同样的不可变语义。
   const output = (response?.output || []).map((item) => {
-    if (item?.type === 'message') return {
-      ...item,
-      content: (item.content || []).map((part) => (
-        part?.type === 'output_text' ? { ...part, text: clip(part.text) } : part
-      )),
-    };
-    if (item?.type === 'reasoning') return {
-      ...item,
-      summary: (item.summary || []).map((part) => (
-        part?.type === 'summary_text' ? { ...part, text: clip(part.text) } : part
-      )),
-    };
-    if (item?.type === 'custom_tool_call') return { ...item, input: clip(item.input) };
-    if (item?.type === 'function_call') return { ...item, arguments: clip(item.arguments) };
+    if (item?.type === 'message') {
+      return { ...item, content: (item.content || []).map((part) => ({ ...part })) };
+    }
+    if (item?.type === 'reasoning') {
+      return { ...item, summary: (item.summary || []).map((part) => ({ ...part })) };
+    }
+    if (item?.type === 'custom_tool_call' || item?.type === 'function_call') {
+      return { ...item };
+    }
     return item;
   });
+
+  // 把所有文本槽按出现顺序收集成扁平列表，才能做「先保底、后余额」的两轮分配。
+  const slots = [];
+  for (const item of output) {
+    if (item?.type === 'message') {
+      for (const part of item.content) {
+        if (part?.type === 'output_text') slots.push({ owner: part, key: 'text', kind: 'text' });
+      }
+    } else if (item?.type === 'reasoning') {
+      for (const part of item.summary) {
+        if (part?.type === 'summary_text') slots.push({ owner: part, key: 'text', kind: 'text' });
+      }
+    } else if (item?.type === 'custom_tool_call') {
+      slots.push({ owner: item, key: 'input', kind: 'text' });
+    } else if (item?.type === 'function_call') {
+      slots.push({ owner: item, key: 'arguments', kind: 'json' });
+    }
+  }
+  if (!slots.length) return { ...response, output };
+
+  for (const slot of slots) {
+    slot.text = String(slot.owner[slot.key] ?? '');
+    slot.bytes = Buffer.byteLength(slot.text, 'utf8');
+  }
+  const floors = slots.map((slot) => Math.min(slot.bytes, PER_ITEM_FLOOR_BYTES));
+  const floorTotal = floors.reduce((sum, value) => sum + value, 0);
+
+  // 余额不足以覆盖全部超额时，按顺序（从旧到新）分配，与旧行为的方向一致，
+  // 区别只在于每条都已经拿到保底。
+  let remaining = Math.max(0, MAX_PERSISTED_TEXT_BYTES - floorTotal);
+  const allowances = slots.map((slot, index) => {
+    const extra = slot.bytes - floors[index];
+    const granted = Math.min(extra, remaining);
+    remaining -= granted;
+    return floors[index] + granted;
+  });
+
+  let marked = 0;
+  for (const [index, slot] of slots.entries()) {
+    const allowance = allowances[index];
+    if (allowance >= slot.bytes) continue;
+    const dropped = slot.bytes - allowance;
+    const mark = marked < TRUNCATION_MARK_CAP ? truncationMark(dropped) : '';
+    if (mark) marked += 1;
+    const markBytes = Buffer.byteLength(mark, 'utf8');
+    const room = Math.max(0, allowance - markBytes);
+    const kept = room > 0 ? utf8Prefix(slot.text, room) : '';
+    if (slot.kind === 'json') {
+      // 截断的 arguments 必须是合法 JSON，否则回放会拿到坏参数。
+      // preview 也要收进配额，别让占位符本身把预算顶穿。
+      const previewRoom = Math.max(0, allowance - 96);
+      slot.owner[slot.key] = JSON.stringify({
+        _bridge_truncated: true,
+        bytes: slot.bytes,
+        preview: kept.slice(0, Math.min(512, previewRoom)),
+      });
+    } else {
+      slot.owner[slot.key] = `${kept}${mark}`;
+    }
+  }
+
   return { ...response, output };
 }
 

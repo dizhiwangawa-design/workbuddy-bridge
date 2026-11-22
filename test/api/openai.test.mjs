@@ -361,6 +361,7 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
     },
     wb_reasoning: {
       form: 'supported',
+      known: true,
       supported_efforts: ['low', 'high', 'max'],
       declared_effort: null,
       default_effort: 'high',
@@ -476,6 +477,8 @@ const CHAT_SINGLE_MEDIUM = {
 
 const CHAT_NO_REASONING = {
   form: 'none',
+  // 「上游明确说这个模型不支持推理」，与「元数据没提」不同，故 known:true。
+  known: true,
   efforts: [],
   declaredEffort: null,
   defaultEffort: null,
@@ -888,8 +891,17 @@ test('OpenAI SSE 流式文本、思考提示与多轮工具完成', async (t) =>
   assert.match(second, /"finish_reason":"stop"/);
   assert.match(second, /data: \[DONE\]/);
   assert.equal(upstreamBodies.length, 2);
-  assert.equal(upstreamBodies[1].messages.at(-1).role, 'tool');
-  assert.equal(upstreamBodies[1].messages.at(-1).tool_call_id, 'call_read');
+  // 约束插在最后一条 user 之后，所以末尾仍是 tool 结果；assistant(tool_calls)
+  // 与 tool 结果紧邻。
+  const secondMessages = upstreamBodies[1].messages;
+  assert.equal(secondMessages.at(-1).role, 'tool');
+  assert.equal(secondMessages.at(-1).tool_call_id, 'call_read');
+  assert.equal(secondMessages.at(-2).role, 'assistant');
+  assert.equal(
+    secondMessages.filter((message) => JSON.stringify(message.content).includes('运行约束')).length,
+    1,
+    '约束只注入一次',
+  );
 });
 
 test('OpenAI 工具结果引用缺失或工具开关关闭时返回明确错误', () => {
@@ -1670,3 +1682,319 @@ test('OpenAI Chat 租约释放保留客户端 Key 归因', async () => {
   assert.equal(released[0].result.meta.clientKeyId, 'key-chat');
   assert.equal(released[0].result.meta.clientKeyName, 'desktop');
 });
+
+test('Chat 透传 prompt 缓存命中明细', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4010,"completion_tokens":12,"total_tokens":4022,'
+      + '"prompt_cache_hit_tokens":3840,"prompt_tokens_details":{"cached_tokens":3840}}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'cache' }],
+      reasoning_effort: 'high',
+      stream: true,
+    }),
+  });
+  const text = await response.text();
+  const usage = text.split('\n')
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trim())
+    .filter((payload) => payload && payload !== '[DONE]')
+    .map((payload) => JSON.parse(payload))
+    .map((event) => event.usage)
+    .filter(Boolean)
+    .at(-1);
+
+  assert.equal(usage.prompt_tokens, 4010);
+  assert.equal(usage.prompt_tokens_details.cached_tokens, 3840);
+});
+
+test('Chat 上游不报缓存命中时不输出该字段', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(
+      'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  }, {
+    reasoningCatalogue: declarationCatalogue(CHAT_THREE_RUNG),
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'plain' }],
+      reasoning_effort: 'high',
+      stream: true,
+    }),
+  });
+  const text = await response.text();
+  const usage = text.split('\n')
+    .filter((line) => line.startsWith('data:'))
+    .map((line) => line.slice(5).trim())
+    .filter((payload) => payload && payload !== '[DONE]')
+    .map((payload) => JSON.parse(payload))
+    .map((event) => event.usage)
+    .filter(Boolean)
+    .at(-1);
+
+  assert.equal(usage.prompt_tokens_details, undefined);
+});
+
+test('Chat 显式 reasoning_effort=none 时隐藏上游仍返回的推理正文', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"reasoning_content":"secret reasoning"}}]}\n\n');
+    res.write('data: {"choices":[{"delta":{"reasoning_content":" still secret"}}]}\n\n');
+    res.write('data: {"choices":[{"delta":{"content":"answer"}}]}\n\n');
+    res.end(
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6,'
+      + '"completion_tokens_details":{"reasoning_tokens":2}}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'answer without thinking' }],
+      reasoning_effort: 'none',
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal('reasoning_content' in body.choices[0].message, false);
+  assert.equal(body.choices[0].message.content, 'answer');
+  assert.equal(body.usage.completion_tokens_details.reasoning_tokens, 2);
+});
+
+test('Chat 显式 reasoning_effort=none 的流式响应不发推理增量', async (t) => {
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"choices":[{"delta":{"reasoning_content":"secret"}}]}\n\n');
+    res.end(
+      'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'quiet' }],
+      reasoning_effort: 'none',
+    }),
+  });
+  const text = await response.text();
+  assert.equal(text.includes('secret'), false);
+  assert.equal(text.includes('reasoning_content'), false);
+});
+
+test('Chat 显式档位与未声明档位都不受抑制逻辑影响（回归守卫）', async (t) => {
+  let round = 0;
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    round += 1;
+    const tag = round === 1 ? 'high' : 'unset';
+    res.end(
+      `data: {"choices":[{"delta":{"reasoning_content":"think-${tag}"}}]}\n\n`
+      + 'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+      + '"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n'
+      + 'data: [DONE]\n\n',
+    );
+  });
+
+  const withEffort = await (await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'think' }],
+      reasoning_effort: 'high',
+    }),
+  })).json();
+  assert.equal(withEffort.choices[0].message.reasoning_content, 'think-high');
+
+  const withoutEffort = await (await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'plain' }],
+    }),
+  })).json();
+  assert.equal(withoutEffort.choices[0].message.reasoning_content, 'think-unset');
+});
+
+
+test('Chat 推理通道里的 DSML 调用被剥离并执行', async (t) => {
+  const BAR = '\uFF5C\uFF5C';
+  const dsml = `<${BAR}DSML${BAR} calls><${BAR}DSML${BAR} invoke name="run_shell">`
+    + `<${BAR}DSML${BAR} parameter name="command" string="true">ls -la</${BAR}DSML${BAR} parameter>`
+    + `</${BAR}DSML${BAR} invoke></${BAR}DSML${BAR} calls>`;
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: `I should call it: ${dsml}` } }] })}\n\n`);
+    res.end(
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } })}\n\n`
+      + 'data: [DONE]\n\n',
+    );
+  });
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'go' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'run_shell',
+          description: 'run',
+          parameters: { type: 'object', properties: { command: { type: 'string' } } },
+        },
+      }],
+    }),
+  });
+  const body = await response.json();
+  const serialized = JSON.stringify(body);
+
+  assert.equal(response.status, 200);
+  assert.equal(serialized.includes('DSML'), false, serialized);
+  const call = body.choices[0].message.tool_calls[0];
+  assert.deepEqual(JSON.parse(call.function.arguments), { command: 'ls -la' });
+  assert.equal(body.choices[0].message.reasoning_content, 'I should call it: ');
+});
+
+test('Chat 推理通道的 DSML 在流式下不泄漏且调用完整', async (t) => {
+  const BAR = '\uFF5C\uFF5C';
+  const dsml = `<${BAR}DSML${BAR} calls><${BAR}DSML${BAR} invoke name="run_shell">`
+    + `<${BAR}DSML${BAR} parameter name="command" string="true">pwd</${BAR}DSML${BAR} parameter>`
+    + `</${BAR}DSML${BAR} invoke></${BAR}DSML${BAR} calls>`;
+  const split = Math.floor(dsml.length / 2);
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: `plan: ${dsml.slice(0, split)}` } }] })}\n\n`);
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: dsml.slice(split) } }] })}\n\n`);
+    res.end(
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } })}\n\n`
+      + 'data: [DONE]\n\n',
+    );
+  });
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'go' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'run_shell',
+          description: 'run',
+          parameters: { type: 'object', properties: { command: { type: 'string' } } },
+        },
+      }],
+    }),
+  });
+  const raw = await response.text();
+  assert.equal(raw.includes('DSML'), false, raw);
+  const events = parseSse(raw);
+  const args = events
+    .flatMap((event) => event.choices?.[0]?.delta?.tool_calls || [])
+    .map((call) => call.function?.arguments || '')
+    .join('');
+  assert.deepEqual(JSON.parse(args), { command: 'pwd' });
+});
+
+test('Chat 未声明工具时推理通道的 DSML 只清洗不生成调用', async (t) => {
+  const BAR = '\uFF5C\uFF5C';
+  const dsml = `<${BAR}DSML${BAR} calls><${BAR}DSML${BAR} invoke name="run_shell">`
+    + `<${BAR}DSML${BAR} parameter name="command" string="true">ls</${BAR}DSML${BAR} parameter>`
+    + `</${BAR}DSML${BAR} invoke></${BAR}DSML${BAR} calls>`;
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: `maybe: ${dsml}` } }] })}\n\n`);
+    res.end(
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } })}\n\n`
+      + 'data: [DONE]\n\n',
+    );
+  });
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'go' }],
+    }),
+  });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.choices[0].message.tool_calls, undefined);
+  assert.equal(body.choices[0].message.reasoning_content, 'maybe: ');
+  assert.equal(JSON.stringify(body).includes('DSML'), false);
+});
+
+
+test('Chat 流式正文以尖括号结尾时不得丢字符', async (t) => {
+  const cases = [
+    ['plain', 'no markers here at all'],
+    ['less-than', 'trailing less-than <'],
+    ['bar', `bar-style <\uFF5C`],
+    ['double-bar', `prefix <\uFF5C\uFF5C`],
+  ];
+  let current = '';
+  const { baseUrl } = await startFixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    const chunks = [];
+    for (let i = 0; i < current.length; i += 4) {
+      chunks.push(`data: ${JSON.stringify({ choices: [{ delta: { content: current.slice(i, i + 4) } }] })}\n\n`);
+    }
+    chunks.push(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } })}\n\n`);
+    chunks.push('data: [DONE]\n\n');
+    res.end(chunks.join(''));
+  });
+
+  for (const [label, text] of cases) {
+    current = text;
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        stream: true,
+        messages: [{ role: 'user', content: 'go' }],
+      }),
+    });
+    const events = parseSse(await response.text());
+    const acc = events
+      .map((event) => event.choices?.[0]?.delta?.content || '')
+      .join('');
+    assert.equal(acc, text, `${label}: streamed text lost characters`);
+  }
+});
+

@@ -181,6 +181,8 @@ const SINGLE_MEDIUM = {
 
 const NO_REASONING = {
   form: 'none',
+  // 「上游明确说这个模型不支持推理」，与「元数据没提」不同，故 known:true。
+  known: true,
   efforts: [],
   declaredEffort: null,
   defaultEffort: null,
@@ -1866,6 +1868,73 @@ test('Responses parallel_tool_calls=false 不隐式强制工具调用', () => {
   assert.equal(prepared.parallelToolCalls, false);
 });
 
+// codex 的 web_search = "live" / "cached"（默认就是 live）和 dsh 的 web_fetch 都会把
+// 托管工具塞进每一次请求，上游没有执行器。以前这里直接 400，整轮对话直接失败；
+// 现在应该静默剔除。
+test('Responses 跳过上游不支持的托管工具而不是 400', async (t) => {
+  const received = [];
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    upstream(res, 'answer');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'search the web',
+      tools: [
+        { type: 'function', name: 'read', parameters: { type: 'object' } },
+        { type: 'web_search' },
+        { type: 'web_fetch' },
+        { type: 'web_search_preview' },
+      ],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.status, 'completed');
+  assert.deepEqual(received[0].tools.map((tool) => tool.function.name), ['read']);
+
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: 'only hosted tools',
+    tools: [{ type: 'web_search' }],
+  });
+  assert.equal(prepared.body.tools, undefined);
+  assert.equal(prepared.toolsDeclared, false);
+  assert.equal(prepared.toolChoice, 'auto');
+});
+
+test('Responses 把指向托管工具的 tool_choice 降级为 auto', async (t) => {
+  const received = [];
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    upstream(res, 'answer');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'forced search',
+      tools: [
+        { type: 'function', name: 'read', parameters: { type: 'object' } },
+        { type: 'web_search' },
+      ],
+      tool_choice: { type: 'web_search' },
+    }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.tool_choice, 'auto');
+  assert.equal(received[0].tool_choice, undefined);
+});
+
 test('Responses 拒绝非法 parallel_tool_calls 与 tool_choice 类型', () => {
   const tools = [{ type: 'function', name: 'read', parameters: { type: 'object' } }];
   assert.throws(() => responses.prepareResponsesRequest({
@@ -1884,7 +1953,7 @@ test('Responses 拒绝非法 parallel_tool_calls 与 tool_choice 类型', () => 
     model: 'deepseek-v4.1-flash',
     input: 'invalid choice type',
     tools,
-    tool_choice: { type: 'web_search' },
+    tool_choice: { type: 'file_id' },
   }), (error) => error.status === 400 && error.code === 'invalid_request');
 });
 
@@ -1997,7 +2066,7 @@ test('Responses 不支持工具与 file_id 使用明确 400', async (t) => {
     body: JSON.stringify({
       model: 'deepseek-v4.1-flash',
       input: 'hello',
-      tools: [{ type: 'web_search' }],
+      tools: [{ type: 'not_a_tool_type' }],
     }),
   });
   assert.equal(unsupported.status, 400);
@@ -2198,3 +2267,510 @@ async function waitFor(predicate, timeout = 1000) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+// ---------------------------------------------------------------------------
+// 冷目录：DeepSeek Harness 的真实场景。
+// 它的模型列表是手写的，从不调用 GET /v1/models，所以能力目录永远是冷的。
+// 旧行为是冷目录一律删掉 reasoning_effort，上游因此不再返回 reasoning_content。
+// ---------------------------------------------------------------------------
+test('Responses 能力目录未预热时透传客户端档位', async (t) => {
+  let received;
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    upstream(res, 'done');
+  }); // 不传 reasoningCatalogue：等价于目录冷
+
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'go',
+      reasoning: { effort: 'max' },
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(received.reasoning_effort, 'max');
+  assert.equal(body.reasoning.effort, 'max');
+});
+
+test('Responses 冷目录下客户端的 none 与未声明的行为保持不变', async (t) => {
+  const received = [];
+  const { baseUrl } = await fixture(t, async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    upstream(res, 'done');
+  });
+
+  for (const reasoning of [{ effort: 'none' }, undefined]) {
+    await fetch(`${baseUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        input: 'off',
+        ...(reasoning ? { reasoning } : {}),
+      }),
+    });
+  }
+
+  assert.equal(received[0].reasoning_effort, 'none');
+  assert.equal(received[1].reasoning_effort, 'none');
+});
+
+// ---------------------------------------------------------------------------
+// live 输出块生命周期：output_index 必须等于终态 output 的下标，
+// 每个块只 closed 一次，推理增量必须有配对的 done 事件。
+// ---------------------------------------------------------------------------
+test('Responses 正文与推理的 output_index 不冲突且与终态顺序一致', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    // 真实上游可能先给正文，再给推理
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: '先写正文。' } }] }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: '然后我才思考。' } }] }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: {}, finish_reason: 'stop' }] }));
+    res.end('data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', stream: true, store: false, input: 'mix' }),
+  });
+  const events = parseSse(await response.text());
+  const added = events.filter((e) => e.type === 'response.output_item.added');
+  const indexes = added.map((e) => e.output_index);
+  assert.equal(new Set(indexes).size, indexes.length, `duplicate output_index: ${indexes}`);
+
+  const doneIds = events
+    .filter((e) => e.type === 'response.output_item.done')
+    .map((e) => e.item?.id);
+  assert.equal(new Set(doneIds).size, doneIds.length, `duplicate output_item.done: ${doneIds}`);
+
+  // 顺序不变量：流里的 output_index 必须等于该 item 在终态 output 里的下标
+  const terminal = events.find((e) => e.type === 'response.completed');
+  terminal.response.output.forEach((item, i) => {
+    const addedEvent = added.find((e) => e.item?.id === item.id);
+    assert.equal(
+      addedEvent?.output_index,
+      i,
+      `item ${item.id} (${item.type}) 的流索引与终态下标不一致`,
+    );
+  });
+});
+
+test('Responses 推理增量必须带出结束事件', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: '想一想' } }] }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] }));
+    res.end('data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', stream: true, store: false, input: 'think' }),
+  });
+  const events = parseSse(await response.text());
+  const at = (type) => events.findIndex((e) => e.type === type);
+  assert.ok(at('response.reasoning_summary_text.delta') >= 0);
+  assert.ok(at('response.reasoning_summary_text.done') > at('response.reasoning_summary_text.delta'));
+  assert.ok(at('response.reasoning_summary_part.done') > 0);
+  assert.ok(at('response.reasoning_summary_text.done') < at('response.completed'));
+
+  const textDone = events.find((e) => e.type === 'response.reasoning_summary_text.done');
+  assert.equal(textDone.item_id, events.find((e) => e.type === 'response.output_item.added' && e.item?.type === 'reasoning').item.id);
+});
+
+test('Responses 透传上游缓存命中 token', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'ok' } }] }));
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: 4010,
+        completion_tokens: 12,
+        total_tokens: 4022,
+        prompt_cache_hit_tokens: 3840,
+        prompt_tokens_details: { cached_tokens: 3840 },
+      },
+    }));
+    res.end('data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', input: 'cache' }),
+  });
+  const body = await response.json();
+  assert.equal(body.usage.input_tokens, 4010);
+  assert.equal(body.usage.input_tokens_details.cached_tokens, 3840);
+  assert.equal(body.usage.total_tokens, 4022);
+});
+
+test('Responses 上游不报缓存命中时保持 0', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'ok' } }] }));
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+    }));
+    res.end('data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', input: 'plain' }),
+  });
+  const body = await response.json();
+  assert.equal(body.usage.input_tokens_details.cached_tokens, 0);
+});
+
+test('Responses 显式 reasoning.effort=none 时隐藏上游仍返回的推理正文', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: 'secret reasoning' } }] }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: ' still secret' } }] }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'answer' } }] }));
+    res.end(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+    }) + 'data: [DONE]\n\n');
+  });
+
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'answer without thinking',
+      reasoning: { effort: 'none' },
+    }),
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.output.some((item) => item.type === 'reasoning'), false);
+  assert.equal(body.output.find((item) => item.type === 'message').content[0].text, 'answer');
+  assert.equal(JSON.stringify(body).includes('secret'), false);
+});
+
+test('Responses 显式档位仍照常透出推理正文（回归守卫）', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: 'inspect' } }] }));
+    res.end(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+    }) + 'data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'think hard',
+      reasoning: { effort: 'max' },
+    }),
+  });
+  const body = await response.json();
+  assert.equal(body.output[0].type, 'reasoning');
+  assert.equal(body.output[0].summary[0].text, 'inspect');
+});
+
+test('Responses 未声明档位时保持既有行为：推理正文照常透出', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: 'inspect' } }] }));
+    res.end(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+    }) + 'data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', input: 'hello' }),
+  });
+  const body = await response.json();
+  assert.equal(body.output[0].type, 'reasoning');
+  assert.equal(body.output[0].summary[0].text, 'inspect');
+});
+
+test('Responses 流式显式 effort=none 时不发推理增量事件', async (t) => {
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: 'secret' } }] }));
+    res.end(encodeSseEvent('message', {
+      choices: [{ delta: { content: 'answer' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+    }) + 'data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: false,
+      input: 'quiet',
+      reasoning: { effort: 'none' },
+    }),
+  });
+  const events = parseSse(await response.text());
+  assert.equal(events.some((event) => event.type === 'response.reasoning_summary_text.delta'), false);
+  assert.equal(events.some((event) => JSON.stringify(event).includes('secret')), false);
+});
+
+
+test('Responses 推理通道里的 DSML 调用被剥离并执行', async (t) => {
+  const BAR = '\uFF5C\uFF5C';
+  const dsml = `<${BAR}DSML${BAR} calls><${BAR}DSML${BAR} invoke name="run_shell">`
+    + `<${BAR}DSML${BAR} parameter name="command" string="true">ls -la</${BAR}DSML${BAR} parameter>`
+    + `</${BAR}DSML${BAR} invoke></${BAR}DSML${BAR} calls>`;
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: { reasoning_content: `I should call it: ${dsml}` } }],
+    }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'done' } }] }));
+    res.end(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5, completion_tokens: 5 },
+    }) + 'data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      input: 'go',
+      tools: [{
+        type: 'function',
+        name: 'run_shell',
+        description: 'run',
+        parameters: { type: 'object', properties: { command: { type: 'string' } } },
+      }],
+    }),
+  });
+  const body = await response.json();
+  const serialized = JSON.stringify(body);
+
+  assert.equal(response.status, 200);
+  assert.equal(serialized.includes('DSML'), false, serialized);
+  const call = body.output.find((item) => item.type === 'function_call');
+  assert.ok(call, serialized);
+  assert.deepEqual(JSON.parse(call.arguments), { command: 'ls -la' });
+  assert.equal(body.output.find((item) => item.type === 'reasoning').summary[0].text, 'I should call it: ');
+});
+
+test('Responses 推理通道的 DSML 在流式下不泄漏且调用完整', async (t) => {
+  const BAR = '\uFF5C\uFF5C';
+  const dsml = `<${BAR}DSML${BAR} calls><${BAR}DSML${BAR} invoke name="run_shell">`
+    + `<${BAR}DSML${BAR} parameter name="command" string="true">pwd</${BAR}DSML${BAR} parameter>`
+    + `</${BAR}DSML${BAR} invoke></${BAR}DSML${BAR} calls>`;
+  const split = Math.floor(dsml.length / 2);
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: { reasoning_content: `plan: ${dsml.slice(0, split)}` } }],
+    }));
+    res.write(encodeSseEvent('message', {
+      choices: [{ delta: { reasoning_content: dsml.slice(split) } }],
+    }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'done' } }] }));
+    res.end(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5, completion_tokens: 5 },
+    }) + 'data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      store: false,
+      input: 'go',
+      tools: [{
+        type: 'function',
+        name: 'run_shell',
+        description: 'run',
+        parameters: { type: 'object', properties: { command: { type: 'string' } } },
+      }],
+    }),
+  });
+  const raw = await response.text();
+  assert.equal(raw.includes('DSML'), false, raw);
+  const events = parseSse(raw);
+  const terminal = events.find((event) => event.type === 'response.completed');
+  const call = terminal.response.output.find((item) => item.type === 'function_call');
+  assert.ok(call, JSON.stringify(terminal.response.output));
+  assert.deepEqual(JSON.parse(call.arguments), { command: 'pwd' });
+});
+
+test('Responses 推理通道的畸形 DSML 只丢弃片段，不判整轮失败', async (t) => {
+  const BAR = '\uFF5C\uFF5C';
+  const partial = `<${BAR}DSML${BAR} calls><${BAR}DSML${BAR} invoke name="run_shell">`;
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(encodeSseEvent('message', { choices: [{ delta: { reasoning_content: `bad ${partial}` } }] }));
+    res.write(encodeSseEvent('message', { choices: [{ delta: { content: 'still works' } }] }));
+    res.end(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5, completion_tokens: 5 },
+    }) + 'data: [DONE]\n\n');
+  });
+  const response = await fetch(`${baseUrl}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', input: 'go' }),
+  });
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.status, 'completed');
+  assert.equal(body.output.find((item) => item.type === 'message').content[0].text, 'still works');
+  assert.equal(JSON.stringify(body).includes('DSML'), false);
+});
+
+
+test('Responses 流式正文以尖括号结尾时不得丢字符', async (t) => {
+  const cases = [
+    ['plain', 'no markers here at all'],
+    ['less-than', 'trailing less-than <'],
+    ['bar', `bar-style <\uFF5C`],
+    ['double-bar', `prefix <\uFF5C\uFF5C`],
+  ];
+  let current = '';
+  const { baseUrl } = await fixture(t, (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    const chunks = [];
+    for (let i = 0; i < current.length; i += 4) {
+      chunks.push(encodeSseEvent('message', { choices: [{ delta: { content: current.slice(i, i + 4) } }] }));
+    }
+    chunks.push(encodeSseEvent('message', {
+      choices: [{ delta: {}, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 5, completion_tokens: 5 },
+    }));
+    chunks.push('data: [DONE]\n\n');
+    res.end(chunks.join(''));
+  });
+
+  for (const [label, text] of cases) {
+    current = text;
+    const response = await fetch(`${baseUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash', stream: true, store: false, input: 'go' }),
+    });
+    const events = parseSse(await response.text());
+    const delta = events
+      .filter((event) => event.type === 'response.output_text.delta')
+      .map((event) => event.delta)
+      .join('');
+    const terminal = events.find((event) => event.type === 'response.completed');
+    const final = terminal.response.output
+      .filter((item) => item.type === 'message')
+      .map((item) => item.content.map((part) => part.text).join(''))
+      .join('');
+    assert.equal(delta, text, `${label}: streamed deltas lost characters`);
+    assert.equal(final, text, `${label}: terminal text lost characters`);
+  }
+});
+
+
+test('Responses 租约把上游缓存命中写进号池记账字段', async () => {
+  const { createResponsesRuntime } = await import('../../src/api-responses.js');
+  const released = [];
+  const runtime = createResponsesRuntime({
+    pick: () => ({ name: 'cache-responses' }),
+    begin: () => {},
+    end: (account, result) => released.push({ account, result }),
+    readCredentials: () => ({
+      ok: true,
+      accessToken: 'test-access',
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    }),
+    upstreamClient: {
+      chat: async () => ({
+        status: 200,
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+              + '"usage":{"prompt_tokens":4010,"completion_tokens":12,"total_tokens":4022,'
+              + '"prompt_cache_hit_tokens":3840}}' + '\n\n'
+              + 'data: [DONE]' + '\n\n',
+            ));
+            controller.close();
+          },
+        }),
+      }),
+    },
+  });
+  const res = {
+    headersSent: false,
+    writable: true,
+    writableEnded: false,
+    destroyed: false,
+    writeHead() { this.headersSent = true; },
+    end() { this.writableEnded = true; },
+    write() { return true; },
+    on() {},
+    off() {},
+  };
+
+  await runtime.create({
+    req: { once() {}, off() {} },
+    res,
+    body: { model: 'deepseek-v4.1-flash', stream: false, store: false, input: 'cache' },
+    config: settings.getApiSettings(),
+  });
+
+  assert.equal(released.length, 1);
+  const usage = released[0].result.meta.usage;
+  assert.equal(usage.input_tokens, 4010);
+  assert.equal(usage.cache_read_input_tokens, 3840);
+});
+
+
+// —— 推理历史：不再被清空 ——
+
+test('historyForResponse 保留 reasoning 摘要，只更换 item 身份', () => {
+  const record = {
+    body: {
+      _bridgeMeta: { version: 1, outputOffset: 0 },
+      _bridgeInput: [],
+      output: [
+        { type: 'reasoning', id: 'rs_old', summary: [{ type: 'summary_text', text: '先读 a.js' }] },
+        { type: 'message', id: 'm1', role: 'assistant', content: [{ type: 'output_text', text: '改好了' }] },
+      ],
+    },
+  };
+  const [reasoning] = responses.historyForResponse(record);
+  assert.equal(reasoning.type, 'reasoning');
+  assert.notEqual(reasoning.id, 'rs_old');
+  assert.deepEqual(reasoning.summary, [{ type: 'summary_text', text: '先读 a.js' }]);
+});
+
+test('历史 reasoning 不进上游 messages，且不泄漏成可见文本', () => {
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: '先看语法树' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续' }] },
+    ],
+  });
+  // 上游没有 reasoning 通道；折成 assistant 正文会让模型把自己的思考当成
+  // 「上一轮说过的话」，进而在正文里沿用那个格式 —— 曾把标记泄漏给用户。
+  assert.deepEqual(prepared.body.messages.map((m) => m.role), ['user']);
+  assert.equal(JSON.stringify(prepared.body.messages).includes('先看语法树'), false);
+});

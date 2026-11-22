@@ -7,6 +7,9 @@ import path from 'node:path';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-admin-api-'));
 process.env.WB_BRIDGE_HOME = path.join(tmp, 'bridge');
 process.env.WB_ADMIN_TOKEN = 'admin-fixture';
+// 测试桩上游就起在 127.0.0.1，必须显式放行内网地址；
+// 生产默认禁止，见 src/api-settings.js 的 assertUpstreamHost。
+process.env.WB_ALLOW_PRIVATE_UPSTREAM = '1';
 
 const settings = await import('../../src/api-settings.js');
 const { startHttpServer } = await import('../../src/http.js');
@@ -297,4 +300,29 @@ test('Anthropic 工具探针走真实 HTTP runtime、号池租约与脱敏结果
     0,
   );
   assert.equal(pool.loadPool().accounts[accountName].today.req, 2);
+});
+
+test('管理页暴露回合续跑约束开关，PATCH 可改并回读', async () => {
+  await withServer(async (baseUrl) => {
+    const page = await adminFetch(baseUrl, '/admin');
+    const html = await page.text();
+    assert.match(html, /id="api-continuation-nudge-switch"/);
+    assert.match(html, /data-act="api-continuation-nudge-toggle"/);
+    assert.match(html, /回合续跑约束/);
+
+    const patched = await adminFetch(baseUrl, '/api/api-compat', {
+      method: 'PATCH',
+      body: JSON.stringify({ continuationNudge: false }),
+    });
+    assert.equal(patched.status, 200);
+    assert.equal((await patched.json()).continuationNudge, false);
+
+    const read = await adminFetch(baseUrl, '/api/api-compat');
+    assert.equal((await read.json()).continuationNudge, false);
+
+    await adminFetch(baseUrl, '/api/api-compat', {
+      method: 'PATCH',
+      body: JSON.stringify({ continuationNudge: true }),
+    });
+  });
 });
