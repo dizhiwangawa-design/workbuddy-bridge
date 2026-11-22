@@ -1,0 +1,26 @@
+# DeepSeek Harness 速度读数修复（可粘贴到 ~/.dsh/profiles/<profile>/cordis.patch.yml）
+#
+# 为什么需要它：上游 session-stats 的 decode 速度是
+#     tps = ΣoutputTokens / Σ(t_message − t_firstToken)
+# 而纯工具调用步的可见内容（参数 JSON）在上游是攒成一帧下发的，那个窗口塌成 0–3ms。
+# 实测两个真实会话：63.4% / 44.5% 的 output token 落在这种零窗口步里 → tps 527 / 252。
+#
+# 这个 fork 做两件事，都不改既有字段语义：
+#   1. 零窗口步（span <= 5ms）不进 decode 统计，分母不再被除零拉爆；
+#   2. 新增 decodeFrameTokens / decodeTextTokens / decodeReasoningTokens，
+#      把 provider 报的 output token 按通道字符占比拆开，让读者能只按「答案」算速度。
+#
+# 前置：把本目录拷到 dsh 能解析的位置，并软链进 profile 的 node_modules
+# （本机做法：~/.dsh/plugins/dsh-session-stats-patched + profile 里一条软链）。
+# stateVersion 从 1 → 2，旧缓存行会被丢弃重算，不会混读。
+#
+# 注意：loader 不允许只按 id 改 name —— 会报
+#   patch: name mismatch for "session-stats" (expected "@deepseek-ai/dsh-session-stats",
+#   got "..."), skipping
+# 所以必须「禁用原来那行 + insert 一行新的」。
+
+- id: session-stats
+  disabled: true
+- insert:
+    - id: session-stats-patched
+      name: 'dsh-session-stats-patched'
