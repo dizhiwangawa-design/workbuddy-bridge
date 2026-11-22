@@ -674,3 +674,79 @@ test('生产 WebSocket 心跳固定为 Ping 15 秒、Pong 宽限 10 秒', () => 
   assert.equal(WS_PING_MS, 15000);
   assert.equal(WS_PONG_GRACE_MS, 10000);
 });
+
+// —— 持久化预算：按条目保底，而不是顺序吃光 ——
+
+test('大工具参数不再把后续 assistant 消息清成空串', () => {
+  const bigPatch = '*** Begin Patch\n' + '+x\n'.repeat(120 * 1024) + '*** End Patch\n';
+  const compacted = compactResponseForStore({
+    output: [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: '先打补丁。' }] },
+      { type: 'custom_tool_call', id: 'c1', call_id: 'call_1', name: 'apply_patch', input: bigPatch },
+      { type: 'function_call', id: 'f1', call_id: 'call_2', name: 'exec_command', arguments: '{"command":["node","test.mjs"]}' },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '测试通过，结论：没有回归。' }] },
+    ],
+  });
+  const message = compacted.output.find((item) => item.type === 'message');
+  assert.equal(message.content[0].text, '测试通过，结论：没有回归。');
+  const call = compacted.output.find((item) => item.type === 'function_call');
+  assert.equal(call.arguments, '{"command":["node","test.mjs"]}');
+  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= 512 * 1024);
+});
+
+test('截断处写标记，回放时能看出缺内容', () => {
+  const compacted = compactResponseForStore({
+    output: [{
+      type: 'custom_tool_call',
+      id: 'c1',
+      call_id: 'call_1',
+      name: 'apply_patch',
+      input: 'x'.repeat(400 * 1024),
+    }],
+  });
+  assert.match(compacted.output[0].input, /\[bridge-truncated: \d+ bytes\]$/);
+  assert.equal(compacted.output[0].input.includes('\uFFFD'), false);
+});
+
+test('被截断的 function_call.arguments 仍是合法 JSON', () => {
+  const compacted = compactResponseForStore({
+    output: [
+      { type: 'custom_tool_call', id: 'c1', call_id: 'call_1', name: 'apply_patch', input: 'A'.repeat(300 * 1024) },
+      { type: 'function_call', id: 'f1', call_id: 'call_2', name: 'run', arguments: 'B'.repeat(300 * 1024) },
+    ],
+  });
+  const call = compacted.output.find((item) => item.type === 'function_call');
+  const parsed = JSON.parse(call.arguments);
+  assert.equal(parsed._bridge_truncated, true);
+  assert.equal(parsed.bytes, 300 * 1024);
+  assert.equal(typeof parsed.preview, 'string');
+});
+
+test('每个文本槽都有保底配额，先到先得不再是零和', () => {
+  const compacted = compactResponseForStore({
+    output: [
+      { type: 'custom_tool_call', id: 'c1', call_id: '1', name: 'apply_patch', input: 'A'.repeat(300 * 1024) },
+      { type: 'function_call', id: 'f1', call_id: '2', name: 'run', arguments: 'B'.repeat(300 * 1024) },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '结论' }] },
+    ],
+  });
+  const message = compacted.output.find((item) => item.type === 'message');
+  assert.equal(message.content[0].text, '结论');
+  assert.ok(compacted.output[0].input.length > 0, '第一个槽也要有内容');
+  assert.equal(JSON.parse(compacted.output[1].arguments)._bridge_truncated, true);
+});
+
+test('持久化裁剪不修改入参响应对象', () => {
+  const big = 'A'.repeat(400 * 1024);
+  const original = {
+    output: [
+      { type: 'custom_tool_call', id: 'c1', call_id: '1', name: 'apply_patch', input: big },
+      { type: 'function_call', id: 'f1', call_id: '2', name: 'run', arguments: 'B'.repeat(400 * 1024) },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: '结论' }] },
+    ],
+  };
+  const snapshot = JSON.stringify(original);
+  compactResponseForStore(original);
+  // 入参是最终响应体，调用方可能还在读它；原地改写会污染外部状态。
+  assert.equal(JSON.stringify(original), snapshot);
+});

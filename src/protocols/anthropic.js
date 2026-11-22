@@ -101,7 +101,17 @@ function normalizeMessages(messages, warnings) {
       const toolCalls = [];
       const toolIds = new Set();
       for (const block of message.content) {
-        if (block?.type === 'thinking' || block?.type === 'redacted_thinking') {
+        if (block?.type === 'thinking') {
+          // 上游没有原生 thinking 通道回放，但整块丢掉会让「依赖推理连续性」的
+          // 多轮对话失忆（模型看不到自己上一轮想过什么）。保留成可见文本，
+          // 上游接受这种承载方式（实测 200）。
+          if (typeof block.thinking === 'string' && block.thinking) {
+            texts.push(`<prior_reasoning>${block.thinking}</prior_reasoning>`);
+          }
+          continue;
+        }
+        if (block?.type === 'redacted_thinking') {
+          // 加密思考块没有可读内容，也没有可用的解密通道，只能丢弃。
           continue;
         }
         if (block?.cache_control !== undefined) {
@@ -262,6 +272,7 @@ export function normalizeAnthropicRequest(body, {
     messages: withContinuationNudge(messages, {
       tools: tools.length,
       enabled: continuationNudge,
+      toolChoice,
     }),
     tools,
     toolChoice,

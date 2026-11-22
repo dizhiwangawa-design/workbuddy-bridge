@@ -2,6 +2,111 @@
 
 ## Unreleased
 
+### Performance
+
+- **The pool no longer parses and rewrites `pool.json` on every request.**
+  `beginTask` and `endTask` each did one `loadPool()` + one `savePool()`, i.e.
+  two full parses and two full rewrites of a ~100 KB file per request (24
+  writes / ~2.3 MB per 12-request wave). Reads now go through an in-memory copy
+  that is re-parsed only when the disk signature (ino + mtime + size) changes,
+  and writes are split in two: configuration and cooldown changes still hit
+  disk synchronously, while statistics (`lastUsedAt`, req/token/ms, series
+  samples, the round-robin cursor) are coalesced — flushed 500 ms after traffic
+  goes quiet, and at most once every 2 s under sustained load. Measured with
+  `.wbperf/bench-pool-writes.mjs`: one 12-request wave drops from 24 writes /
+  2.34 MB to 1 write / 96 KB, `beginTask` from 1.04 ms to 0.01 ms and
+  `endTask` from 1.11 ms to 0.02 ms.
+  Coalesced statistics are flushed on `exit` and on `SIGINT`/`SIGTERM`/`SIGHUP`;
+  the signal hooks only call `process.exit(0)` when no other handler is
+  registered, so Ctrl+C keeps working for embedders.
+  When another process rewrites the file (`wb pool`, a second bridge), the
+  merge rule is configuration-from-disk and statistics-from-memory: a slot
+  change takes effect on the next request without discarding accounting that
+  has not been flushed yet.
+
+### Added
+
+- **Per-account concurrency is configurable from the CLI and the dashboard.**
+  `maxConcurrency` already existed in the schema and in the PATCH route, but
+  there was no way to set it without hand-editing `pool.json`, and nothing to
+  observe it with. `wb pool concurrency <name> <1-10>`, a "并发 N" button on
+  each account card, and `defaultMaxConcurrency` for newly discovered accounts.
+  The value is clamped to 1–10 on write; the default is still 1. Upstream allows
+  same-account concurrency (measured 1/2/4/6/8 with no 429 and no
+  serialization), but 3 is the recommended ceiling: a 429 here can cost hours
+  of cooldown.
+- **`today.peakInflight` and `today.rateLimited` are recorded per account** and
+  shown on the card under the concurrency KPI. Opening up concurrency without
+  these two numbers leaves no basis for rolling back.
+- **`Retry-After` is honoured and surfaced.** A 429 carrying `Retry-After`,
+  `retry-after-ms`, `x-ratelimit-reset` or a reset timestamp in the body now
+  produces a cooldown that ends at that moment instead of an exponential guess
+  (1 → 2 → 4 … min, 30 min cap, still the fallback). The same deadline goes
+  back to the client as `Retry-After` in the error response.
+
+### Fixed
+
+- **A model whose catalogue entry simply omits `reasoning` no longer loses the
+  client's `reasoning_effort`.** `reasoningDeclaration` collapsed "the upstream
+  says this model cannot reason" and "the upstream said nothing about reasoning"
+  into the same `form: "none"`, and the resolver deleted the effort for both.
+  Nine of the 36 models in the live catalogue (`default`, `glm-4.6`, `glm-5.0`,
+  `glm-4.7`, `hunyuan-*`…) fall in the second bucket and accept any effort
+  upstream (verified: `null`/`high`/`none`/`xhigh`/`max` all return 200). The
+  declaration now carries `known`; only `known: true && form: "none"` drops the
+  field, and missing metadata passes the client's value through. `wb_reasoning`
+  in `/v1/models` publishes the new `known` flag.
+- **Chat and Responses re-resolve the effort after a 401 re-auth.** Only the
+  Anthropic runtime re-read the catalogue after switching accounts, so the other
+  two paths kept sending the old account's effort. All three now share
+  `applyEffortToBody`.
+- **Historical reasoning is no longer discarded.** Anthropic `thinking` blocks are
+  folded into a `<prior_reasoning>…</prior_reasoning>` text prefix (upstream
+  accepts it); `redacted_thinking` is still dropped for having no readable
+  content. Persisted Responses `reasoning.summary` is kept verbatim and only the
+  item id is regenerated, while client-replayed reasoning items are folded into
+  one assistant prefix message capped at 2000 characters. Empty summaries still
+  produce no message.
+- **The 256 KiB persistence budget is allocated per item instead of sequentially.**
+  A 300 KB `apply_patch` used to consume the whole budget, leaving the following
+  `function_call.arguments` and assistant message as empty strings — and
+  `arguments: ""` is not valid JSON. Every text slot now gets
+  `min(bytes, 4 KiB)` first and only the remainder is handed out in order.
+  Truncation writes `…[bridge-truncated: N bytes]`, and a truncated
+  `function_call.arguments` becomes valid JSON
+  `{"_bridge_truncated":true,"bytes":N,"preview":"…"}`.
+- **A 429 on a single-account pool no longer triggers a pointless retry.**
+  `RETRY_STATUS` includes 429, so the retry loop picked another account — with
+  a single account that meant re-selecting the same one and hitting the rate
+  limit again. The loop now stops when no other account can serve the request,
+  and the 429 passes straight through to the client.
+
+### Changed
+
+- **The continuation nudge applies to coding agents and tool loops, not to every
+  request that declares tools.** `continuationNudge: true` now means `auto`:
+  inject only when the request is recognised as a coding agent (`originator:
+  codex_*`, `x-codex-*` headers, `client_metadata` carrying `x-codex-*`, or
+  `user-agent: pi (…)`) or when the history already contains a tool round trip.
+  `WB_CONTINUATION_NUDGE=1` forces `always`, `0` forces `off`. Plain Q&A and
+  unrelated clients are no longer polluted.
+- **Rule 2 of the nudge text no longer bans narration.** It used to forbid
+  describing what the model was doing, which made the whole turn opaque: with the
+  loop fixed you could no longer tell what the model was working on or why.
+  Verified that codex does not treat "explanation + tool call in one turn" as
+  completion (2 upstream requests, text shown), so the rule now permits one or
+  two sentences of progress explanation and only forbids describing a plan
+  without acting on it. Rule 4 no longer overrides the client's approval policy,
+  and rule 5 gives repeated patch failures a termination condition.
+- **The nudge is appended at the end of the message list** rather than after the
+  last user message. Real requests end with tool round trips, so the old
+  placement buried the constraint mid-history; upstream accepts a trailing
+  system message (verified for start / after-user / after-tool / very end).
+  `tool_choice: "none"` suppresses the nudge entirely.
+- The dashboard gained a "回合续跑约束" switch; the setting previously had no UI at
+  all and could only be changed through `PATCH /api/api-compat` or the
+  environment.
+
 ### Security
 
 - **The admin API is no longer open by default on a non-loopback bind.**
@@ -30,8 +135,19 @@
   dashboard showed the new value while requests kept going to the old endpoint.
   Both are now read from config per request; an explicitly passed `baseUrl` /
   `timeoutMs` still pins a fixture.
+
 ### Fixed
 
+- Responses requests no longer fail with `tools[N] type web_search is not
+  supported` when the client always declares upstream-hosted tools. Codex
+  (`web_search = "live" | "cached"`) and DeepSeek Harness (`web_fetch`) both send
+  such declarations. Hosted tool declarations (`web_search*`, `web_fetch`,
+  `computer_use*`, `file_search`, `code_interpreter`, `image_generation`, `mcp`,
+  `container`) are dropped instead of rejected, and a `tool_choice` naming one of
+  them degrades to `auto` instead of failing the turn.
+- `wb install --client dsh` resolves `DSH_HOME` when it runs instead of when the
+  module loads, so an inherited `DSH_HOME` no longer redirects the write into the
+  live profile (the isolated install tests failed with a read-only `EROFS`).
 - Cache hits reported by the upstream now reach the account ledger as well: the
   lease result carries `cache_read_input_tokens` / `cache_creation_input_tokens`
   on Anthropic, Chat and Responses, so `pool.json` and the admin dashboard stop
@@ -105,4 +221,9 @@
   the field is not an instruction to disable thinking, so its reasoning text is
   still returned.
 - Thinking signatures are empty because the upstream does not provide verifiable
-  signatures.
+  signatures. Strict clients that validate them fall back to plain text rather
+  than failing.
+- `include: ["reasoning.encrypted_content"]` and `encrypted_content` are not
+  supported: the upstream never produces them, so there is nothing to replay.
+  Clients relying on encrypted reasoning continuity see the plain-text summary
+  instead.

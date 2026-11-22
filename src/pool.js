@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 import {
   POOL_FILE,
   ensureBridgeDirs,
@@ -39,6 +40,47 @@ const ALL_MODELS = '*';
 // inflight 属于进程运行态，不能跟号池统计一起从磁盘重载。
 const inflightByAccount = new Map();
 
+/** 单号并发槽位上限：实测到 8 未触发限流，但不建议把 8 当默认值。 */
+export const MAX_CONCURRENCY = 10;
+
+// ---------------------------------------------------------------- 落盘与缓存
+//
+// 一次请求要碰两次号池（beginTask / endTask），而 pool.json 有近 100 KB，
+// 其中约六成是面板的时序数据。每次都全量解析 + 全量重写，12 并发时每波就是
+// 24 次 100 KB 的同步 I/O。这里做两件事：
+//
+//   1. 读走内存缓存：只有磁盘签名（ino + mtime + size）变了才重新解析；
+//   2. 写分两类：配置类同步落盘，统计类合并 —— 空闲 500 ms 后写，
+//      持续有流量时最多 2 s 一次。
+//
+// 别的进程（wb pool、另一个 bridge）改了文件时按「配置以磁盘为准、统计以内存
+// 为准」合并：既不会把对方刚改的配置改回去，也不会丢掉还没落盘的计数。
+// 已知代价：对方写入时若把尚未落盘的冷却带走了，该号会再撞一次 429 才重新进冷却。
+
+const FLUSH_DELAY_MS = 500;
+const FLUSH_MAX_DELAY_MS = 2000;
+
+/** cache.pool 是「磁盘 + 未落盘统计」的唯一内存副本，调用方直接改它。 */
+let cache = null; // { pool, sig }
+let dirty = false;
+let flushTimer = null;
+let firstDirtyAt = 0;
+let exitHooksInstalled = false;
+
+function fileSignature() {
+  try {
+    const s = fs.statSync(POOL_FILE);
+    return { ino: s.ino, mtimeMs: s.mtimeMs, size: s.size };
+  } catch {
+    return null;
+  }
+}
+
+function sameSignature(a, b) {
+  if (!a || !b) return !a && !b;
+  return a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.size === b.size;
+}
+
 export const STRATEGIES = {
   balanced: '均衡（按 token 用量 + 权重 + 空闲优先）',
   'round-robin': '加权轮询（按权重轮流）',
@@ -55,6 +97,9 @@ function emptyToday() {
     cacheWrite: 0,
     ms: 0,
     cost: 0,
+    // 观测：没有这两项就不要放开并发（峰值帮忙判断槽位够不够，429 次数帮忙回滚）
+    peakInflight: 0,
+    rateLimited: 0,
   };
 }
 
@@ -90,6 +135,8 @@ function emptyPool() {
     version: 2,
     strategy: 'balanced',
     maxAttempts: 3,
+    // 新账号的并发槽位默认值。默认保守，按号放开（单号实测安全到 3，不建议把 8 当默认）
+    defaultMaxConcurrency: 1,
     rrCursor: 0,
     accounts: {},
     series: emptySeries(),
@@ -131,8 +178,16 @@ function syncCooldownState(entry, now = Date.now()) {
   return entry.cooldownUntil;
 }
 
-export function loadPool() {
-  const raw = readJson(POOL_FILE, null);
+/** 只从磁盘读一次并规范化；调用方是缓存层，其他代码一律走 readPool()。 */
+function loadPoolFromDisk() {
+  let raw = null;
+  let sig = null;
+  try {
+    sig = fileSignature();
+    raw = JSON.parse(fs.readFileSync(POOL_FILE, 'utf8'));
+  } catch {
+    raw = null; // 文件不存在或内容损坏：按空池起步，不阻断请求
+  }
   const pool = { ...emptyPool(), ...(raw || {}) };
   if (!pool.accounts || typeof pool.accounts !== 'object') pool.accounts = {};
   if (!STRATEGIES[pool.strategy]) pool.strategy = 'balanced';
@@ -140,35 +195,195 @@ export function loadPool() {
 
   // inflight 是进程内状态；磁盘只保存统计，运行时值从内存覆盖回来。
   for (const [name, e] of Object.entries(pool.accounts)) {
-    const base = emptyEntry(name);
-    const now = Date.now();
-    const cooldowns = normalizeCooldowns(e.cooldowns, now);
-    // v2 只保存账号级冷却。升级后按“所有模型”处理，避免旧状态提前失效。
-    if (!Object.hasOwn(e, 'cooldowns') && Number(e.cooldownUntil) > now) {
-      cooldowns[ALL_MODELS] = {
-        until: Number(e.cooldownUntil),
-        failures: Math.max(1, Number(e.failures) || 1),
-      };
-    }
-    pool.accounts[name] = {
-      ...base,
-      ...e,
-      cooldowns,
-      // 老版本的 today/total 没有缓存字段，逐项补齐
-      today: { ...emptyToday(), ...(e.today || {}) },
-      total: { ...emptyTotal(), ...(e.total || {}) },
-      inflight: inflightByAccount.get(name) || 0,
-      name,
+    pool.accounts[name] = normalizeEntry(name, e);
+  }
+  return { pool, sig };
+}
+
+function normalizeEntry(name, e) {
+  const base = emptyEntry(name);
+  const now = Date.now();
+  const cooldowns = normalizeCooldowns(e?.cooldowns, now);
+  // v2 只保存账号级冷却。升级后按“所有模型”处理，避免旧状态提前失效。
+  if (!Object.hasOwn(e || {}, 'cooldowns') && Number(e?.cooldownUntil) > now) {
+    cooldowns[ALL_MODELS] = {
+      until: Number(e.cooldownUntil),
+      failures: Math.max(1, Number(e.failures) || 1),
     };
-    syncCooldownState(pool.accounts[name], now);
-    rollDay(pool.accounts[name]);
+  }
+  const entry = {
+    ...base,
+    ...e,
+    cooldowns,
+    // 老版本的 today/total 没有缓存字段，逐项补齐
+    today: { ...emptyToday(), ...(e?.today || {}) },
+    total: { ...emptyTotal(), ...(e?.total || {}) },
+    inflight: inflightByAccount.get(name) || 0,
+    name,
+  };
+  syncCooldownState(entry, now);
+  rollDay(entry);
+  return entry;
+}
+
+/**
+ * 有缓存就复用，没有或磁盘变了才重新解析。
+ *
+ * 磁盘变化来自别的进程（wb pool、另一个 bridge）。此时统计以内存为准：
+ * 本进程还没落盘的计数不能被一份更旧的磁盘快照覆盖，否则请求结束就白记了。
+ * 配置、冷却、series 以磁盘为准 —— 用户刚在面板上改的东西要立刻生效。
+ */
+function readPool() {
+  const sig = fileSignature();
+  if (!cache) {
+    cache = loadPoolFromDisk();
+    installExitHooks();
+  } else if (!sameSignature(sig, cache.sig) && !(dirty && !sig)) {
+    // 签名变了（含文件被删）就以磁盘重来；只有「文件不见但还有没落盘的统计」例外 ——
+    // 那份统计是仅存的数据，不能被一次删除抹掉。
+    const fresh = loadPoolFromDisk();
+    // 没有待落盘的统计时直接以磁盘为准；有则合并，两边都不丢。
+    cache.pool = dirty ? mergeDiskConfig(fresh.pool, cache.pool) : fresh.pool;
+    cache.sig = fresh.sig;
+  }
+  // 每次读都要重算：inflight 是本进程的实时值，冷却会随时间自然过期，
+  // 跨天要归档 —— 这些都不能停在「上一次解析那一刻」的状态。
+  refreshEntries(cache.pool);
+  return cache.pool;
+}
+
+/** 就地刷新每个账号条目：规范化、同步 inflight、跨天归档。 */
+function refreshEntries(pool) {
+  pool.series = normalizeSeries(pool.series);
+  for (const [name, e] of Object.entries(pool.accounts)) {
+    pool.accounts[name] = normalizeEntry(name, e);
   }
   return pool;
 }
 
+/** 别的进程能改的字段：配置、启停、冷却。其余（统计、时序）归本进程所有。 */
+const CONFIG_FIELDS = ['enabled', 'weight', 'maxConcurrency', 'budgetTokens'];
+
+/**
+ * 合并「刚读到的磁盘快照」与「内存里还没落盘的池」。
+ *   配置 / 冷却 / 启停 ← 磁盘（用户刚改的要立刻生效）
+ *   统计 / 时序 / 最近使用 ← 内存（还没落盘的计数不能丢）
+ */
+function mergeDiskConfig(disk, mine) {
+  const out = { ...disk, series: mine.series };
+  out.accounts = { ...disk.accounts };
+  for (const [name, m] of Object.entries(mine.accounts || {})) {
+    const d = out.accounts[name];
+    if (!d) {
+      out.accounts[name] = m;
+      continue;
+    }
+    const e = { ...m, inflight: inflightByAccount.get(name) || 0 };
+    for (const k of CONFIG_FIELDS) e[k] = d[k];
+    e.cooldowns = d.cooldowns;
+    e.cooldownUntil = d.cooldownUntil;
+    e.failures = d.failures;
+    e.status = d.status;
+    // 跨天时「今日」不是同一天，磁盘那份才是今天
+    if (d.day !== m.day) {
+      e.day = d.day;
+      e.today = d.today;
+      e.days = d.days;
+    }
+    syncCooldownState(e, Date.now());
+    out.accounts[name] = e;
+  }
+  return out;
+}
+
+/** 兼容旧调用名：从缓存读，不每次都碰磁盘。 */
+export function loadPool() {
+  return readPool();
+}
+
+/**
+ * 真正落盘。写失败只记 warn 并保留脏标记，下一次再试 ——
+ * 一次磁盘错误不能让请求失败。
+ */
+export function flushPool() {
+  clearTimeout(flushTimer);
+  flushTimer = null;
+  if (!cache || !dirty) return false;
+  try {
+    ensureBridgeDirs();
+    writeJson(POOL_FILE, cache.pool);
+    cache.sig = fileSignature();
+    dirty = false;
+    firstDirtyAt = 0;
+    return true;
+  } catch (err) {
+    warn(`pool 落盘失败，保留脏标记：${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * 统计类写：合并后再落盘。空闲 500 ms 后写；持续有流量时最多 2 s 一次。
+ * 显式落盘的配置写不走这里，直接 savePool()。
+ */
+export function markPoolDirty() {
+  dirty = true;
+  const now = Date.now();
+  if (!firstDirtyAt) firstDirtyAt = now;
+  if (now - firstDirtyAt >= FLUSH_MAX_DELAY_MS) {
+    flushPool();
+    return;
+  }
+  clearTimeout(flushTimer);
+  const wait = Math.max(0, Math.min(FLUSH_DELAY_MS, firstDirtyAt + FLUSH_MAX_DELAY_MS - now));
+  flushTimer = setTimeout(flushPool, wait);
+  // 不能因为一个待落盘的统计把进程钉在事件循环里
+  flushTimer.unref?.();
+}
+
+const EXIT_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
+/**
+ * 退出前把合并窗口里的统计写完。
+ *
+ * 'exit' 钩子只在正常退出时跑；被 SIGINT/SIGTERM 打断时进程直接结束，钩子不会执行。
+ * 所以信号也要接，但只在没有别的处理者时才由我们 exit —— 否则 Ctrl+C 会被这里
+ * 抢先吞掉（安装顺序在我们之后的其他处理者就再也不会执行）。判据是 once 包装器
+ * 在调用前已被移除：此时 listenerCount 为 0 说明确实只剩我们。
+ */
+function installExitHooks() {
+  if (exitHooksInstalled) return;
+  exitHooksInstalled = true;
+  process.once('exit', () => {
+    try {
+      flushPool();
+    } catch {
+      /* 退出路径上不能再抛 */
+    }
+  });
+  for (const signal of EXIT_SIGNALS) {
+    process.once(signal, () => {
+      try {
+        flushPool();
+      } catch {
+        /* 退出路径上不能再抛 */
+      }
+      if (process.listenerCount(signal) === 0) process.exit(0);
+    });
+  }
+}
+
+/** 配置类写：先更新缓存再把整份文件同步写下去，保证别的进程立刻看到。 */
 export function savePool(pool) {
-  ensureBridgeDirs();
-  writeJson(POOL_FILE, pool);
+  // 没读过就写：先建缓存，否则 flushPool 会因为「没有缓存」直接跳过这次落盘
+  if (!cache) {
+    cache = { pool, sig: null };
+    installExitHooks();
+  } else if (pool !== cache.pool) {
+    cache.pool = pool;
+  }
+  dirty = true;
+  flushPool();
   return pool;
 }
 
@@ -195,17 +410,29 @@ export function rollDay(entry, now = Date.now()) {
 /** 账号在 accounts.json 里存在、且池里有记录；没有就补一条。 */
 export function entryFor(pool, name) {
   const key = name;
-  if (!pool.accounts[key]) pool.accounts[key] = emptyEntry(key);
+  if (!pool.accounts[key]) {
+    pool.accounts[key] = emptyEntry(key);
+    pool.accounts[key].maxConcurrency = clampConcurrency(pool.defaultMaxConcurrency);
+  }
   rollDay(pool.accounts[key]);
   return pool.accounts[key];
+}
+
+/** 并发槽位只允许 1..MAX_CONCURRENCY 的整数，越小越保守。 */
+export function clampConcurrency(value) {
+  const n = Math.round(Number(value) || 0);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, MAX_CONCURRENCY);
 }
 
 export function updateAccount(name, patch = {}) {
   const pool = loadPool();
   const e = entryFor(pool, resolveAccountName(name));
-  for (const k of ['enabled', 'weight', 'maxConcurrency', 'budgetTokens']) {
+  for (const k of ['enabled', 'weight', 'budgetTokens']) {
     if (patch[k] !== undefined) e[k] = patch[k];
   }
+  // 并发槽位是唯一会被 clamp 的字段：手滑写 999 不该把号池打穿
+  if (patch.maxConcurrency !== undefined) e.maxConcurrency = clampConcurrency(patch.maxConcurrency);
   savePool(pool);
   return e;
 }
@@ -241,7 +468,9 @@ export function beginTask(name) {
   const pool = loadPool();
   const e = entryFor(pool, key);
   e.lastUsedAt = Date.now();
-  savePool(pool);
+  // 峰值并发是判断槽位够不够的唯一凭据，跟着统计一起落盘
+  if (next > (e.today.peakInflight || 0)) e.today.peakInflight = next;
+  markPoolDirty();
   return next;
 }
 
@@ -282,6 +511,10 @@ export function endTask(name, result) {
   e.lastLatencyMs = ms;
   if (result?.meta?.model) e.model = result.meta.model;
 
+  // 只有「会让这个号立刻停派」的变化才值得同步落盘：统计丢了只是少一个计数，
+  // 冷却丢了会立刻再撞一次 429。
+  let urgent = false;
+
   if (result?.ok) {
     e.total.ok += 1;
     e.today.ok += 1;
@@ -299,8 +532,11 @@ export function endTask(name, result) {
 
     if (result?.code === 'AUTH_REQUIRED') {
       e.status = 'unauthorized';
+      urgent = true;
     } else if (isQuotaError(result)) {
-      applyCooldown(e, result?.meta?.model);
+      e.today.rateLimited = (e.today.rateLimited || 0) + 1;
+      applyCooldown(e, result?.meta?.model, at, result?.meta?.resetAt);
+      urgent = true;
     } else {
       e.failures += 1;
     }
@@ -331,7 +567,8 @@ export function endTask(name, result) {
     at,
   );
 
-  savePool(pool);
+  if (urgent) savePool(pool);
+  else markPoolDirty();
   return e;
 }
 
@@ -351,7 +588,14 @@ export async function withAccountLease(name, fn) {
   }
 }
 
-function applyCooldown(e, model, now = Date.now()) {
+/**
+ * 打冷却。上游给了恢复时刻就按时刻走，没给才退避。
+ *
+ * 指数退避（1min → 30min 封顶）是猜；猜短了会连续撞限流，而 CodeBuddy 生态的
+ * 429 一旦给出重置时刻，等待可能就是几小时。所以 result.meta.resetAt 优先。
+ * 失败计数仍然累加，这样连续撞限流时退避也不会倒退。
+ */
+function applyCooldown(e, model, now = Date.now(), resetAt = 0) {
   const key = String(model || ALL_MODELS);
   if (!e.cooldowns || typeof e.cooldowns !== 'object' || Array.isArray(e.cooldowns)) {
     e.cooldowns = Object.create(null);
@@ -360,13 +604,14 @@ function applyCooldown(e, model, now = Date.now()) {
   const failures = Math.max(1, Number(previous?.failures) || 0) + 1;
   e.failures = (e.failures || 0) + 1;
   const backoff = Math.min(COOLDOWN_BASE_MS * 2 ** (failures - 1), MAX_COOLDOWN_MS);
+  const until = Number(resetAt) > now ? Math.round(Number(resetAt)) : now + backoff;
   e.cooldowns[key] = {
-    until: now + backoff,
+    until,
     failures,
   };
   if (e.status !== 'unauthorized' && e.status !== 'disabled') e.status = 'cooling';
   syncCooldownState(e, now);
-  return backoff;
+  return Math.max(0, until - now);
 }
 
 /** 手动把某个号拉回可用（面板上的「重置冷却」）。 */
@@ -505,6 +750,7 @@ export function poolView() {
       maxConcurrency: e.maxConcurrency,
       inflight: e.inflight || 0,
       budgetTokens: e.budgetTokens || 0,
+      maxConcurrencyMax: MAX_CONCURRENCY,
       cooldownUntil: e.cooldownUntil || 0,
       cooldownLeftMs: Math.max(0, (e.cooldownUntil || 0) - now),
       cooldownModels,
@@ -526,6 +772,9 @@ export function poolView() {
         costUsd: e.today.cost || 0,
         avgMs: e.today.req ? Math.round(e.today.ms / e.today.req) : 0,
         successRate: e.today.req ? e.today.ok / e.today.req : null,
+        // 放开并发必须能看见这两项，否则回滚没有依据
+        peakInflight: e.today.peakInflight || 0,
+        rateLimited: e.today.rateLimited || 0,
       },
       total: {
         req: e.total.req,
@@ -553,6 +802,8 @@ export function poolView() {
     strategy: pool.strategy,
     strategyText: STRATEGIES[pool.strategy],
     maxAttempts: pool.maxAttempts,
+    defaultMaxConcurrency: pool.defaultMaxConcurrency || 1,
+    maxConcurrencyMax: MAX_CONCURRENCY,
     accounts: rows,
     summary: {
       total: rows.length,
@@ -643,9 +894,10 @@ export function pickAccount({
       const name = ring[(cursor + i) % ring.length];
       const hit = usable.find((r) => r.name === name);
       if (!hit) continue;
-      const next = loadPool();
-      next.rrCursor = (cursor + i + 1) % ring.length;
-      savePool(next);
+      // 游标是调度态：只更新缓存里的那一份，落盘跟着统计一起合并写。
+      // 跨进程的轮询精度会略降（最多差一个窗口），换来的是每次选号不写 100 KB。
+      pool.rrCursor = (cursor + i + 1) % ring.length;
+      markPoolDirty();
       return { name, strategy: strat };
     }
   }

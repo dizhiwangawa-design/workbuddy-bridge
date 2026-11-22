@@ -557,6 +557,10 @@ export function adminPage({ home = '', token = '' } = {}) {
           <div><b>续跑提示</b><small>在 Responses 请求中提示模型可续接取消片段</small></div>
           <button class="switch" id="api-responses-nudge-switch" role="switch" aria-checked="false" data-act="api-responses-nudge-toggle" title="启用/停用 Responses 续跑提示"></button>
         </div>
+        <div class="api-option">
+          <div><b>回合续跑约束</b><small>对编码 Agent（codex / dsh）在消息末尾追加「未完成必须继续调用工具」的 system 约束</small></div>
+          <button class="switch" id="api-continuation-nudge-switch" role="switch" aria-checked="false" data-act="api-continuation-nudge-toggle" title="启用/停用回合续跑约束"></button>
+        </div>
       </div>
     </div>
   </section>
@@ -965,10 +969,15 @@ function card(a){
       '<div class="kpi2"><b>'+num(a.today.tokens)+'</b><span>今日 token</span></div>'+
       '<div class="kpi2"><b>'+a.inflight+'/'+a.maxConcurrency+'</b><span>并发</span></div>'+
     '</div>'+
+    ((a.today.peakInflight||a.today.rateLimited)
+      ? '<div class="qline sub2"><span>峰值并发 '+(a.today.peakInflight||0)+'/'+a.maxConcurrency+
+        '</span><span>今日 429 '+(a.today.rateLimited||0)+' 次</span></div>'
+      : '')+
     '<div class="foot">'+
       '<button class="mini" data-act="login" data-name="'+a.name+'">扫码登录</button>'+
       '<button class="mini" data-act="test" data-name="'+a.name+'">测试</button>'+
       '<button class="mini" data-act="budget" data-name="'+a.name+'">预算</button>'+
+      '<button class="mini" data-act="concurrency" data-name="'+a.name+'" title="单号并发槽位：默认 1，建议不超过 3">并发 '+a.maxConcurrency+'</button>'+
       (a.cooldownLeftMs>0?'<button class="mini" data-act="reset" data-name="'+a.name+'">重置冷却</button>':'')+
       '<span class="grow"></span>'+
       '<span class="stepper" title="权重：越高分到的任务越多">'+
@@ -1079,6 +1088,11 @@ function renderApi(){
   var nudgeEnabled=!!(persistenceEnabled&&s.responsesNudge);
   $('api-responses-nudge-switch').setAttribute('aria-checked',nudgeEnabled?'true':'false');
   $('api-responses-nudge-switch').disabled=!persistenceEnabled;
+  // 回合续跑约束与协议无关（三条协议都会注入），只受总开关约束。
+  // 注意不能读下面的 masterEnabled —— var 会提升但此刻还是 undefined。
+  var continuationNudgeOn=!!(s.enabled&&s.continuationNudge);
+  $('api-continuation-nudge-switch').setAttribute('aria-checked',continuationNudgeOn?'true':'false');
+  $('api-continuation-nudge-switch').disabled=!s.enabled;
   var authMode=s.requireApiKey?'所有连接强制 Key':
     !s.remoteRequireKey?'不强制 Key':
     s.trustProxy?'可信代理强制 Key':'回环免 Key · 远程强制 Key';
@@ -1274,6 +1288,13 @@ document.addEventListener('click',function(ev){
         .then(function(){toast(!nudgeOn?'Responses 续跑提示已启用':'Responses 续跑提示已关闭')});
     });
   }
+  if(a==='api-continuation-nudge-toggle'){
+    var continuationOn=el.getAttribute('aria-checked')==='true';
+    return act(function(){
+      return api('/api/api-compat',{method:'PATCH',body:JSON.stringify({continuationNudge:!continuationOn})})
+        .then(function(){toast(!continuationOn?'回合续跑约束已启用':'回合续跑约束已关闭')});
+    });
+  }
   if(a==='api-key-create'){
     return openCreateApiKey();
   }
@@ -1323,6 +1344,7 @@ document.addEventListener('click',function(ev){
   }
   if(a==='login') return openLogin(name);
   if(a==='budget') return openBudget(name);
+  if(a==='concurrency') return openConcurrency(name);
   if(a==='remove'){
     if(!confirm('删除账号「'+name+'」？其本地凭证目录也会一并删除，需要重新扫码。')) return;
     return act(function(){return api('/api/pool/'+encodeURIComponent(name),{method:'DELETE'}).then(function(){toast('已删除 '+name)})});
@@ -1457,6 +1479,28 @@ function openBudget(name){
     act(function(){
       return api('/api/pool/'+encodeURIComponent(name),{method:'PATCH',body:JSON.stringify({budgetTokens:v})})
         .then(function(){ closeModal(); toast(v?('预算已设为 '+num(v)+' tokens'):'已取消预算限制') });
+    });
+  };
+}
+
+function openConcurrency(name){
+  var acc=state.pool.accounts.filter(function(x){return x.name===name})[0]||{};
+  var cur=acc.maxConcurrency||1;
+  var cap=state.pool.maxConcurrencyMax||10;
+  $('mask').className='mask on';
+  $('modal').innerHTML='<h2>单号并发 · '+name+'</h2>'+
+    '<p>同一个账号同时在跑的请求上限，'+1+'–'+cap+'。默认 1（串行）；实测安全区是 3，'+
+    '再高吞吐不会变多，只会更早撞限流——撞一次可能要等几小时。</p>'+
+    '<input id="conc" type="number" min="1" max="'+cap+'" step="1" value="'+cur+'"/>'+
+    '<div class="row"><button data-x="close">取消</button><button class="primary" id="do-conc">保存</button></div>';
+  var input=$('conc');
+  input.focus(); input.select();
+  $('modal').querySelector('[data-x=close]').onclick=closeModal;
+  $('do-conc').onclick=function(){
+    var v=Math.max(1,Math.min(cap,Math.round(Number(input.value||1))));
+    act(function(){
+      return api('/api/pool/'+encodeURIComponent(name),{method:'PATCH',body:JSON.stringify({maxConcurrency:v})})
+        .then(function(){ closeModal(); toast('并发槽位已设为 '+v+(v>3?'（高于推荐值 3）':'')) });
     });
   };
 }

@@ -3,7 +3,13 @@ import assert from 'node:assert/strict';
 import {
   CONTINUATION_NUDGE,
   CONTINUATION_NUDGE_MARKER,
+  anthropicHasToolLoop,
+  chatHasToolLoop,
+  continuationNudgeApplies,
   continuationNudgeEnabled,
+  continuationNudgeMode,
+  detectAgentClient,
+  responsesHasToolLoop,
   withContinuationNudge,
 } from '../../src/continuation-nudge.js';
 import { prepareResponsesRequest } from '../../src/protocols/responses.js';
@@ -29,7 +35,7 @@ test('约束文本自带可识别标记', () => {
   assert.ok(CONTINUATION_NUDGE.startsWith(CONTINUATION_NUDGE_MARKER));
 });
 
-test('带工具时插到最后一条 user 之后', () => {
+test('带工具时插到消息末尾', () => {
   const messages = [user('a'), { role: 'assistant', content: 'b' }, user('c')];
   const patched = withContinuationNudge(messages, { tools: 2 });
   assert.notEqual(patched, messages, '不应原地修改入参');
@@ -45,9 +51,35 @@ test('插入后 assistant 工具调用与结果仍然相邻', () => {
     { role: 'tool', tool_call_id: 'c1', content: 'ok' },
   ];
   const patched = withContinuationNudge(messages, { tools: 1 });
-  assert.deepEqual(nudgePositions(patched), [1]);
-  assert.equal(patched[2].role, 'assistant');
-  assert.equal(patched[3].role, 'tool');
+  // 工具组已经闭合，约束落在整组之后：assistant(tool_calls) 与 tool 仍然紧邻。
+  assert.deepEqual(nudgePositions(patched), [3]);
+  assert.equal(patched[1].role, 'assistant');
+  assert.equal(patched[2].role, 'tool');
+  assert.equal(patched[3].role, 'system');
+});
+
+test('约束落在工具往返之后，而不是历史中段', () => {
+  const messages = [
+    { role: 'system', content: 'sys' },
+    user('refactor the parser'),
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c1' }] },
+    { role: 'tool', tool_call_id: 'c1', content: 'body' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c2' }] },
+    { role: 'tool', tool_call_id: 'c2', content: 'ok' },
+  ];
+  const patched = withContinuationNudge(messages, { tools: 1 });
+  assert.deepEqual(nudgePositions(patched), [messages.length]);
+});
+
+test('tool_choice 为 none 时不注入（不与客户端意图冲突）', () => {
+  const messages = [user('just answer')];
+  assert.equal(withContinuationNudge(messages, { tools: 1, toolChoice: 'none' }), messages);
+  assert.equal(withContinuationNudge(messages, { tools: 1, toolChoice: { type: 'none' } }), messages);
+  // 其它 tool_choice 值照常注入
+  assert.deepEqual(
+    nudgePositions(withContinuationNudge(messages, { tools: 1, toolChoice: 'auto' })),
+    [1],
+  );
 });
 
 test('没有 user 消息时追加到末尾', () => {
@@ -181,4 +213,74 @@ test('Chat：带工具时注入，continuationNudge=false 可关闭', () => {
     }).body.messages),
     [],
   );
+});
+
+// —— 规则文本：可观测性回归 ——
+
+test('规则 2 允许一句进度说明，不再禁止叙述', () => {
+  // 旧文本禁止一切叙述，代价是过程完全不可见。实测 codex 接受「说明+工具调用」
+  // 同轮，不会提前收尾，所以这条放开。
+  assert.doesNotMatch(CONTINUATION_NUDGE, /不要在回复里预告或复述/);
+  assert.match(CONTINUATION_NUDGE, /说明.*在做什么/);
+  // 但「别只说不做」必须保留，否则等于把循环约束拆了
+  assert.match(CONTINUATION_NUDGE, /说明不等于执行/);
+  assert.match(CONTINUATION_NUDGE, /必须包含至少一个工具调用/);
+});
+
+test('规则 4 与 approval 策略解耦、规则 5 给出重试终止条件', () => {
+  assert.match(CONTINUATION_NUDGE, /approval/);
+  assert.doesNotMatch(CONTINUATION_NUDGE, /不要中途停下来征求意见/);
+  assert.match(CONTINUATION_NUDGE, /连续失败两次/);
+});
+
+// —— 生效范围：off / auto / always ——
+
+test('continuationNudgeMode 三态解析', () => {
+  const previous = process.env.WB_CONTINUATION_NUDGE;
+  try {
+    delete process.env.WB_CONTINUATION_NUDGE;
+    assert.equal(continuationNudgeMode({}), 'auto');
+    assert.equal(continuationNudgeMode({ continuationNudge: true }), 'auto');
+    assert.equal(continuationNudgeMode({ continuationNudge: false }), 'off');
+
+    process.env.WB_CONTINUATION_NUDGE = '0';
+    assert.equal(continuationNudgeMode({ continuationNudge: true }), 'off');
+    process.env.WB_CONTINUATION_NUDGE = '1';
+    assert.equal(continuationNudgeMode({ continuationNudge: false }), 'always');
+  } finally {
+    if (previous === undefined) delete process.env.WB_CONTINUATION_NUDGE;
+    else process.env.WB_CONTINUATION_NUDGE = previous;
+  }
+});
+
+test('detectAgentClient 识别 codex 与 dsh，未知客户端返回 null', () => {
+  assert.equal(detectAgentClient({ headers: { originator: 'codex_exec' } }), 'codex');
+  assert.equal(detectAgentClient({ headers: { 'user-agent': 'pi (linux 6.1; x64)' } }), 'dsh');
+  assert.equal(detectAgentClient({ headers: { 'x-codex-turn-metadata': '{}' } }), 'codex');
+  assert.equal(detectAgentClient({
+    body: { client_metadata: { 'x-codex-window-id': 'w' } },
+  }), 'codex');
+  assert.equal(detectAgentClient({ headers: { 'user-agent': 'curl/8.5' } }), null);
+  assert.equal(detectAgentClient({}), null);
+});
+
+test('auto 模式只对编码 Agent 或已在工具循环里的请求生效', () => {
+  const unknown = { 'user-agent': 'python-requests/2.32' };
+  assert.equal(continuationNudgeApplies({ mode: 'auto', headers: unknown }), false);
+  assert.equal(continuationNudgeApplies({ mode: 'auto', headers: unknown, hasToolLoop: true }), true);
+  assert.equal(continuationNudgeApplies({ mode: 'auto', headers: { originator: 'codex_exec' } }), true);
+  assert.equal(continuationNudgeApplies({ mode: 'off', headers: { originator: 'codex_exec' } }), false);
+  assert.equal(continuationNudgeApplies({ mode: 'always', headers: unknown }), true);
+});
+
+test('工具往返探测覆盖三条协议的历史形状', () => {
+  assert.equal(responsesHasToolLoop({ input: [{ type: 'function_call' }] }), true);
+  assert.equal(responsesHasToolLoop({ input: [{ type: 'function_call_output' }] }), true);
+  assert.equal(responsesHasToolLoop({ input: [{ type: 'message', role: 'user' }] }), false);
+  assert.equal(chatHasToolLoop({ messages: [{ role: 'tool', tool_call_id: 'x' }] }), true);
+  assert.equal(chatHasToolLoop({ messages: [{ role: 'assistant', tool_calls: [{ id: 'c' }] }] }), true);
+  assert.equal(chatHasToolLoop({ messages: [{ role: 'user', content: 'hi' }] }), false);
+  assert.equal(anthropicHasToolLoop({ messages: [{ content: [{ type: 'tool_use' }] }] }), true);
+  assert.equal(anthropicHasToolLoop({ messages: [{ content: [{ type: 'tool_result' }] }] }), true);
+  assert.equal(anthropicHasToolLoop({ messages: [{ content: [{ type: 'text' }] }] }), false);
 });

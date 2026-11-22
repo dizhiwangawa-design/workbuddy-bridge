@@ -181,6 +181,8 @@ const SINGLE_MEDIUM = {
 
 const NO_REASONING = {
   form: 'none',
+  // 「上游明确说这个模型不支持推理」，与「元数据没提」不同，故 known:true。
+  known: true,
   efforts: [],
   declaredEffort: null,
   defaultEffort: null,
@@ -2739,3 +2741,58 @@ test('Responses 租约把上游缓存命中写进号池记账字段', async () =
   assert.equal(usage.cache_read_input_tokens, 3840);
 });
 
+
+// —— 推理历史：不再被清空 ——
+
+test('historyForResponse 保留 reasoning 摘要，只更换 item 身份', () => {
+  const record = {
+    body: {
+      _bridgeMeta: { version: 1, outputOffset: 0 },
+      _bridgeInput: [],
+      output: [
+        { type: 'reasoning', id: 'rs_old', summary: [{ type: 'summary_text', text: '先读 a.js' }] },
+        { type: 'message', id: 'm1', role: 'assistant', content: [{ type: 'output_text', text: '改好了' }] },
+      ],
+    },
+  };
+  const [reasoning] = responses.historyForResponse(record);
+  assert.equal(reasoning.type, 'reasoning');
+  assert.notEqual(reasoning.id, 'rs_old');
+  assert.deepEqual(reasoning.summary, [{ type: 'summary_text', text: '先读 a.js' }]);
+});
+
+test('replayHistory 把历史 reasoning 折叠成 assistant 前缀而不是丢弃', () => {
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: '先看语法树' }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续' }] },
+    ],
+  });
+  assert.deepEqual(prepared.body.messages.map((m) => m.role), ['assistant', 'user']);
+  assert.match(prepared.body.messages[0].content, /先看语法树/);
+});
+
+test('空 summary 的 reasoning 不制造空气泡', () => {
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: [
+      { type: 'reasoning', summary: [] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续' }] },
+    ],
+  });
+  assert.deepEqual(prepared.body.messages.map((m) => m.role), ['user']);
+});
+
+test('超长 reasoning 摘要回放时被截断', () => {
+  const long = 'think '.repeat(1000);
+  const prepared = responses.prepareResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: long }] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续' }] },
+    ],
+  });
+  assert.ok(prepared.body.messages[0].content.length < long.length);
+  assert.match(prepared.body.messages[0].content, /…<\/prior_reasoning>$/);
+});

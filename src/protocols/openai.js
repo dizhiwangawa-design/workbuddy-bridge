@@ -196,6 +196,7 @@ export function prepareOpenAIRequest(body, {
   outbound.messages = withContinuationNudge(normalizeMessages(body.messages), {
     tools: tools.length,
     enabled: continuationNudge,
+    toolChoice,
   });
   outbound.stream = true;
   delete outbound.stream_options;
@@ -523,6 +524,9 @@ function modelRow(model) {
     },
     wb_reasoning: {
       form: declaration.form,
+      // 上游有没有就这个模型给出 reasoning 元数据。false 时桥接按未知处理，
+      // 透传客户端声明的档位，而不是当成「模型不支持推理」删掉。
+      known: declaration.known,
       supported_efforts: declaration.efforts,
       declared_effort: declaration.declaredEffort,
       default_effort: declaration.defaultEffort,

@@ -321,6 +321,14 @@ async function cmdPool(values, positionals) {
     console.log(`${name} 权重 → ${Math.max(1, Math.min(20, Math.round(w)))}`);
     return;
   }
+  if (action === 'concurrency' || action === 'conc') {
+    const raw = positionals[2] ?? values.concurrency;
+    if (!name || raw === undefined) throw new Error('用法：wb pool concurrency <名字> <1-10>');
+    const entry = updateAccount(name, { maxConcurrency: Number(raw) });
+    const over = entry.maxConcurrency > 3 ? C.yellow('（高于实测安全区 3）') : '';
+    console.log(`${name} 并发槽位 → ${entry.maxConcurrency}${over}`);
+    return;
+  }
   if (action === 'reset') {
     if (!name) throw new Error('用法：wb pool reset <名字>');
     resetCooldown(name);
@@ -356,13 +364,14 @@ async function cmdPool(values, positionals) {
     ),
   );
 
-  const head = ['状态', '账号', '权重', '今日', '成功率', 'Token', '额度', '均值'];
+  const head = ['状态', '账号', '权重', '并发', '今日', '成功率', 'Token', '额度', '均值'];
   const rows = view.accounts.map((a) => {
     const q = a.quota;
     return [
       a.available ? C.green('● 可用') : C.yellow('○ ' + a.statusText),
       a.name + (a.isDefault ? C.dim(' *') : ''),
       '×' + a.weight,
+      `${a.inflight}/${a.maxConcurrency}`,
       String(a.today.req),
       a.today.successRate === null ? '—' : Math.round(a.today.successRate * 100) + '%',
       num(q.used),
@@ -522,6 +531,7 @@ async function main() {
     timeout: { type: 'string' },
     strategy: { type: 'string' },
     weight: { type: 'string' },
+    concurrency: { type: 'string' },
     qr: { type: 'boolean' },
     mcp: { type: 'boolean' },
     print: { type: 'boolean' },

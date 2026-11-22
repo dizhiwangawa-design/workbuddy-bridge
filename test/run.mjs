@@ -329,10 +329,17 @@ const dshProfile = path.join(dshHome, '.dsh', 'profiles', 'web');
 const dshPatch = path.join(dshProfile, 'cordis.patch.yml');
 
 function runInstall(args, extraEnv = {}) {
-  // 在 dsh 自己托管的终端里跑测试时，环境里会带着真实的 DSH_HOME；
-  // 用例要的是隔离 HOME，所以这里显式覆盖掉。
-  const env = { ...process.env, HOME: dshHome, USERPROFILE: dshHome, ...extraEnv };
-  if (!Object.hasOwn(extraEnv, 'DSH_HOME')) env.DSH_HOME = '';
+  // HOME / DSH_HOME 都必须指向隔离目录：在 dsh 自己托管的终端里跑测试时，
+  // 环境变量会带着真实路径，历史用例曾因此写进真实 profile（EROFS）。
+  // WB_DSH_SKIP_PLUGIN_INSTALL 让用例不用真的执行 pnpm add。
+  const env = {
+    ...process.env,
+    HOME: dshHome,
+    USERPROFILE: dshHome,
+    DSH_HOME: '',
+    WB_DSH_SKIP_PLUGIN_INSTALL: '1',
+  };
+  Object.assign(env, extraEnv);
   return new Promise((resolve) => {
     const p = spawn(process.execPath, [path.join(ROOT, 'bin', 'wb.js'), 'install', ...args], {
       env,
@@ -714,6 +721,147 @@ await test('调度抛出异常时也会释放并发占位', async () => {
   const row = poolMod.poolView().accounts.find((item) => item.name === 'throw-release');
   assertEqual(row.inflight, 0, '异常返回后并发占位应归零');
   assertEqual(poolMod.pickAccount({ strategy: 'balanced' }).name, 'throw-release');
+});
+
+await test('统计类写盘被合并：一波 20 次 begin/end 只落盘很少几次', async () => {
+  for (const a of accounts.listAccounts()) accounts.removeAccount(a.name);
+  credAccount('throttle-a');
+  poolMod.updateAccount('throttle-a', { maxConcurrency: 20 });
+
+  // 数真实的 pool.json 写入，不数 fs 之外的东西
+  let writes = 0;
+  const orig = fs.writeFileSync;
+  fs.writeFileSync = function (target, ...rest) {
+    if (String(target).includes('pool.json')) writes += 1;
+    return orig.call(fs, target, ...rest);
+  };
+  try {
+    for (let i = 0; i < 20; i++) {
+      poolMod.beginTask('throttle-a');
+      poolMod.endTask('throttle-a', {
+        ok: true,
+        durationMs: 400,
+        meta: { model: 'deepseek-v4.1-flash', usage: { input_tokens: 100, output_tokens: 10 } },
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2200));
+  } finally {
+    fs.writeFileSync = orig;
+  }
+
+  // 20 次请求 = 40 次 begin/end；节流后应该只剩个位数的落盘
+  assert(writes > 0, '统计最终必须落盘');
+  assert(writes <= 4, `一波 40 次读写不该落盘 ${writes} 次`);
+  const disk = JSON.parse(fs.readFileSync(POOL_FILE, 'utf8'));
+  assertEqual(disk.accounts['throttle-a'].today.req, 20, '统计必须完整落盘');
+});
+
+await test('配置类写立刻落盘，别的进程能马上读到', () => {
+  poolMod.updateAccount('throttle-a', { maxConcurrency: 3 });
+  // 绕开本进程缓存，直接读文件：面板与 wb pool 看到的就是这份
+  const disk = JSON.parse(fs.readFileSync(POOL_FILE, 'utf8'));
+  assertEqual(disk.accounts['throttle-a'].maxConcurrency, 3, '配置必须同步落盘');
+});
+
+await test('外部改 pool.json 后下一个请求立刻生效，且统计不丢', () => {
+  poolMod.beginTask('throttle-a');
+  poolMod.endTask('throttle-a', {
+    ok: true,
+    durationMs: 100,
+    meta: { model: 'deepseek-v4.1-flash', usage: { input_tokens: 10, output_tokens: 1 } },
+  });
+  const before = poolMod.loadPool().accounts['throttle-a'].today.req;
+
+  // 模拟 wb pool concurrency 在另一个进程里改文件
+  const disk = JSON.parse(fs.readFileSync(POOL_FILE, 'utf8'));
+  disk.accounts['throttle-a'].maxConcurrency = 5;
+  fs.writeFileSync(POOL_FILE, JSON.stringify(disk, null, 2));
+
+  const picked = poolMod.pickAccount({ strategy: 'balanced' });
+  assertEqual(picked.name, 'throttle-a');
+  const after = poolMod.loadPool().accounts['throttle-a'];
+  assertEqual(after.maxConcurrency, 5, '外部改的配置应立刻生效');
+  assert(after.today.req >= before, '重载不能把还没落盘的统计抹掉');
+});
+
+await test('并发槽位被夹在 1..10，手滑写 999 不会打穿号池', () => {
+  const entry = poolMod.updateAccount('throttle-a', { maxConcurrency: 999 });
+  assertEqual(entry.maxConcurrency, poolMod.MAX_CONCURRENCY);
+  assertEqual(poolMod.updateAccount('throttle-a', { maxConcurrency: 0 }).maxConcurrency, 1);
+  assertEqual(poolMod.updateAccount('throttle-a', { maxConcurrency: -3 }).maxConcurrency, 1);
+  poolMod.updateAccount('throttle-a', { maxConcurrency: 1 });
+});
+
+await test('新入池的账号读 defaultMaxConcurrency，已有账号保持自己的值', () => {
+  const withDefault = poolMod.loadPool();
+  withDefault.defaultMaxConcurrency = 2;
+  poolMod.savePool(withDefault);
+  poolMod.updateAccount('throttle-a', { maxConcurrency: 4 });
+
+  accounts.ensureAccount('fresh-slot');
+  const entry = poolMod.entryFor(poolMod.loadPool(), 'fresh-slot');
+  assertEqual(entry.maxConcurrency, 2, '新账号应继承池级默认值');
+  assertEqual(
+    poolMod.loadPool().accounts['throttle-a'].maxConcurrency,
+    4,
+    '已有账号不受池级默认值影响',
+  );
+
+  const cleanup = poolMod.loadPool();
+  cleanup.defaultMaxConcurrency = 1;
+  delete cleanup.accounts['fresh-slot'];
+  poolMod.savePool(cleanup);
+});
+
+await test('峰值并发记进 today，重启后仍可读', () => {
+  poolMod.updateAccount('throttle-a', { maxConcurrency: 4 });
+  poolMod.beginTask('throttle-a');
+  poolMod.beginTask('throttle-a');
+  try {
+    assertEqual(poolMod.loadPool().accounts['throttle-a'].today.peakInflight, 2, '峰值应为 2');
+  } finally {
+    poolMod.endTask('throttle-a', { ok: true, durationMs: 1 });
+    poolMod.endTask('throttle-a', { ok: true, durationMs: 1 });
+  }
+  const row = poolMod.poolView().accounts.find((a) => a.name === 'throttle-a');
+  assertEqual(row.today.peakInflight, 2, '面板能读到峰值');
+  assertEqual(row.today.rateLimited, 0, '没有 429 时应为 0');
+});
+
+await test('429 按上游给的恢复时刻冷却，而不是指数退避猜', () => {
+  poolMod.resetCooldown('throttle-a');
+  const resetAt = Date.now() + 5 * 60 * 1000;
+  poolMod.beginTask('throttle-a');
+  poolMod.endTask('throttle-a', {
+    ok: false,
+    code: 'RATE_LIMITED',
+    error: 'rate limit exceeded',
+    durationMs: 200,
+    meta: { model: 'deepseek-v4.1-flash', resetAt },
+  });
+
+  const entry = poolMod.loadPool().accounts['throttle-a'];
+  assertEqual(entry.today.rateLimited, 1, '429 次数要记');
+  const until = entry.cooldowns['deepseek-v4.1-flash'].until;
+  assertEqual(until, resetAt, '冷却截止时间应等于上游给的时刻');
+  assertEqual(poolMod.pickAccount().name, null, '冷却中的号不该被选中');
+  poolMod.resetCooldown('throttle-a');
+});
+
+await test('冷却丢失会立刻再撞限流，所以它必须同步落盘', () => {
+  poolMod.resetCooldown('throttle-a');
+  poolMod.beginTask('throttle-a');
+  poolMod.endTask('throttle-a', {
+    ok: false,
+    code: 'RATE_LIMITED',
+    error: 'too many requests',
+    durationMs: 100,
+    meta: { model: '', usage: {} },
+  });
+  // 不等待合并窗口，直接读文件
+  const disk = JSON.parse(fs.readFileSync(POOL_FILE, 'utf8'));
+  assert(disk.accounts['throttle-a'].cooldowns['*'].until > Date.now(), '冷却必须同步落盘');
+  poolMod.resetCooldown('throttle-a');
 });
 
 // ------------------------------------------------------------------

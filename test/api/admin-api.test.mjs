@@ -301,3 +301,28 @@ test('Anthropic 工具探针走真实 HTTP runtime、号池租约与脱敏结果
   );
   assert.equal(pool.loadPool().accounts[accountName].today.req, 2);
 });
+
+test('管理页暴露回合续跑约束开关，PATCH 可改并回读', async () => {
+  await withServer(async (baseUrl) => {
+    const page = await adminFetch(baseUrl, '/admin');
+    const html = await page.text();
+    assert.match(html, /id="api-continuation-nudge-switch"/);
+    assert.match(html, /data-act="api-continuation-nudge-toggle"/);
+    assert.match(html, /回合续跑约束/);
+
+    const patched = await adminFetch(baseUrl, '/api/api-compat', {
+      method: 'PATCH',
+      body: JSON.stringify({ continuationNudge: false }),
+    });
+    assert.equal(patched.status, 200);
+    assert.equal((await patched.json()).continuationNudge, false);
+
+    const read = await adminFetch(baseUrl, '/api/api-compat');
+    assert.equal((await read.json()).continuationNudge, false);
+
+    await adminFetch(baseUrl, '/api/api-compat', {
+      method: 'PATCH',
+      body: JSON.stringify({ continuationNudge: true }),
+    });
+  });
+});

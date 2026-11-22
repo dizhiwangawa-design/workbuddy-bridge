@@ -361,6 +361,7 @@ test('模型目录映射成功结果并生成稳定 fallback', () => {
     },
     wb_reasoning: {
       form: 'supported',
+      known: true,
       supported_efforts: ['low', 'high', 'max'],
       declared_effort: null,
       default_effort: 'high',
@@ -476,6 +477,8 @@ const CHAT_SINGLE_MEDIUM = {
 
 const CHAT_NO_REASONING = {
   form: 'none',
+  // 「上游明确说这个模型不支持推理」，与「元数据没提」不同，故 known:true。
+  known: true,
   efforts: [],
   declaredEffort: null,
   defaultEffort: null,
@@ -888,8 +891,13 @@ test('OpenAI SSE 流式文本、思考提示与多轮工具完成', async (t) =>
   assert.match(second, /"finish_reason":"stop"/);
   assert.match(second, /data: \[DONE\]/);
   assert.equal(upstreamBodies.length, 2);
-  assert.equal(upstreamBodies[1].messages.at(-1).role, 'tool');
-  assert.equal(upstreamBodies[1].messages.at(-1).tool_call_id, 'call_read');
+  // 约束现在追加在整条消息列表末尾（工具组之后），所以末尾是 system，
+  // 工具结果仍然紧跟在 assistant(tool_calls) 后面。
+  const secondMessages = upstreamBodies[1].messages;
+  assert.equal(secondMessages.at(-1).role, 'system');
+  const toolResult = secondMessages.findLast((message) => message.role === 'tool');
+  assert.equal(toolResult.tool_call_id, 'call_read');
+  assert.equal(secondMessages[secondMessages.indexOf(toolResult) - 1].role, 'assistant');
 });
 
 test('OpenAI 工具结果引用缺失或工具开关关闭时返回明确错误', () => {

@@ -16,6 +16,19 @@ export function badRequest(message) {
   return new ApiError(400, message);
 }
 
+/**
+ * 把「什么时候能再来」透给客户端。
+ *
+ * 只在一个号可用时才有意义：那时代理层换号等于原地重试，除了把限流放大没有别的
+ * 作用。客户端拿到 Retry-After 至少可以自己等，而不是反复重试再被拒。秒数向上取整，
+ * 不足 1 秒按 1 秒给 —— 0 是合法值但读起来像「立刻可重试」。
+ */
+export function retryAfterHeaders(error, now = Date.now()) {
+  const resetAt = Number(error?.resetAt || 0);
+  if (!(resetAt > now)) return {};
+  return { 'retry-after': String(Math.max(1, Math.ceil((resetAt - now) / 1000))) };
+}
+
 export function sendApiError(res, error, protocol = 'openai') {
   const rawStatus = Number(error.status || 500);
   const status = rawStatus >= 100 && rawStatus <= 599 ? rawStatus : 500;
@@ -48,6 +61,7 @@ export function sendApiError(res, error, protocol = 'openai') {
     res.writeHead(status, {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
+      ...retryAfterHeaders(error),
     });
     res.end(JSON.stringify(body));
     return true;

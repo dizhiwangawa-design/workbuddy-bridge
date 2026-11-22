@@ -40,10 +40,13 @@ test('单值声明沿用目录值', () => {
   assert.equal(resolveReasoningEffort('none', declaration), 'none');
 });
 
-test('无 reasoning 对象不产生转发值', () => {
+test('元数据缺失 reasoning 时透传客户端档位而不是删掉', () => {
+  // 真实目录里 9/36 个模型没有 reasoning 字段（default、glm-4.6、glm-5.0…），
+  // 上游对这些模型照样接受任意档位（实测 200），不能替它做「不支持」的判定。
   const declaration = reasoningDeclaration({ id: 'glm-4.6' });
-  assert.equal(resolveReasoningEffort('high', declaration), null);
-  assert.equal(resolveReasoningEffort(null, declaration), null);
+  assert.equal(declaration.known, false);
+  assert.equal(resolveReasoningEffort('high', declaration), 'high');
+  assert.equal(resolveReasoningEffort(null, declaration), 'none');
   assert.throws(
     () => resolveReasoningEffort('hihg', declaration),
     (error) => error.status === 400,
@@ -123,9 +126,23 @@ test('显式 none 保持现状：即便模型声明不可关思考也照发', ()
 });
 
 test('明确声明不支持 reasoning 的模型不转发', () => {
-  const noReasoning = reasoningDeclaration({ id: 'glm-4.6' });
-  assert.deepEqual(resolveRequestedEffort('high', noReasoning), { effort: null, source: 'unsupported' });
-  assert.deepEqual(resolveRequestedEffort(null, noReasoning), { effort: null, source: 'unsupported' });
+  // 只有「上游给了 reasoning 对象但没有任何可用档位」才算明确不支持。
+  const noEfforts = reasoningDeclaration({ id: 'glm-4.6', reasoning: { defaultEffort: 'high' } });
+  assert.equal(noEfforts.known, true);
+  assert.equal(noEfforts.form, 'none');
+  assert.deepEqual(resolveRequestedEffort('high', noEfforts), { effort: null, source: 'unsupported' });
+  assert.deepEqual(resolveRequestedEffort(null, noEfforts), { effort: null, source: 'unsupported' });
+});
+
+test('元数据缺失与明确不支持的区分（known 字段）', () => {
+  const missing = reasoningDeclaration({ id: 'glm-4.6' });
+  const explicit = reasoningDeclaration({ id: 'glm-4.6', reasoning: {} });
+  assert.equal(missing.form, 'none');
+  assert.equal(missing.known, false);
+  assert.equal(explicit.form, 'none');
+  assert.equal(explicit.known, true);
+  assert.deepEqual(resolveRequestedEffort('high', missing), { effort: 'high', source: 'passthrough' });
+  assert.deepEqual(resolveRequestedEffort('high', explicit), { effort: null, source: 'unsupported' });
 });
 
 test('未知档位名在冷热目录下都返回 400', () => {

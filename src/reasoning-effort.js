@@ -26,6 +26,16 @@ function usableRung(value) {
   return REASONING_LADDER.includes(named) ? named : null;
 }
 
+/**
+ * 元数据「没有 reasoning 字段」和「明确声明不能推理」是两件事。
+ *
+ * 旧实现把两者压成同一个 `form:'none'`，调用方据此删掉客户端的
+ * `reasoning_effort`。但真实目录里 9/36 个模型（default、glm-4.6、glm-5.0…）
+ * 只是没写 reasoning 字段，上游对这些模型照样接受任意档位（实测 200）。
+ * 因此这里补 `known`：
+ *   - `reasoning` 对象存在，只是没给档位 → known:true（上游说了，只是没细到档位）
+ *   - `reasoning` 完全缺失 → known:false（没提，按未知处理，透传客户端意图）
+ */
 export function reasoningDeclaration(model) {
   const reasoning = model?.reasoning;
   if (!reasoning || typeof reasoning !== 'object' || Array.isArray(reasoning)) {
@@ -35,6 +45,7 @@ export function reasoningDeclaration(model) {
       declaredEffort: null,
       defaultEffort: null,
       canDisableThinking: null,
+      known: false,
     };
   }
 
@@ -53,6 +64,7 @@ export function reasoningDeclaration(model) {
       declaredEffort: null,
       defaultEffort,
       canDisableThinking,
+      known: true,
     };
   }
 
@@ -64,6 +76,7 @@ export function reasoningDeclaration(model) {
       declaredEffort,
       defaultEffort,
       canDisableThinking,
+      known: true,
     };
   }
 
@@ -73,6 +86,7 @@ export function reasoningDeclaration(model) {
     declaredEffort: null,
     defaultEffort,
     canDisableThinking,
+    known: true,
   };
 }
 
@@ -117,6 +131,9 @@ function mapToDeclaration(raw, declaration) {
  * 「未声明」与「显式 none」两条既有语义刻意保持不变：是否思考不应由模型目录的
  * 元数据字段翻转，客户端显式表达的意图应当照发。
  *
+ * 只有「目录明确知道这个模型、并明确说它不支持推理」（known 且 form:none）才删档位；
+ * 元数据缺失（known:false）按未知处理，同样透传。
+ *
  * @param {string|null|undefined} requested 客户端声明的档位；null/undefined 表示没声明
  * @param {object|null} declaration 该模型的目录声明；null 表示未知
  * @returns {{ effort: string|null, source: 'passthrough'|'mapped'|'default'|'disabled'|'unsupported' }}
@@ -126,7 +143,7 @@ export function resolveRequestedEffort(requested, declaration) {
   const raw = hasRequest ? canonical(requested) : null;
   if (hasRequest) assertAccepted(raw);
 
-  if (declaration && declaration.form === 'none') {
+  if (declaration && declaration.form === 'none' && declaration.known === true) {
     return { effort: null, source: 'unsupported' };
   }
   if (!hasRequest) return { effort: 'none', source: 'default' };
@@ -140,6 +157,34 @@ export function resolveRequestedEffort(requested, declaration) {
 
 export function resolveReasoningEffort(requested, declaration) {
   return resolveRequestedEffort(requested, declaration).effort;
+}
+
+/**
+ * 把客户端的档位意图落到一份请求体上，并记录实际转发值与抑制标记。
+ *
+ * 三条协议（Chat / Anthropic / Responses）共用，避免各自维护一份「相同但不一致」
+ * 的写回逻辑 —— 历史上 401 换号重试后只有 Anthropic 重新解析档位，另两条协议
+ * 会带着旧目录的结论继续发请求。
+ *
+ * @param {object} body 出站请求体（会被就地修改）
+ * @param {string|null} requested 客户端声明的档位
+ * @param {object|null} declaration 该模型的目录声明
+ * @returns {{ forwardedEffort: string|null, suppressed: boolean }}
+ */
+export function applyEffortToBody(body, requested, declaration) {
+  const decision = resolveRequestedEffort(requested, declaration);
+  const forwardedEffort = decision.effort;
+  if (!body || typeof body !== 'object') {
+    return { forwardedEffort, suppressed: decision.source === 'disabled' };
+  }
+  if (forwardedEffort === null) delete body.reasoning_effort;
+  else body.reasoning_effort = forwardedEffort;
+  return {
+    forwardedEffort,
+    // 客户端**显式**要求 none，上游却仍返回 reasoning_content —— 此时正文不该
+    // 透给客户端。只认显式意图：没声明档位（source: 'default'）不是「要求关闭」。
+    suppressed: decision.source === 'disabled',
+  };
 }
 
 export function budgetEffort(thinking) {

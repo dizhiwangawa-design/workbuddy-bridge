@@ -19,6 +19,9 @@ const SUPPORTED_TOOL_TYPES = new Set([
   'apply_patch',
 ]);
 
+/** 回放历史推理时的单条上限：够表达思路，又不至于把上下文顶满。 */
+const REASONING_REPLAY_LIMIT = 2000;
+
 /**
  * 上游托管的工具（web_search / file_search / computer_use……）：客户端会无条件
  * 把这些工具塞进每一次请求，但上游没有对应执行器，也不需要模型知道它们。
@@ -82,6 +85,13 @@ export function reasoningItem(summary = '', status = 'completed') {
   };
 }
 
+/**
+ * 空推理 item。
+ *
+ * 注意：回放历史**不再**用它替换已有 reasoning（那会让模型看到空壳），
+ * 见 historyForResponse。保留导出是因为它是 reasoning item 的标准空形状，
+ * 上游协商时仍可能用到。
+ */
 export function emptyCompletedReasoning() {
   return reasoningItem('', 'completed');
 }
@@ -463,7 +473,23 @@ function replayHistory(input) {
       positions.set(id, position);
       continue;
     }
-    if (type === 'reasoning') continue;
+    if (type === 'reasoning') {
+      // 回放历史里的推理：上游没有 reasoning 通道，整条丢弃会让模型看不到
+      // 自己上一轮想过什么（gpt-5-codex 这类客户端明确依赖它）。
+      // 折叠成一条 assistant 前缀消息；空 summary 仍然跳过，不制造空气泡。
+      const summary = summaryTextOf(item).trim();
+      if (summary) {
+        const clipped = summary.length > REASONING_REPLAY_LIMIT
+          ? `${summary.slice(0, REASONING_REPLAY_LIMIT)}…`
+          : summary;
+        messages.push({
+          role: 'assistant',
+          content: `<prior_reasoning>${clipped}</prior_reasoning>`,
+          position,
+        });
+      }
+      continue;
+    }
     if (typeof item.text === 'string') {
       messages.push({ role: 'user', content: item.text, position });
       continue;
@@ -590,10 +616,12 @@ export function prepareResponsesRequest(body, {
   const outbound = {
     model,
     // 带工具时补一条回合约束：没有工具调用的纯文字回复会被 codex / dsh 当作
-    // 任务结束，导致模型只描述下一步就交还控制权。
+    // 任务结束，导致模型只描述下一步就交还控制权。tool_choice 明确为 none 时
+    // 不注入，否则约束会与客户端的意图硬顶。
     messages: withContinuationNudge(messages, {
       tools: tools.length,
       enabled: continuationNudge,
+      toolChoice: choice,
     }),
     stream: true,
   };
@@ -794,9 +822,22 @@ export function historyForResponse(record) {
     ? meta.outputOffset
     : 0;
   return [...storedInput, ...output.slice(outputOffset).map((item) => {
-    if (item.type === 'reasoning') return emptyCompletedReasoning();
+    // 换 id 是因为 reasoning item 的身份属于上一次响应；但 summary 文本必须留下，
+    // 否则回放的是一具空壳，依赖推理连续性的模型看不到上一轮想过什么。
+    if (item.type === 'reasoning') {
+      return reasoningItem(summaryTextOf(item), 'completed');
+    }
     return item;
   })];
+}
+
+/** 取 reasoning item 里可见的 summary 文本（兼容 summary/summary_text 两种形状）。 */
+function summaryTextOf(item) {
+  const parts = Array.isArray(item?.summary) ? item.summary : [];
+  return parts
+    .map((part) => (typeof part === 'string' ? part : part?.text || ''))
+    .filter(Boolean)
+    .join('\n');
 }
 
 /** Live stdout lifecycle for Responses SSE. Final output is emitted only at

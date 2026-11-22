@@ -14,7 +14,11 @@ import {
 } from './tool-calls.js';
 import { createStructuredToolAssembler, arbitrateToolCalls } from './protocols/normalize.js';
 import { conservativeTokenEstimate } from './protocols/anthropic.js';
-import { continuationNudgeEnabled } from './continuation-nudge.js';
+import {
+  continuationNudgeApplies,
+  continuationNudgeMode,
+  responsesHasToolLoop,
+} from './continuation-nudge.js';
 import {
   baseResponse,
   completedResponseBody,
@@ -38,7 +42,7 @@ import {
   mergePartialOutput,
 } from './responses-store.js';
 import { debug, warn } from './log.js';
-import { resolveRequestedEffort } from './reasoning-effort.js';
+import { applyEffortToBody } from './reasoning-effort.js';
 
 function runtimeError(message, code, {
   status = 502,
@@ -139,17 +143,18 @@ export function createResponsesRuntime(options = {}) {
       credentials,
       model: prepared.model,
     }) || null;
-    const decision = resolveRequestedEffort(prepared.requestedEffort, declaration);
-    const forwardedEffort = decision.effort;
-    if (forwardedEffort === null) delete prepared.body.reasoning_effort;
-    else prepared.body.reasoning_effort = forwardedEffort;
-    prepared.forwardedEffort = forwardedEffort;
+    const applied = applyEffortToBody(
+      prepared.body,
+      prepared.requestedEffort,
+      declaration,
+    );
+    prepared.forwardedEffort = applied.forwardedEffort;
     // 客户端**显式**要求 none，上游却仍返回 reasoning_content（CHANGELOG 的
     // 已知限制）——此时正文不该透给客户端，与 Anthropic 路径对齐。
     // 只认显式意图：没声明档位（source: 'default'）不是「要求关闭思考」，
     // 那种情况照常透出推理，否则会静默砍掉既有功能。
-    prepared.reasoningSuppressed = decision.source === 'disabled';
-    return forwardedEffort;
+    prepared.reasoningSuppressed = applied.suppressed;
+    return applied.forwardedEffort;
   }
 
   async function ensureDeadLetterRetry() {
@@ -1302,6 +1307,8 @@ export function createResponsesRuntime(options = {}) {
         });
         if (upstream.status === 401 && credentials.refreshToken) {
           credentials = await refresh(account, credentials);
+          // 换号后目录可能完全不同，档位必须按新账号的模型声明重解析。
+          applyReasoningEffort(prepared, account, credentials);
           upstream = await upstreamClient.chat({
             accountId: account,
             credentials,
@@ -1562,7 +1569,12 @@ export function createResponsesRuntime(options = {}) {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
       history,
-      continuationNudge: continuationNudgeEnabled(config),
+      continuationNudge: continuationNudgeApplies({
+        mode: continuationNudgeMode(config),
+        headers: req?.headers || null,
+        body,
+        hasToolLoop: responsesHasToolLoop(body),
+      }),
     });
     let attempt;
     try {
@@ -1605,7 +1617,12 @@ export function createResponsesRuntime(options = {}) {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
       history: previous.messages,
-      continuationNudge: continuationNudgeEnabled(config),
+      continuationNudge: continuationNudgeApplies({
+        mode: continuationNudgeMode(config),
+        headers: req?.headers || null,
+        body,
+        hasToolLoop: responsesHasToolLoop(body),
+      }),
     });
     if (body?.stream === true && !config.streaming) {
       throw new ApiError(400, 'streaming is disabled', { code: 'streaming_disabled' });
@@ -1730,7 +1747,12 @@ export function createResponsesRuntime(options = {}) {
           defaultModel: config.defaultModel,
           toolsEnabled: config.tools,
           history: history.messages,
-          continuationNudge: continuationNudgeEnabled(config),
+          // WebSocket 会话拿不到 HTTP 请求头，靠 client_metadata 与工具往返识别。
+          continuationNudge: continuationNudgeApplies({
+            mode: continuationNudgeMode(config),
+            body: command,
+            hasToolLoop: responsesHasToolLoop(command),
+          }),
         });
       } catch (error) {
         send({ type: 'error', error: { code: error.code || 'invalid_request', message: error.message } });

@@ -18,10 +18,16 @@ import {
   createDsmlScanner,
   structuredToolArgumentLimit,
 } from './tool-calls.js';
-import { continuationNudgeEnabled } from './continuation-nudge.js';
+import {
+  anthropicHasToolLoop,
+  chatHasToolLoop,
+  continuationNudgeApplies,
+  continuationNudgeMode,
+} from './continuation-nudge.js';
 import { createSseParser, encodeSseEvent } from './sse.js';
 import { ApiError, sendApiError } from './api-errors.js';
 import { withClientKeyAttribution } from './api-attribution.js';
+import { resetAtFromResponse } from './rate-limit.js';
 import {
   readAccountCredentials,
   refreshAccountCredentials,
@@ -46,7 +52,7 @@ import {
 } from './stream-control.js';
 import { createDeadLetter, createResponsesStore } from './responses-store.js';
 import { createChatEncoder } from './protocols/openai.js';
-import { resolveReasoningEffort, resolveRequestedEffort } from './reasoning-effort.js';
+import { applyEffortToBody } from './reasoning-effort.js';
 
 const ANTHROPIC_ESTIMATOR = 'wb-conservative-v1';
 const PING_INTERVAL_MS = PRODUCTION_KEEPALIVE_MS;
@@ -233,6 +239,26 @@ function upstreamError(status, detail = '') {
   });
 }
 
+/**
+ * 还有没有别的号能接这个模型。
+ *
+ * 单号部署下 429 换号就是原地重试：同一个号刚被打上冷却，pick 只会返回空，
+ * 循环白跑一轮再把同样的错误抛出去。这里提前判定，省掉那次无用重试。
+ */
+function hasAnotherAccount(tried, model) {
+  return Boolean(pickAccount({ exclude: tried, model })?.name);
+}
+
+/**
+ * 429 会带「什么时候能再来」。把这句解析成 resetAt 挂在失败对象上，
+ * endTask 会用它打冷却：按上游给的时刻等，而不是拿指数退避去猜。
+ */
+function withResetHint(failure, headers, detail = '') {
+  const resetAt = resetAtFromResponse(headers, detail);
+  if (resetAt) failure.resetAt = resetAt;
+  return failure;
+}
+
 async function upstreamErrorDetail(response) {
   try {
     const raw = await response.text();
@@ -273,7 +299,7 @@ function streamHeaders() {
   };
 }
 
-function normalizeBody(body, config) {
+function normalizeBody(body, config, headers = null) {
   if (body?.stream === true && config.streaming === false) {
     throw new ApiError(400, 'streaming is disabled', { code: 'streaming_disabled' });
   }
@@ -282,7 +308,12 @@ function normalizeBody(body, config) {
     model: body?.model || config.defaultModel,
   };
   const converted = anthropicToOpenAI(candidate, {
-    continuationNudge: continuationNudgeEnabled(config),
+    continuationNudge: continuationNudgeApplies({
+      mode: continuationNudgeMode(config),
+      headers,
+      body,
+      hasToolLoop: anthropicHasToolLoop(body),
+    }),
   });
   for (const warning of converted.warnings) {
     warn(
@@ -702,14 +733,14 @@ export function createAnthropicRuntime({
         credentials,
         model: body.normalized.model || body.requestBody.model,
       }) || null;
-      const forwardedEffort = resolveReasoningEffort(
+      const applied = applyEffortToBody(
+        body.body,
         body.normalized.requestedEffort,
         declaration,
       );
-      if (forwardedEffort === null) delete body.body.reasoning_effort;
-      else body.body.reasoning_effort = forwardedEffort;
       // 实际转发值：客户端回显与排查都读它，而不是读请求里的原始值。
-      body.forwardedEffort = forwardedEffort;
+      body.forwardedEffort = applied.forwardedEffort;
+      body.reasoningSuppressed = applied.suppressed;
     }
 
     try {
@@ -741,7 +772,8 @@ export function createAnthropicRuntime({
         response = await requestUpstream(credentials);
       }
       if (!response.ok) {
-        throw upstreamError(response.status, await upstreamErrorDetail(response));
+        const detail = await upstreamErrorDetail(response);
+        throw withResetHint(upstreamError(response.status, detail), response.headers, detail);
       }
       if (!response.body) throw new RuntimeFailure('upstream response has no body');
 
@@ -1072,7 +1104,7 @@ export function createAnthropicRuntime({
         code: failure.code,
         error: `${failure.message} ${failure.code}`,
         durationMs: now() - startedAt,
-        meta: { model: body.requestBody.model, usage: {} },
+        meta: { model: body.requestBody.model, usage: {}, resetAt: failure.resetAt || 0 },
       };
       if (downstreamStarted && stream && failure.code !== 'ABORTED') {
         if (!responseEnded) {
@@ -1274,7 +1306,7 @@ export function createAnthropicRuntime({
   }
 
   async function messages({ req, res, body, config, clientKey = null, interruptSignal = null }) {
-    const normalized = normalizeBody(body, config);
+    const normalized = normalizeBody(body, config, req?.headers || null);
     const pool = poolLoader();
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
     const tried = [];
@@ -1311,6 +1343,9 @@ export function createAnthropicRuntime({
       if (result.started) return result;
       lastFailure = result.error;
       if (!result.error?.retryable) break;
+      // 限流且没有别的号可用：换号等于原地重试，只会把 429 放大。
+      // 直接把 429 和 Retry-After 透给客户端。
+      if (lastFailure.code === 'RATE_LIMITED' && !hasAnotherAccount(tried, normalized.requestBody.model)) break;
     }
 
     const failure = lastFailure || new RuntimeFailure('all account attempts failed');
@@ -1764,31 +1799,34 @@ export function createOpenAIRuntime({
         });
       }
       if (credentials.needsRefresh) credentials = await refreshCredentials(credentials);
-      const declaration = reasoningCatalogue?.getDeclaration({
-        accountId: account,
-        credentials,
-        model: body.model,
-      }) || null;
-      const decision = resolveRequestedEffort(body.requestedEffort, declaration);
-      const forwardedEffort = decision.effort;
-      if (forwardedEffort === null) delete body.body.reasoning_effort;
-      else body.body.reasoning_effort = forwardedEffort;
-      body.forwardedEffort = forwardedEffort;
-      // 客户端**显式**要求 none，上游却仍返回 reasoning_content（CHANGELOG 的
-      // 已知限制）——此时正文不该透给客户端，与 Anthropic 路径对齐。
-      // 只认显式意图：没声明档位（source: 'default'）不是「要求关闭思考」，
-      // 那种情况照常透出推理，否则会静默砍掉既有功能。
-      body.reasoningSuppressed = decision.source === 'disabled';
+      const applyChatEffort = () => {
+        const declaration = reasoningCatalogue?.getDeclaration({
+          accountId: account,
+          credentials,
+          model: body.model,
+        }) || null;
+        const applied = applyEffortToBody(body.body, body.requestedEffort, declaration);
+        body.forwardedEffort = applied.forwardedEffort;
+        // 客户端**显式**要求 none，上游却仍返回 reasoning_content（CHANGELOG 的
+        // 已知限制）——此时正文不该透给客户端，与 Anthropic 路径对齐。
+        // 只认显式意图：没声明档位（source: 'default'）不是「要求关闭思考」，
+        // 那种情况照常透出推理，否则会静默砍掉既有功能。
+        body.reasoningSuppressed = applied.suppressed;
+      };
+      applyChatEffort();
 
       armTotal();
       armFirstByte();
       let response = await requestUpstream(credentials);
       if (response.status === 401 && credentials.refreshToken) {
         credentials = await refreshCredentials(credentials);
+        // 换号后目录可能完全不同（另一个账号的模型声明），档位必须按新目录重解析。
+        applyChatEffort();
         response = await requestUpstream(credentials);
       }
       if (!response.ok) {
-        throw upstreamError(response.status, await upstreamErrorDetail(response));
+        const detail = await upstreamErrorDetail(response);
+        throw withResetHint(upstreamError(response.status, detail), response.headers, detail);
       }
 
       const contentType = String(response.headers.get('content-type') || '');
@@ -2056,7 +2094,7 @@ export function createOpenAIRuntime({
         code: failure.code,
         error: `${failure.message} ${failure.code}`,
         durationMs: now() - startedAt,
-        meta: { model: body.model, usage: {} },
+        meta: { model: body.model, usage: {}, resetAt: failure.resetAt || 0 },
       };
       if (cancelKind) {
         leaseResult = {
@@ -2155,7 +2193,12 @@ export function createOpenAIRuntime({
     const normalized = prepareOpenAIRequest(body, {
       defaultModel: config.defaultModel,
       toolsEnabled: config.tools,
-      continuationNudge: continuationNudgeEnabled(config),
+      continuationNudge: continuationNudgeApplies({
+        mode: continuationNudgeMode(config),
+        headers: req?.headers || null,
+        body,
+        hasToolLoop: chatHasToolLoop(body),
+      }),
     });
     const pool = poolLoader();
     const maxAttempts = Math.max(1, Math.min(Number(pool.maxAttempts) || 3, 5));
@@ -2188,6 +2231,8 @@ export function createOpenAIRuntime({
       if (result.ok || result.started) return result;
       lastFailure = result.error;
       if (!result.error?.retryable) break;
+      // 见 anthropic 同名逻辑：只有一个号时限流不该触发换号重试
+      if (lastFailure.code === 'RATE_LIMITED' && !hasAnotherAccount(tried, normalized.model)) break;
     }
 
     const failure = lastFailure || new RuntimeFailure('all account attempts failed');
