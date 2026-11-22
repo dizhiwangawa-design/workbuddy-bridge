@@ -320,6 +320,9 @@ export function endTask(name, result) {
       cacheRead,
       cacheWrite,
       ms,
+      // 时间口径由 runtime 提供；缺失时保持 0，stats 会把它们当作「无样本」。
+      ttftMs: Number(result?.meta?.ttftMs) || 0,
+      decodeMs: Number(result?.meta?.decodeMs) || 0,
       cost,
       apiProtocol: result?.meta?.apiProtocol || '',
       clientKeyId: result?.meta?.clientKeyId || '',

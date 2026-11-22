@@ -765,10 +765,13 @@ function renderKpis(){
       spark:sparkline(pts,'req','var(--brand)')
     })+
     kpiCard({
-      icon:'⚡', label:'生成速度', value:(t.throughput||0).toFixed(1), unit:'tok/s',
+      icon:'⚡', label:'解码速度', value:(t.decodeThroughput||0).toFixed(1), unit:'tok/s',
       delta:undefined,
-      lines:['平均耗时 '+dur(t.avgMs)+' · 单次 '+num(t.avgTokens)+' tok','峰值 '+Math.round(t.peakThroughput)+' tok/s · 按任务时长'],
-      spark:sparkline(pts,'throughput','var(--brand)')
+      lines:[
+        '首字 '+(t.ttftMs===null?'—':dur(t.ttftMs))+' · 端到端 '+(t.throughput||0).toFixed(1)+' tok/s',
+        '按首增量→结束计算 · 样本 '+int(t.ttftReq||0)+' 次',
+      ],
+      spark:sparkline(pts,'decodeThroughput','var(--brand)')
     })+
     kpiCard({
       icon:'❄', label:'缓存命中率', value:pct(t.cacheHitRate,1),

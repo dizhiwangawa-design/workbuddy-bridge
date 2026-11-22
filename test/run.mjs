@@ -329,15 +329,13 @@ const dshProfile = path.join(dshHome, '.dsh', 'profiles', 'web');
 const dshPatch = path.join(dshProfile, 'cordis.patch.yml');
 
 function runInstall(args, extraEnv = {}) {
+  // 在 dsh 自己托管的终端里跑测试时，环境里会带着真实的 DSH_HOME；
+  // 用例要的是隔离 HOME，所以这里显式覆盖掉。
+  const env = { ...process.env, HOME: dshHome, USERPROFILE: dshHome, ...extraEnv };
+  if (!Object.hasOwn(extraEnv, 'DSH_HOME')) env.DSH_HOME = '';
   return new Promise((resolve) => {
     const p = spawn(process.execPath, [path.join(ROOT, 'bin', 'wb.js'), 'install', ...args], {
-      env: {
-        ...process.env,
-        HOME: dshHome,
-        USERPROFILE: dshHome,
-        WB_DSH_SKIP_PLUGIN_INSTALL: '1',
-        ...extraEnv,
-      },
+      env,
       stdio: 'pipe',
     });
     p.on('close', resolve);
@@ -942,3 +940,42 @@ setTimeout(() => {
   }
   process.exit(fail ? 1 : 0);
 }, 300);
+
+test('缓存命中率不会超过 100%（上游换口径时夹住）', () => {
+  const base = new Date(2026, 10, 4, 10, 0, 0, 0).getTime();
+  const pool = { series: statsMod.emptySeries() };
+  // 原生 Anthropic 口径：input_tokens 不含 cache_read，直接把 cached 当分母会 >100%
+  statsMod.recordSample(pool, { at: base, ok: true, tin: 100, tout: 10, cacheRead: 100, ms: 1000 }, base);
+  const pts = statsMod.seriesPoints(pool, base, base + 1, 'hour');
+  const sum = statsMod.summarize(pts, { usdCny: 7.2, pin: 0, pout: 0, pcache: 0 });
+  assertEqual(sum.cacheHitRate, 1, '命中率上限应为 100%');
+  assertEqual(sum.freshIn, 0, '新鲜输入不得为负');
+});
+
+
+await test('解码速度与首字延迟是两个口径，不共用端到端吞吐', () => {
+  const base = new Date(2026, 10, 4, 10, 0, 0, 0).getTime();
+  const pool = { series: statsMod.emptySeries() };
+  // 首字节慢 3s、解码 2s 出 1000 token：端到端 tok/s 明显低于解码 tok/s。
+  statsMod.recordSample(pool, {
+    at: base, ok: true, tin: 100, tout: 1000, ms: 5000, ttftMs: 3000, decodeMs: 2000,
+  }, base);
+  const pts = statsMod.seriesPoints(pool, base, base + 1, 'hour');
+  const sum = statsMod.summarize(pts, { usdCny: 7.2, pin: 0, pout: 0, pcache: 0 });
+  assertEqual(Math.round(sum.ttftMs), 3000, '首字延迟应取实测值');
+  assertEqual(sum.decodeThroughput, 500, '解码速度 = 输出 / 解码窗口');
+  assertEqual(Math.round(sum.throughput), 200, '端到端吞吐 = 输出 / 全部时长');
+  assert(sum.decodeThroughput > sum.throughput, '解码速度必须高于端到端吞吐');
+});
+
+await test('没有首增量样本时首字与解码速度保持 null，不污染均值', () => {
+  const base = new Date(2026, 10, 4, 11, 0, 0, 0).getTime();
+  const pool = { series: statsMod.emptySeries() };
+  statsMod.recordSample(pool, { at: base, ok: true, tin: 10, tout: 20, ms: 900 }, base);
+  const pts = statsMod.seriesPoints(pool, base, base + 1, 'hour');
+  const sum = statsMod.summarize(pts, { usdCny: 7.2, pin: 0, pout: 0, pcache: 0 });
+  assertEqual(sum.ttftMs, null, '无样本时首字延迟应为 null');
+  assertEqual(sum.decodeThroughput, null, '无样本时解码速度应为 null');
+  assertEqual(Math.round(sum.throughput) > 0, true, '端到端吞吐仍然有值');
+});
+
