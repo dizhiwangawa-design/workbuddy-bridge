@@ -187,6 +187,7 @@ if (toolUse) {
 - **真实流式**：可见文本到达即转发。工具调用延后到响应结束统一裁决，随后按 Anthropic 事件格式追加 `tool_use` blocks。
 - **结构优先**：合法结构化 `tool_calls` 优先；只有结构化调用全部无效时才回退到文本 DSML。两者同时有效会记录安全 warning，只包含模型、请求 ID、账号、数量和参数哈希，不记录原始参数。
 - **DSML 上限**：扫描器默认最多缓冲 2 MiB。超限、畸形或截断时失败关闭，不向正文泄漏 DSML，流式错误后不发送 `message_stop`。
+- **推理通道同样过扫描器**：模型有时把工具调用写进思考而非正文。三条协议都为 reasoning 单独跑一个 DSML 扫描器，把调用剥离出来并入仲裁，推理正文里只留可见部分；正文与推理各自独立缓冲，互不串味。推理是辅助通道，**片段畸形只丢弃并告警，不判整轮失败**（正文通道仍然失败关闭）。
 - **四层超时**：首字节 60 秒、流中空闲 120 秒、`finish_reason` 后宽限 2 秒、总时长 600 秒。流开始后无法安全换号，只会终止当前响应；账号 inflight 始终释放。
 - **SSE 保活**：`message_start` 后每 15 秒发送一次 Anthropic `ping`，防止下游代理因短暂无事件而断开。ping 不代表上游出现了新内容。
 - **乱序工具结果**：user message 中排在 text/image 后的 `tool_result` 会自动移到最前，并保持 result 组与剩余块各自的相对顺序；引用未知 `tool_use_id` 的请求返回 400。
@@ -241,9 +242,12 @@ codex 和 dsh 这类客户端把「这一轮没有发出工具调用」当作任
 token。上游可能在 `reasoning_tokens:0` 时仍通过 `reasoning_content` 返回有效的思考
 内容，判断是否思考时应同时检查这两个信号。
 
-`none` 是尽最大努力关闭，不保证所有上游模型都停止思考。禁用 thinking 时，
-bridge 不返回 reasoning 正文；若上游仍返回非空 `reasoning_content`，服务端会为该
-请求记录一条不含正文的 warning，并如实保留上游报告的 reasoning token。
+`none` 是尽最大努力关闭，不保证所有上游模型都停止思考。三条协议用同一套判定：
+**只有客户端显式要求关闭**（Anthropic `thinking.type:"disabled"`、Responses
+`reasoning.effort:"none"`、Chat `reasoning_effort:"none"`）时，bridge 才隐藏上游返回的
+reasoning 正文；若此时上游仍返回非空 `reasoning_content`，服务端为该请求记录一条不含
+正文的 warning，并如实保留上游报告的 reasoning token。**没写档位不等于要求关闭**——
+那种请求照常返回推理正文，否则会静默砍掉既有功能。
 
 `count_tokens` 是确定性本地估算，不是 Anthropic 官方 tokenizer。中英文混合和长上下文可能有明显误差，**不得用于精确计费或裁剪刚好达到上下文上限的请求**；实际请求仍应处理上游的 `context_length_exceeded`。
 
@@ -332,6 +336,8 @@ OpenAI 与 Anthropic 路由共用客户端 Key，也共用现有号池和扫码�
 - Chat `stream: true` 返回标准 SSE：文本立即转发，思考提示透传
   `reasoning_content`，最后只发送一个合法的 `finish_reason` 和 `[DONE]`。生产环境每
   15 秒发送一次 keepalive 空 `choices` chunk，不伪造完成或工具调用。
+- 思考提示来自上游 `reasoning_content`，同样会过 DSML 扫描器：写进思考通道的
+  `tool_calls` 会被剥离成真正的工具调用，`reasoning_content` 里不会留下原始标记。
 - `tools` 支持 OpenAI function 工具；`tool_choice` 支持 `auto` / `none` /
   `required` / 指定函数。历史 assistant `tool_calls` 与 `role:"tool"` 的
   `tool_call_id` 可续传。关闭 API 配置中的工具开关时返回
@@ -366,8 +372,10 @@ Chat Completions 的顶层 `reasoning_effort` 与 Responses 的
 - 单值 `reasoning.effort` 表示该模型唯一的非关闭档位；例如声明 `medium` 的模型
   会接收 `medium`，不会因为客户端要求 `high` 就改成 `high`。
 - 已知支持 reasoning 的模型在请求缺少档位时显式接收 `none`。
-- 模型目录明确声明无 reasoning，或缓存中没有该模型时，不向上游发送
-  `reasoning_effort`。
+- **只有**模型目录明确声明无 reasoning 时才不发送。目录中查不到该模型（未预热、
+  超时、模型不在上游列表里）时**透传客户端声明的档位**——这正是 DeepSeek Harness
+  这类手写模型列表的客户端的常态，否则它的思维链会整段丢失。
+- 客户端显式要求 `none` 时一律照发，不会因模型元数据被改写。
 - Responses 的 `reasoning.effort` 回显实际转发值；它可能与客户端请求值不同。
 - 未知档位名返回 `400 invalid_reasoning_effort`。这是对 Chat 过去静默透传行为的
   有意变更。
@@ -441,7 +449,18 @@ WorkBuddy 没有公开的额度查询接口，桥接只使用 CLI 或 API 实际
 - **已用**：真实数据。MCP 路径从 CLI `result.usage` 取 `input_tokens` / `output_tokens` / `cache_read_input_tokens`；API 路径从上游 `usage.prompt_tokens` / `completion_tokens` 记账。
   实测 CLI 0.2.x 的 `input_tokens` **已经包含**缓存读取部分，所以总输入就是 `input_tokens`，不再二次相加——之前多算一遍会让用量虚高近一倍
 - **剩余**：需要给账号设一个每日预算（`budgetTokens`）。设了才算得出剩余和百分比，并据此停派；不设就只显示用量，不做拦截
-- **缓存命中率** = `cache_read_input_tokens ÷ input_tokens`
+- **缓存命中率** = `cache_read_input_tokens ÷ input_tokens`（夹在 100% 以内：上游偶尔会报一个比
+  `input_tokens` 还大的 cached，那是原生 Anthropic 口径，不是我们算错了）
+- **三种速度口径互不替代**：
+
+  | 指标 | 分子 / 分母 | 回答什么 |
+  |:---|:---|:---|
+  | 首字延迟 `ttftMs` | 请求发出 → 首个可见增量（正文 / 推理 / 工具调用任一） | 首字多慢 |
+  | 解码速度 `decodeThroughput` | `decodeTokens ÷ decodeMs`（首增量 → 结束） | 模型本身多快，与 dsh 的 `decodeTokens/decodeMs` 同口径 |
+  | 端到端吞吐 `throughput` | `output_tokens ÷ 全时长`（含排队、首字节、慢客户端写） | 这个客户端有多快 |
+
+  面板 KPI 显示的是**解码速度**；首字延迟与端到端吞吐作为副行。只有后两者都观测不到时对应字段为
+  `null`（而不是 0），避免把「没有样本」画成「速度是 0」
 - **费用**：优先用 CLI 返回的 `total_cost_usd`；没有就按 `WB_PRICE_IN` / `WB_PRICE_OUT` 估算；两者都没配时显示未上报计价，不猜
 
 明细保留：小时桶 16 天、天桶 400 天、最近请求 160 条。够画一整年热力图，又不会让 `pool.json` 无限膨胀。
@@ -467,7 +486,7 @@ wb http --port 7666   # 管理页默认 http://127.0.0.1:7666/admin
 
 | 区块 | 内容 |
 |:---|:---|
-| KPI | Token 消耗（输入 / 输出 / 缓存读写拆分）、请求数、生成速度、缓存命中率、API 等价费用、成功率环 |
+| KPI | Token 消耗（输入 / 输出 / 缓存读写拆分）、请求数、解码速度（副行给首字与端到端）、缓存命中率、API 等价费用、成功率环 |
 | 时序图 | Token / 请求数 / 吞吐量三视图，柱状叠折线，悬停看逐点明细；按区间自动切小时或按天聚合 |
 | 最近请求 | 实时活动流：时间、模型、账号、token、耗时，失败的标红 |
 | 工作回潮 | GitHub 风格年度热力图，按 token 量分五档；右侧是活跃天数、总请求、总 token、峰值日 |
@@ -620,6 +639,35 @@ models:
 `input` 与 `wb_reasoning`，但当前 dsh 网络发现只采纳 id、名称和容量，因此手写条目
 仍需把能力字段写在 `cordis.patch.yml` 中。
 
+**4. dsh 的 tok/s 本身是虚高的，桥接改不了。**
+
+dsh 的 `sessionStats` 折叠把速度算成 `ΣoutputTokens / Σ(t_message − t_firstToken)`。
+纯工具调用步的可见内容（参数 JSON）在上游是一帧下发的，那个窗口塌成 0–3ms，
+于是分子照算、分母近零 —— 两个真实会话里分别有 63.4% 与 44.5% 的输出 token 落在这种步上，
+读数就成了 527 / 252 tok/s。
+
+这不是桥接能修的（它在 dsh 包里），所以仓库里带了一份最小改动的 fork：
+`vendor/dsh-session-stats-0.2.1-rc.5/`。它把零窗口步剔出 decode 统计，并按通道把
+provider 报的总数拆成 `decodeFrameTokens` / `decodeTextTokens` / `decodeReasoningTokens`；
+既有字段名与语义一个没改，`stateVersion` 从 1 提到 2 让旧缓存行整批重算。
+同一批会话复算后为 193.5 / 141.3 tok/s。
+
+部署方式、为什么门槛取 5ms、以及「拆分是比例归因而非精确计数」这一条限制，都在
+`vendor/dsh-session-stats-0.2.1-rc.5/README.md` 里。要点：**loader 不允许只按 `id` 改插件名**
+（会报 `patch: name mismatch for "session-stats" ... skipping`），必须禁用原行再 insert 新行：
+
+```yaml
+- id: session-stats
+  disabled: true
+- insert:
+    - id: session-stats-patched
+      name: 'dsh-session-stats-patched'
+```
+
+插件名由 profile 目录的 `node_modules` 解析，所以要把 fork 软链进去（与 `dsh-computer-use-linux`
+同一套做法）。改完 `dsh --profile <p> --dump-config` 应看到 `disabled: true` 与新行、且无 mismatch 警告，
+然后**重启 dsh** —— 插件树是启动时快照的，不重启不生效。
+
 ## 工具一览
 
 | 工具 | 作用 |
@@ -744,7 +792,16 @@ wb login --site ioa         # 腾讯内网
 - **DSML 失败关闭**：识别到 DSML envelope 后，畸形、截断或超过 2 MiB 会终止响应，不回退为工具调用，也不把原始标记混入正文。
 - **stdio 不污染**：MCP 的 stdout 是协议通道，桥接所有日志走 stderr 和 `~/.workbuddy-bridge/logs/`。
 - **导出包敏感**：`wb export` 的 tgz 等同账号权限，自行保管。
-- **管理界面默认只监听 127.0.0.1**：`wb http --host 0.0.0.0` 会把账号、Key 和 API 管理能力暴露到网络；务必同时设置 `WB_ADMIN_TOKEN`，并给远程 API 客户端配置独立 Key。
+- **管理接口门禁由监听地址决定**：回环监听时本机免令牌；**非回环监听且未设 `WB_ADMIN_TOKEN` 时
+  `wb http` / `wb admin` 直接拒绝启动**（以前只打一行黄字建议）。设了令牌后，`/api/api-compat`、
+  `/api/pool`、`/api/stats` 只接受 `x-wb-token` 请求头；URL 里的 `?token=` 仅用于首次打开管理页，
+  页面会立刻用 `history.replaceState` 把它从地址栏抹掉（避免进浏览器历史与反代日志）。
+  手机扫码场景建议用 SSH 端口转发，而不是 `--host 0.0.0.0`。
+- **上游地址白名单**：`upstreamBaseUrl` 直接决定 accessToken 发往哪里，因此禁止指向本机/内网/
+  链路本地地址（含 169.254.169.254 元数据）。自建网关需要内网时设 `WB_ALLOW_PRIVATE_UPSTREAM=1`；
+  要限制到固定域名就设 `WB_UPSTREAM_ALLOW_HOSTS=gw.example.com,*.corp.example`。
+- **上游地址与超时是热更新**：编辑后保存即生效，不需要重启。（旧版本在启动时把它们固化进闭包，
+  PATCH 返回 200、页面显示已保存，但实际仍走老地址。）
 
 ## 常见问题
 
