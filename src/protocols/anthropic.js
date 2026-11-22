@@ -357,8 +357,20 @@ export function createAnthropicEncoder({
 
   // Anthropic 的 prompt 缓存是原生字段；上游没报（或为 0）时不输出，
   // 保持既有响应形状，避免严格 schema 的客户端因多出字段报错。
-  function usage(outputTokens, reasoningTokens, cacheReadTokens = 0, cacheWriteTokens = 0) {
+  function usage(
+    outputTokens,
+    reasoningTokens,
+    cacheReadTokens = 0,
+    cacheWriteTokens = 0,
+    inputTokens = null,
+  ) {
     return {
+      // message_start 只能给估算值（上游还没上报）。message_delta 是最后一次机会，
+      // 客户端（Anthropic SDK / pi-ai）会用这里的 input_tokens 覆盖初值，
+      // 因此有真实值时必须带上，否则上下文占用会一直停在 bytes/3 的估算上。
+      ...(Number.isFinite(inputTokens) && inputTokens > 0
+        ? { input_tokens: Math.max(0, inputTokens) }
+        : {}),
       output_tokens: Math.max(0, Number(outputTokens) || 0),
       output_tokens_details: {
         reasoning_tokens: Math.max(0, Number(reasoningTokens) || 0),
@@ -445,6 +457,7 @@ export function createAnthropicEncoder({
       reasoningTokens = 0,
       cacheReadTokens = 0,
       cacheWriteTokens = 0,
+      inputTokens = null,
     } = {}) {
       if (finished) return [];
       finished = true;
@@ -483,7 +496,13 @@ export function createAnthropicEncoder({
           stop_reason: stopReason(finishReason, calls.length > 0),
           stop_sequence: null,
         },
-        usage: usage(outputTokens, reasoningTokens, cacheReadTokens, cacheWriteTokens),
+        usage: usage(
+          outputTokens,
+          reasoningTokens,
+          cacheReadTokens,
+          cacheWriteTokens,
+          inputTokens,
+        ),
       }));
       events.push(event('message_stop', {
         type: 'message_stop',

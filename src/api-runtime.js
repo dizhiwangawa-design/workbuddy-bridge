@@ -46,7 +46,7 @@ import {
 } from './stream-control.js';
 import { createDeadLetter, createResponsesStore } from './responses-store.js';
 import { createChatEncoder } from './protocols/openai.js';
-import { resolveReasoningEffort } from './reasoning-effort.js';
+import { resolveReasoningEffort, resolveRequestedEffort } from './reasoning-effort.js';
 
 const ANTHROPIC_ESTIMATOR = 'wb-conservative-v1';
 const PING_INTERVAL_MS = PRODUCTION_KEEPALIVE_MS;
@@ -361,6 +361,13 @@ export function createAnthropicRuntime({
     let encoder;
     let usage = { inputTokens: inputEstimate, outputTokens: 0 };
     let warnedThinkingWhileDisabled = false;
+    // 首个「可见」增量的时刻（正文或推理，非空）。decode 窗口从这里算起，
+    // 与 dsh 的 t_firstToken 同口径；工具调用本身也算可见内容。
+    let firstVisibleAt = 0;
+    const markVisible = () => { if (!firstVisibleAt) firstVisibleAt = now(); };
+    // 推理通道单独一把扫描器：模型常把工具调用写进思考里，那条通道以前不过扫描器，
+    // 于是原始标记既泄漏给客户端，又少执行一次本该发生的调用。
+    const reasoningScanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
     let finishReason = null;
     let sawDone = false;
     let leaseResult = {
@@ -561,11 +568,16 @@ export function createAnthropicRuntime({
       ensureStarted();
       const scanned = scanner.push(text);
       if (scanned.error) throwScannerError(scanned.error);
-      if (scanned.calls.length) dsmlCalls.push(...scanned.calls);
+      if (scanned.calls.length) {
+        dsmlCalls.push(...scanned.calls);
+        markVisible();
+      }
       if (scanned.visibleText && stream) {
+        markVisible();
         appendRuntimeText(visibleText, scanned.visibleText);
         write(encoder.textDelta(scanned.visibleText));
       } else if (scanned.visibleText) {
+        markVisible();
         appendRuntimeText(visibleText, scanned.visibleText);
       }
     }
@@ -594,25 +606,44 @@ export function createAnthropicRuntime({
         if (Array.isArray(messageTools)) pushStructured(messageTools);
         if (Array.isArray(delta.tool_calls)) pushStructured(delta.tool_calls);
         if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
-          appendRuntimeText(reasoningText, delta.reasoning_content);
-          if (body.normalized.thinkingEnabled) {
-            ensureStarted();
-            if (encoder && !cancelKind) {
-              write(encoder.thinkingDelta(delta.reasoning_content));
-            }
-          } else if (!warnedThinkingWhileDisabled) {
-            warnedThinkingWhileDisabled = true;
-            logWarn(
-              `Anthropic request ${requestId} received reasoning content while thinking `
-              + 'was disabled; the model may not honor none',
-            );
-          }
+          applyReasoningDocument(delta.reasoning_content);
         }
         if (delta.content !== undefined) feedContent(delta.content);
         if (choice.finish_reason) {
           finishReason = choice.finish_reason;
           armFinishGrace();
         }
+      }
+    }
+
+    /**
+     * 推理通道的清洗：只把可见文本交给 thinking 块，DSML 调用合并进 dsmlCalls。
+     *
+     * 与正文通道的差别在于失败策略——推理是辅助通道，畸形片段只丢不判整轮失败。
+     */
+    function applyReasoningDocument(text) {
+      if (!text) return;
+      if (!body.normalized.thinkingEnabled && !warnedThinkingWhileDisabled) {
+        warnedThinkingWhileDisabled = true;
+        logWarn(
+          `Anthropic request ${requestId} received reasoning content while thinking `
+          + 'was disabled; the model may not honor none',
+        );
+      }
+      const scannedReasoning = reasoningScanner.push(text);
+      if (scannedReasoning.calls.length) dsmlCalls.push(...scannedReasoning.calls);
+      if (scannedReasoning.error) {
+        logWarn(
+          `Anthropic reasoning channel carried malformed DSML: ${scannedReasoning.error.code}`,
+        );
+        return;
+      }
+      if (!body.normalized.thinkingEnabled || !scannedReasoning.visibleText) return;
+      markVisible();
+      appendRuntimeText(reasoningText, scannedReasoning.visibleText);
+      ensureStarted();
+      if (encoder && !cancelKind) {
+        write(encoder.thinkingDelta(scannedReasoning.visibleText));
       }
     }
 
@@ -806,6 +837,16 @@ export function createAnthropicRuntime({
         appendRuntimeText(visibleText, scannedEnd.visibleText);
         if (stream) write(encoder.textDelta(scannedEnd.visibleText));
       }
+      // 推理通道的收尾与正文同口径：补回缓冲里的可见尾巴，把调用交给仲裁。
+      const scannedReasoningEnd = reasoningScanner.finish();
+      if (scannedReasoningEnd.calls.length) dsmlCalls.push(...scannedReasoningEnd.calls);
+      if (scannedReasoningEnd.error) {
+        logWarn(`Anthropic reasoning channel ended with ${scannedReasoningEnd.error.code}`);
+      } else if (scannedReasoningEnd.visibleText && body.normalized.thinkingEnabled) {
+        appendRuntimeText(reasoningText, scannedReasoningEnd.visibleText);
+        ensureStarted();
+        if (stream) write(encoder.thinkingDelta(scannedReasoningEnd.visibleText));
+      }
       const structuredEnd = structured.finish();
       if (
         structuredEnd.invalid.length > 0
@@ -894,6 +935,11 @@ export function createAnthropicRuntime({
           reasoningTokens,
           cacheReadTokens: Math.max(0, Number(usage.cacheReadTokens) || 0),
           cacheWriteTokens: Math.max(0, Number(usage.cacheWriteTokens) || 0),
+          // 上游已经报了真实的 prompt_tokens 就用它收尾，不要再让客户端停在
+          // message_start 的 bytes/3 估算上。
+          inputTokens: Number.isFinite(Number(usage.inputTokens)) && Number(usage.inputTokens) > 0
+            ? Number(usage.inputTokens)
+            : null,
         }));
         if (!cancelKind && !writer?.failed && writer?.ended) {
           terminate('client', clientWriteFailure());
@@ -926,9 +972,17 @@ export function createAnthropicRuntime({
         durationMs: now() - startedAt,
         meta: {
           model: body.requestBody.model,
+          // 与 dsh 的 decodeTokens/decodeMs 同口径：首增量 → 结束。
+          ttftMs: firstVisibleAt ? firstVisibleAt - startedAt : 0,
+          decodeMs: firstVisibleAt ? now() - firstVisibleAt : 0,
           usage: {
+            // usage.inputTokens 来自上游 prompt_tokens；只有上游完全没报时才退回估算。
             input_tokens: usage.inputTokens || inputEstimate,
             output_tokens: Math.max(0, outputTokens),
+            // 号池按 cache_read_input_tokens / cache_creation_input_tokens 记账；
+            // 这里不漏字段，面板的缓存命中率才不会恒为 0。
+            cache_read_input_tokens: Math.max(0, Number(usage.cacheReadTokens) || 0),
+            cache_creation_input_tokens: Math.max(0, Number(usage.cacheWriteTokens) || 0),
           },
         },
       };
@@ -1374,6 +1428,9 @@ export function createOpenAIRuntime({
     const reasoningText = createRuntimeTextCache({ hardBytes });
     const refusalText = createRuntimeTextCache({ hardBytes });
     const scanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
+    // 推理通道单独一把扫描器：模型常把工具调用写进思考里，那条通道以前不过扫描器，
+    // 于是原始标记既泄漏给用户，又少执行一次本该发生的调用。
+    const reasoningScanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
     const writer = body.stream
       ? createHttpEventWriter(res, {
           protocol: 'openai',
@@ -1388,6 +1445,10 @@ export function createOpenAIRuntime({
     let encoder = null;
     let pingTimer = null;
     let responseEnded = false;
+    let warnedReasoningWhileDisabled = false;
+    // 首个「可见」增量的时刻（正文/推理/工具调用任一）。decode 窗口从这里算起。
+    let firstVisibleAt = 0;
+    const markVisible = () => { if (!firstVisibleAt) firstVisibleAt = now(); };
     let leaseResult = {
       ok: false,
       code: 'ABORTED',
@@ -1546,6 +1607,8 @@ export function createOpenAIRuntime({
       } catch (error) {
         throw structuredRuntimeFailure(error);
       }
+      // 工具调用同样是「可见内容」：dsh 的首 token 判定把它算在内。
+      if (Array.isArray(deltas) ? deltas.length : Boolean(deltas)) markVisible();
     }
 
     function feedContent(content) {
@@ -1553,11 +1616,46 @@ export function createOpenAIRuntime({
       if (!text) return '';
       const scanned = scanner.push(text);
       if (scanned.error) scannerError(scanned.error);
-      dsmlCalls.push(...scanned.calls);
+      if (scanned.calls.length) {
+        dsmlCalls.push(...scanned.calls);
+        markVisible();
+      }
       if (scanned.visibleText) {
+        markVisible();
         appendRuntimeText(visibleText, scanned.visibleText);
       }
       return scanned.visibleText;
+    }
+
+    /**
+     * 推理通道的清洗：只把可见文本交出去，DSML 调用合并进 dsmlCalls。
+     *
+     * 与正文通道的差别在于失败策略——推理是辅助通道，畸形片段只丢不判整轮失败，
+     * 否则一段跑偏的思考会把本来能成功的回合打成错误。
+     */
+    function applyReasoningDocument(text) {
+      if (!text) return;
+      if (body.reasoningSuppressed && !warnedReasoningWhileDisabled) {
+        warnedReasoningWhileDisabled = true;
+        warn(
+          `Chat request ${chatResponseId} received reasoning content while `
+          + 'reasoning_effort was none; the model may not honor none',
+        );
+      }
+      const scannedReasoning = reasoningScanner.push(text);
+      if (scannedReasoning.calls.length) dsmlCalls.push(...scannedReasoning.calls);
+      if (scannedReasoning.error) {
+        warn(`Chat reasoning channel carried malformed DSML: ${scannedReasoning.error.code}`);
+        return;
+      }
+      if (body.reasoningSuppressed || !scannedReasoning.visibleText) return;
+      markVisible();
+      appendRuntimeText(reasoningText, scannedReasoning.visibleText);
+      if (body.stream) {
+        ensureStreamStarted();
+        if (!encoder || cancelKind) return;
+        emit(encoder.reasoningDelta(scannedReasoning.visibleText));
+      }
     }
 
     function processDocument(document) {
@@ -1584,12 +1682,7 @@ export function createOpenAIRuntime({
       finishReason = choice.finish_reason || finishReason;
       const payload = choice.delta || choice.message || {};
       if (typeof payload.reasoning_content === 'string') {
-        appendRuntimeText(reasoningText, payload.reasoning_content);
-        if (body.stream) {
-          ensureStreamStarted();
-          if (!encoder || cancelKind) return;
-          emit(encoder.reasoningDelta(payload.reasoning_content));
-        }
+        applyReasoningDocument(payload.reasoning_content);
       }
       if (typeof payload.refusal === 'string') {
         appendRuntimeText(refusalText, payload.refusal);
@@ -1676,10 +1769,16 @@ export function createOpenAIRuntime({
         credentials,
         model: body.model,
       }) || null;
-      const forwardedEffort = resolveReasoningEffort(body.requestedEffort, declaration);
+      const decision = resolveRequestedEffort(body.requestedEffort, declaration);
+      const forwardedEffort = decision.effort;
       if (forwardedEffort === null) delete body.body.reasoning_effort;
       else body.body.reasoning_effort = forwardedEffort;
       body.forwardedEffort = forwardedEffort;
+      // 客户端**显式**要求 none，上游却仍返回 reasoning_content（CHANGELOG 的
+      // 已知限制）——此时正文不该透给客户端，与 Anthropic 路径对齐。
+      // 只认显式意图：没声明档位（source: 'default'）不是「要求关闭思考」，
+      // 那种情况照常透出推理，否则会静默砍掉既有功能。
+      body.reasoningSuppressed = decision.source === 'disabled';
 
       armTotal();
       armFirstByte();
@@ -1744,7 +1843,27 @@ export function createOpenAIRuntime({
       const scannedEnd = scanner.finish();
       if (scannedEnd.error) scannerError(scannedEnd.error);
       dsmlCalls.push(...scannedEnd.calls);
-      appendRuntimeText(visibleText, scannedEnd.visibleText);
+      // 缓冲里可能留着一截「看着像 DSML 开头」的可见尾巴（例如正文以 "<" 结尾）。
+      // 非流式靠 visibleText 收尾即可，流式必须把它补发一次，否则客户端字面上丢字符。
+      if (scannedEnd.visibleText) {
+        appendRuntimeText(visibleText, scannedEnd.visibleText);
+        if (body.stream && encoder && !cancelKind) {
+          ensureStreamStarted();
+          emit(encoder.textDelta(scannedEnd.visibleText));
+        }
+      }
+      // 推理通道的收尾与正文同口径：补回缓冲里的可见尾巴，把调用交给仲裁。
+      const scannedReasoningEnd = reasoningScanner.finish();
+      if (scannedReasoningEnd.calls.length) dsmlCalls.push(...scannedReasoningEnd.calls);
+      if (scannedReasoningEnd.error) {
+        warn(`Chat reasoning channel ended with ${scannedReasoningEnd.error.code}`);
+      } else if (scannedReasoningEnd.visibleText && !body.reasoningSuppressed) {
+        appendRuntimeText(reasoningText, scannedReasoningEnd.visibleText);
+        if (body.stream && encoder && !cancelKind) {
+          ensureStreamStarted();
+          emit(encoder.reasoningDelta(scannedReasoningEnd.visibleText));
+        }
+      }
       if (cancelKind) {
         const outputTokens = conservativeTokenEstimate(visibleText.value());
         const usage = openAIUsage(upstreamUsage, inputEstimate, outputTokens);
@@ -1900,9 +2019,16 @@ export function createOpenAIRuntime({
         durationMs: now() - startedAt,
         meta: {
           model: body.model,
+          // 与 dsh 的 decodeTokens/decodeMs 同口径：首增量 → 结束。
+          ttftMs: firstVisibleAt ? firstVisibleAt - startedAt : 0,
+          decodeMs: firstVisibleAt ? now() - firstVisibleAt : 0,
           usage: {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
+            // 号池按 cache_read_input_tokens / cache_creation_input_tokens 记账；
+            // 这里不漏字段，面板的缓存命中率才不会恒为 0。
+            cache_read_input_tokens: Math.max(0, Number(usage.prompt_tokens_details?.cached_tokens) || 0),
+            cache_creation_input_tokens: 0,
           },
         },
       };

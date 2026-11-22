@@ -38,7 +38,7 @@ import {
   mergePartialOutput,
 } from './responses-store.js';
 import { debug, warn } from './log.js';
-import { resolveReasoningEffort } from './reasoning-effort.js';
+import { resolveRequestedEffort } from './reasoning-effort.js';
 
 function runtimeError(message, code, {
   status = 502,
@@ -139,13 +139,16 @@ export function createResponsesRuntime(options = {}) {
       credentials,
       model: prepared.model,
     }) || null;
-    const forwardedEffort = resolveReasoningEffort(
-      prepared.requestedEffort,
-      declaration,
-    );
+    const decision = resolveRequestedEffort(prepared.requestedEffort, declaration);
+    const forwardedEffort = decision.effort;
     if (forwardedEffort === null) delete prepared.body.reasoning_effort;
     else prepared.body.reasoning_effort = forwardedEffort;
     prepared.forwardedEffort = forwardedEffort;
+    // 客户端**显式**要求 none，上游却仍返回 reasoning_content（CHANGELOG 的
+    // 已知限制）——此时正文不该透给客户端，与 Anthropic 路径对齐。
+    // 只认显式意图：没声明档位（source: 'default'）不是「要求关闭思考」，
+    // 那种情况照常透出推理，否则会静默砍掉既有功能。
+    prepared.reasoningSuppressed = decision.source === 'disabled';
     return forwardedEffort;
   }
 
@@ -259,6 +262,11 @@ export function createResponsesRuntime(options = {}) {
     let usage = null;
     let phase = 'opening';
     let sawDone = false;
+    let warnedReasoningWhileDisabled = false;
+    // 首个「可见」增量的时刻（正文/推理/工具调用任一）。decode 窗口从这里算起，
+    // 与 dsh 的 t_firstToken 同口径。
+    let firstVisibleAt = 0;
+    const markVisible = () => { if (!firstVisibleAt) firstVisibleAt = now(); };
     let parser = null;
     let liveEncoder = null;
     const visibleText = createResponseTextCache({ hardBytes });
@@ -267,6 +275,11 @@ export function createResponsesRuntime(options = {}) {
       maxBytes: structuredToolArgumentLimit(config.dsmlMaxBufferBytes, hardBytes),
     });
     const scanner = createDsmlScanner({
+      maxBufferBytes: config.dsmlMaxBufferBytes,
+    });
+    // 推理通道单独一把扫描器：模型常把工具调用写进思考里，那条通道以前不过扫描器，
+    // 于是原始标记既泄漏给用户，又少执行一次本该发生的调用。
+    const reasoningScanner = createDsmlScanner({
       maxBufferBytes: config.dsmlMaxBufferBytes,
     });
     const dsmlCalls = [];
@@ -378,6 +391,8 @@ export function createResponsesRuntime(options = {}) {
           error?.code || 'UPSTREAM_INVALID_TOOL_CALL',
         );
       }
+      // 工具调用同样是「可见内容」：dsh 的首 token 判定把它算在内。
+      if (Array.isArray(deltas) ? deltas.length : Boolean(deltas)) markVisible();
     }
 
     function snapshot(final = false) {
@@ -385,9 +400,21 @@ export function createResponsesRuntime(options = {}) {
       const calls = Array.isArray(snapshotValue) ? snapshotValue : (snapshotValue.calls || []);
       const invalidCalls = Array.isArray(snapshotValue) ? [] : (snapshotValue.invalid || []);
       const scanned = final ? scanner.finish() : { visibleText: '', calls: [], error: null };
+      const scannedReasoning = final
+        ? reasoningScanner.finish()
+        : { visibleText: '', calls: [], error: null };
       const truncation = scanned.error?.code === 'DSML_TRUNCATED';
       if (scanned.error && !truncation) {
         throw runtimeError('upstream DSML tool call is malformed', scanned.error.code);
+      }
+      if (final) {
+        // 推理通道的收尾与正文同口径：把缓冲里的可见尾巴补回去，把调用交给仲裁。
+        if (scannedReasoning.calls.length) dsmlCalls.push(...scannedReasoning.calls);
+        if (scannedReasoning.error) {
+          warn(`Responses reasoning channel ended with ${scannedReasoning.error.code}`);
+        } else if (scannedReasoning.visibleText && !prepared.reasoningSuppressed) {
+          appendResponseText(reasoningText, scannedReasoning.visibleText);
+        }
       }
       if (
         final
@@ -612,19 +639,29 @@ export function createResponsesRuntime(options = {}) {
       if (!live?.output?.length) return finalBody;
       const head = finalBody.output.slice(0, prior.length);
       const tail = finalBody.output.slice(prior.length);
-      const liveFor = (type) => live.output.find((candidate) => candidate.type === type);
-      // 带 live 身份的块按 live 顺序排在前面，其余（工具调用等）保持原有相对顺序。
+      // 同类型可能有多个块（并行工具调用），必须按**出现次序**配对，不能只按类型取第一个，
+      // 否则两个 function_call 会拿到同一个 live id，身份就串了。
+      const queues = new Map();
+      for (const [position, liveItem] of live.output.entries()) {
+        queueFor(liveItem.type).push({ liveItem, position });
+      }
+      function queueFor(type) {
+        if (!queues.has(type)) queues.set(type, []);
+        return queues.get(type);
+      }
+      // 带 live 身份的块按 live 顺序排在前面，其余（未走 live 的调用）保持原有相对顺序。
       const withLive = [];
       const withoutLive = [];
       for (const item of tail) {
-        const liveItem = liveFor(item.type);
-        if (liveItem) withLive.push({ item, index: live.output.indexOf(liveItem) });
+        const queue = queues.get(item.type);
+        const match = queue?.shift();
+        if (match) withLive.push({ item, liveItem: match.liveItem, index: match.position });
         else withoutLive.push(item);
       }
       withLive.sort((a, b) => a.index - b.index);
       finalBody.output = [
         ...head,
-        ...withLive.map((entry) => ({ ...entry.item, id: liveFor(entry.item.type).id })),
+        ...withLive.map((entry) => ({ ...entry.item, id: entry.liveItem.id })),
         ...withoutLive,
       ];
       return finalBody;
@@ -1148,6 +1185,36 @@ export function createResponsesRuntime(options = {}) {
       }
     }
 
+    /**
+     * 推理通道的清洗：只把可见文本交出去，DSML 调用合并进 dsmlCalls。
+     *
+     * 与正文通道的差别在于失败策略——推理是辅助通道，畸形片段只丢不判整轮失败，
+     * 否则一段跑偏的思考会把本来能成功的回合打成 502。
+     */
+    function applyReasoningDocument(text) {
+      if (!text) return;
+      if (prepared.reasoningSuppressed && !warnedReasoningWhileDisabled) {
+        warnedReasoningWhileDisabled = true;
+        warn(
+          `Responses request ${responseId} received reasoning content while `
+          + 'reasoning_effort was none; the model may not honor none',
+        );
+      }
+      const scannedReasoning = reasoningScanner.push(text);
+      if (scannedReasoning.calls.length) {
+        dsmlCalls.push(...scannedReasoning.calls);
+        phase = 'tool_call';
+      }
+      if (scannedReasoning.error) {
+        warn(`Responses reasoning channel carried malformed DSML: ${scannedReasoning.error.code}`);
+        return;
+      }
+      if (prepared.reasoningSuppressed || !scannedReasoning.visibleText) return;
+      markVisible();
+      appendResponseText(reasoningText, scannedReasoning.visibleText);
+      publishLive(liveEncoder?.reasoningDelta(scannedReasoning.visibleText));
+    }
+
     function applyDocument(rawDocument) {
       let document = rawDocument;
       if (typeof document === 'string') {
@@ -1171,10 +1238,7 @@ export function createResponsesRuntime(options = {}) {
       phase = 'generation';
       const payload = choice.delta || choice.message || {};
       if (typeof payload.reasoning_content === 'string') {
-        appendResponseText(reasoningText, payload.reasoning_content);
-        if (payload.reasoning_content) {
-          publishLive(liveEncoder?.reasoningDelta(payload.reasoning_content));
-        }
+        applyReasoningDocument(payload.reasoning_content);
       }
       if (Array.isArray(payload.tool_calls)) {
         pushStructured(payload.tool_calls);
@@ -1194,8 +1258,10 @@ export function createResponsesRuntime(options = {}) {
         if (scanned.calls.length) {
           dsmlCalls.push(...scanned.calls);
           phase = 'tool_call';
+          markVisible();
         }
         if (scanned.visibleText) {
+          markVisible();
           appendResponseText(visibleText, scanned.visibleText);
           if (liveEncoder) publishLive(liveEncoder.textDelta(scanned.visibleText));
         }
@@ -1279,8 +1345,14 @@ export function createResponsesRuntime(options = {}) {
         }
         clearTimers();
         const result = snapshot(true);
-        if (liveEncoder?.snapshot().content) {
-          result.content = liveEncoder.snapshot().content;
+        // live 只是「已经流出去的那部分」；scanner.finish() 之后的终态可能更长
+        // （缓冲区里还有可见尾巴），用它覆盖会把尾巴吞掉，所以只在 live 更长时取 live。
+        const liveSnapshot = liveEncoder?.snapshot();
+        if (liveSnapshot?.content && liveSnapshot.content.length > result.content.length) {
+          result.content = liveSnapshot.content;
+        }
+        if (liveSnapshot?.reasoning && liveSnapshot.reasoning.length > result.reasoning.length) {
+          result.reasoning = liveSnapshot.reasoning;
         }
         if (result.calls.length > 1 && prepared.parallelToolCalls === false) {
           result.calls = result.calls.slice(0, 1);
@@ -1310,9 +1382,16 @@ export function createResponsesRuntime(options = {}) {
           durationMs: now() - requestStarted,
           meta: {
             model: prepared.model,
+            // 与 dsh 的 decodeTokens/decodeMs 同口径：首增量 → 结束。
+            ttftMs: firstVisibleAt ? firstVisibleAt - requestStarted : 0,
+            decodeMs: firstVisibleAt ? now() - firstVisibleAt : 0,
             usage: {
               input_tokens: result.usage.prompt_tokens,
               output_tokens: result.usage.completion_tokens,
+              // 号池按 cache_read_input_tokens / cache_creation_input_tokens 记账；
+              // 这里不漏字段，面板的缓存命中率才不会恒为 0。
+              cache_read_input_tokens: Math.max(0, Number(result.usage.cached_tokens) || 0),
+              cache_creation_input_tokens: 0,
             },
           },
         });
