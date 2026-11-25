@@ -1998,3 +1998,290 @@ test('Chat 流式正文以尖括号结尾时不得丢字符', async (t) => {
   }
 });
 
+
+const { createStructuredToolAssembler } = await import('../../src/tool-calls.js');
+const { anthropicToOpenAI, conservativeTokenEstimate } = await import('../../src/protocols/anthropic.js');
+
+
+// ---------------------------------------------------------------------------
+// P0/P1 回归守卫：工具调用不得重复下发、参数分片不完整不得泄漏原始 JS 错误、
+// 非流式多工具调用不得塌到同一槽位、token 估算只算真正发出去的 body。
+// ---------------------------------------------------------------------------
+
+function toolCallStream(document) {
+  return (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(`data: ${JSON.stringify(document)}\n\ndata: [DONE]\n\n`);
+  };
+}
+
+test('Chat 流式收到 message 形状的完整工具调用时只下发一次且 index 唯一', async (t) => {
+  const { baseUrl } = await startFixture(t, toolCallStream({
+    id: 'chat-dup-guard',
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{
+          index: 0,
+          id: 'call_1',
+          type: 'function',
+          function: { name: 'read_file', arguments: '{"path":"README.md"}' },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+    usage: { prompt_tokens: 5, completion_tokens: 3 },
+  }));
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'read' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'read_file',
+          parameters: { type: 'object', properties: { path: { type: 'string' } } },
+        },
+      }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  const raw = await response.text();
+  const events = parseSse(raw);
+  const deltas = events.flatMap((event) => event.choices?.[0]?.delta?.tool_calls || []);
+  // 上游一次性给出完整调用，客户端只能看到一次；两次意味着工具会被执行两遍。
+  assert.equal(deltas.length, 1, raw);
+  assert.deepEqual(deltas.map((item) => item.index), [0], raw);
+  assert.equal(new Set(deltas.map((item) => item.id)).size, deltas.length, raw);
+  assert.equal(deltas[0].function.name, 'read_file');
+  assert.equal(deltas[0].function.arguments, '{"path":"README.md"}');
+  assert.equal(events.some((event) => event.error), false, raw);
+});
+
+test('Chat 工具参数分片不完整时不得把原始 JS 解析错误泄给客户端', async (t) => {
+  const { baseUrl } = await startFixture(t, toolCallStream({
+    id: 'chat-truncated-guard',
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{
+          index: 0,
+          id: 'call_trunc',
+          type: 'function',
+          function: { name: 'read_file', arguments: '{"path":"REA' },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+    usage: { prompt_tokens: 5, completion_tokens: 3 },
+  }));
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'read' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'read_file',
+          parameters: { type: 'object', properties: { path: { type: 'string' } } },
+        },
+      }],
+    }),
+  });
+  const raw = await response.text();
+  const events = parseSse(raw);
+  const error = events.find((event) => event.error)?.error;
+  // 关键：绝不能把 JSON.parse 的 SyntaxError 文本原样抛给客户端。
+  assert.doesNotMatch(raw, /Unterminated string|Unexpected end of JSON|JSON at position/, raw);
+  assert.doesNotMatch(String(error?.message || ''), /Unterminated string|JSON at position/, raw);
+  // 截断的参数不可执行：要么明确失败关闭，要么整轮不带可执行调用。
+  const executable = events.flatMap((event) => event.choices?.[0]?.delta?.tool_calls || []);
+  assert.equal(executable.length, 0, raw);
+  assert.ok(error, raw);
+  assert.equal(typeof error.code, 'string');
+});
+
+test('Chat 非流式两条无 index 的工具调用保持为两条独立调用', async (t) => {
+  let upstreamBody = null;
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    await once(req, 'end');
+    upstreamBody = JSON.parse(Buffer.concat(chunks).toString());
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id: 'chat-parallel',
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: '',
+          // OpenAI 非流式 message.tool_calls 结构里没有 index 字段。
+          tool_calls: [
+            { id: 'call_a', type: 'function', function: { name: 'get_weather', arguments: '{"city":"A"}' } },
+            { id: 'call_b', type: 'function', function: { name: 'get_time', arguments: '{"tz":"B"}' } },
+          ],
+        },
+        finish_reason: 'tool_calls',
+      }],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    }));
+  });
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'weather and time' }],
+      tools: ['get_weather', 'get_time'].map((name) => ({
+        type: 'function',
+        function: { name, parameters: { type: 'object', properties: {} } },
+      })),
+    }),
+  });
+  assert.equal(response.status, 200, JSON.stringify(upstreamBody));
+  const body = await response.json();
+  const calls = body.choices?.[0]?.message?.tool_calls || [];
+  assert.equal(calls.length, 2, JSON.stringify(body));
+  assert.deepEqual(calls.map((call) => call.function.name), ['get_weather', 'get_time']);
+  assert.deepEqual(
+    calls.map((call) => call.function.arguments),
+    ['{"city":"A"}', '{"tz":"B"}'],
+  );
+  assert.equal(new Set(calls.map((call) => call.id)).size, 2, 'call_id 必须唯一');
+});
+
+test('结构化装配器只对整批缺 index 的调用按下标分槽，流式分片不重新编号', () => {
+  const assembler = createStructuredToolAssembler();
+  // 整批都没有整数 index：这是非流式的「一组完整调用」，按数组下标各占一槽。
+  assembler.push([
+    { id: 'call_a', function: { name: 'get_weather', arguments: '{"city":"A"}' } },
+    { id: 'call_b', function: { name: 'get_time', arguments: '{"tz":"B"}' } },
+  ]);
+  const finished = assembler.finish();
+  assert.equal(finished.invalid.length, 0, JSON.stringify(finished));
+  assert.equal(finished.calls.length, 2, JSON.stringify(finished));
+  assert.deepEqual(finished.calls.map((call) => call.name), ['get_weather', 'get_time']);
+
+  // 流式分片：批内带整数 index，后续批次即便只有一条无 index 的分片也不得重新编号，
+  // 否则会覆盖已有槽位、把两个调用的名字和参数拼在一起。
+  const streaming = createStructuredToolAssembler();
+  streaming.push([{ index: 0, id: 'call_x', function: { name: 'read_file', arguments: '' } }]);
+  streaming.push([{ index: 1, id: 'call_y', function: { name: 'write_file', arguments: '' } }]);
+  streaming.push([{ function: { arguments: '{"path":"a"}' } }]);
+  streaming.push([{ index: 1, function: { arguments: '{"path":"b"}' } }]);
+  const streamed = streaming.finish();
+  assert.equal(streamed.invalid.length, 0, JSON.stringify(streamed));
+  assert.deepEqual(streamed.calls.map((call) => call.name), ['read_file', 'write_file']);
+  assert.deepEqual(streamed.calls.map((call) => call.input), [{ path: 'a' }, { path: 'b' }]);
+});
+
+test('Anthropic token 估算只序列化真正发出去的 body，不重复计入 requestBody', async (t) => {
+  const { baseUrl } = await startFixture(t, async (req, res) => {
+    req.resume();
+    await once(req, 'end');
+    res.writeHead(200, { 'content-type': 'application/json' });
+    // 上游不返回 usage：此时估算值会直接作为 input_tokens 报给客户端。
+    res.end(JSON.stringify({ id: 'up-no-usage', choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }));
+  });
+  settings.updateApiSettings({
+    enabled: true,
+    openai: true,
+    anthropic: true,
+    streaming: true,
+    tools: true,
+    requireApiKey: false,
+    remoteRequireKey: false,
+    trustProxy: false,
+    defaultModel: 'deepseek-v4.1-flash',
+    firstByteTimeoutMs: 2000,
+    idleTimeoutMs: 3000,
+    finishGraceMs: 100,
+    totalTimeoutMs: 5000,
+  });
+
+  const messages = [];
+  for (let i = 0; i < 120; i += 1) {
+    messages.push({ role: i % 2 === 0 ? 'user' : 'assistant', content: `${'x'.repeat(400)} message ${i}` });
+  }
+  const response = await fetch(`${baseUrl}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'deepseek-v4.1-flash', max_tokens: 64, messages }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  const reported = body.usage.input_tokens;
+  assert.ok(reported >= 1, JSON.stringify(body.usage));
+
+  // 独立复算：整个信封（含 requestBody）与 outbound body 的字节数差约一倍。
+  const envelope = { model: 'deepseek-v4.1-flash', max_tokens: 64, messages };
+  const converted = anthropicToOpenAI(envelope, {});
+  const envelopeBytes = Buffer.byteLength(JSON.stringify({
+    ...converted,
+    requestBody: envelope,
+    stream: false,
+  }));
+  const outboundBytes = Buffer.byteLength(JSON.stringify(converted.body));
+  assert.ok(
+    envelopeBytes > outboundBytes * 1.5,
+    `信封 ${envelopeBytes}B 应远大于 outbound ${outboundBytes}B`,
+  );
+  // 只估 outbound：报出的值必须接近 outbound 的估算量级，而不是信封的。
+  const envelopeEstimate = conservativeTokenEstimate({
+    ...converted,
+    requestBody: envelope,
+    stream: false,
+  });
+  const outboundEstimate = conservativeTokenEstimate(converted.body);
+  assert.ok(
+    reported <= outboundEstimate * 1.1,
+    `input_tokens=${reported} 应贴近 outbound 估算 ${outboundEstimate}（信封估算为 ${envelopeEstimate}）`,
+  );
+  assert.ok(reported < envelopeEstimate, '不得再按整个信封估算');
+});
+
+const { writeJson } = await import('../../src/paths.js');
+
+
+test('writeJson 落盘使用紧凑格式且可无损读回', () => {
+  const file = path.join(tmp, 'compact-check', 'config.json');
+  const data = {
+    apiCompat: { enabled: true, keys: [{ key: 'sk-wb_x', label: 'demo' }] },
+    accounts: { a: { enabled: true, maxConcurrency: 2 } },
+  };
+  writeJson(file, data);
+  const raw = fs.readFileSync(file, 'utf8');
+  // 配置文件没人读缩进：美化输出会让每次同步落盘多写 60% 的字节。
+  assert.equal(raw.includes('\n'), false, 'writeJson 不应再输出换行/缩进');
+  assert.equal(raw, JSON.stringify(data));
+  assert.deepEqual(JSON.parse(raw), data);
+});
+
+const { createSseParser } = await import('../../src/sse.js');
+
+
+
+test('SSE 解析器的事件对象仍可隐式转回原始 JSON 文本（既有契约，勿删）', () => {
+  // src/protocols/anthropic.js 的调用方会直接 JSON.parse(event.data)，
+  // 依赖事件对象转字符串时回落到原始载荷。删掉 sse.js 的 toString 会打断这条路。
+  const parser = createSseParser();
+  const events = parser.feed('event: message\ndata: {"a":1,"b":[2,3]}\n\n').finished();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].event, 'message');
+  assert.deepEqual(events[0].data, { a: 1, b: [2, 3] });
+  assert.deepEqual(JSON.parse(events[0].data), { a: 1, b: [2, 3] });
+  // 非 JSON 载荷仍按原文字符串透出，[DONE] 与畸形 JSON 都不受影响。
+  assert.equal(createSseParser().feed('data: [DONE]\n\n').finished()[0].data, '[DONE]');
+  assert.equal(createSseParser().feed('data: {oops\n\n').finished()[0].data, '{oops');
+});

@@ -38,6 +38,53 @@ function isPrefixOf(value, target) {
   return value.length < target.length && target.startsWith(value);
 }
 
+/** 全部 DSML 标记：任何一个出现在正文里都说明信封结构串进了可见频道。 */
+const DSML_MARKERS = [
+  CALLS_OPEN,
+  CALLS_CLOSE,
+  INVOKE_PREFIX,
+  INVOKE_CLOSE,
+  PARAMETER_PREFIX,
+  PARAMETER_CLOSE,
+];
+
+/** 结尾最多保留多少个字符，避免把一个跨分片到达的标记从中间切断。 */
+function longestMarkerSuffix(value) {
+  let keep = 0;
+  for (const marker of DSML_MARKERS) {
+    keep = Math.max(keep, longestPrefixSuffix(value, marker));
+  }
+  return keep;
+}
+
+/**
+ * 从可见正文里剥掉没有归属的 DSML 标记。
+ *
+ * 模型偶尔会把信封的闭合标签（或残缺的开标签）写进正文，这些标记属于协议层，
+ * 一旦流给客户端就是用户眼里的乱码。信封完整时走 `calls` 模式，根本进不到这里；
+ * 所以这里只处理「正文里冒出来的孤儿标记」，且只删标记本身，不动周围文字。
+ */
+function stripOrphanMarkers(value) {
+  if (!value) return value;
+  let out = value;
+  for (const closer of [CALLS_CLOSE, INVOKE_CLOSE, PARAMETER_CLOSE]) {
+    if (!out.includes(closer)) continue;
+    // 标记常常独占一行：连同行尾换行一起删，否则用户看到的只是「三行乱码」变成
+    // 「三行空白」，正文尾部仍然多出一段突兀的空行。
+    out = out.split(`${closer}\n`).join('').split(closer).join('');
+  }
+  // 残缺开标签连同它的属性一起删；找不到 '>' 就删到本次分片末尾。
+  for (const opener of [INVOKE_PREFIX, PARAMETER_PREFIX]) {
+    let at = out.indexOf(opener);
+    while (at >= 0) {
+      const end = out.indexOf('>', at + opener.length);
+      out = out.slice(0, at) + (end >= 0 ? out.slice(end + 1) : '');
+      at = out.indexOf(opener);
+    }
+  }
+  return out;
+}
+
 function parseAttributes(source) {
   const attrs = {};
   const pattern = /([A-Za-z][\w-]*)\s*=\s*"([^"]*)"/g;
@@ -145,18 +192,19 @@ export function createDsmlScanner({
       if (mode === 'text') {
         const at = buffer.indexOf(CALLS_OPEN);
         if (at >= 0) {
-          result.visibleText += buffer.slice(0, at);
+          result.visibleText += stripOrphanMarkers(buffer.slice(0, at));
           buffer = buffer.slice(at + CALLS_OPEN.length);
           mode = 'calls';
           continue;
         }
         if (final) {
-          result.visibleText += buffer;
+          result.visibleText += stripOrphanMarkers(buffer);
           buffer = '';
           return result;
         }
-        const keep = longestPrefixSuffix(buffer, CALLS_OPEN);
-        result.visibleText += buffer.slice(0, buffer.length - keep);
+        // 保留尾部：可能是任意一个标记的前半截，等下一片补齐再判断。
+        const keep = longestMarkerSuffix(buffer);
+        result.visibleText += stripOrphanMarkers(buffer.slice(0, buffer.length - keep));
         buffer = buffer.slice(buffer.length - keep);
         return result;
       }
@@ -335,8 +383,20 @@ export function createStructuredToolAssembler({
   return {
     push(deltas = []) {
       if (fatal) throw fatal;
+      // OpenAI 非流式的 message.tool_calls 不带 index 字段：整批都缺 index 时它们是
+      // 「一组完整调用」而不是「一批分片」，必须按数组下标各占一个槽位，否则多个并行
+      // 调用会被拼进同一条（名字串成 get_weatherget_time、参数拼成非法 JSON）。
+      // 真正的流式分片可能分多批到达，只要批内有任何一个带整数 index，就沿用原槽位
+      // 规则，绝不因为某批缺 index 就重新从 0 编号——那会把已有槽位覆盖掉。
+      const positional = Array.isArray(deltas)
+        && deltas.length > 0
+        && !deltas.some((delta) => Number.isInteger(delta?.index));
+      let position = 0;
       for (const delta of deltas) {
-        const index = Number.isInteger(delta?.index) ? delta.index : 0;
+        const index = positional
+          ? position
+          : (Number.isInteger(delta?.index) ? delta.index : 0);
+        position += 1;
         if (!pending.has(index) && pending.size >= callLimit) throw overflow();
         const current = pending.get(index) || {
           index,

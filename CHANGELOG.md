@@ -26,6 +26,34 @@
 
 ### Added
 
+- **Turn-cut recovery at the decision layer for `/v1/responses`.** Clients such
+  as codex and dsh treat "no tool call in this turn" as "task finished", so a
+  model that writes "接下来我会补 Sync 路由" and stops hands control back to the
+  user mid-task. The prompt-side nudge (`src/continuation-nudge.js`) had already
+  been rewritten three times without effect — a control experiment put a
+  verifiable directive in four positions (first system / mid system / trailing
+  system / appended to the trailing user) and all four were obeyed, so the
+  constraint *was* delivered and the failure is in the client's decision rule,
+  not in delivery. The bridge now re-requests on its own when a turn ends with an
+  announcement and no tool call: same account, same lease, one extra user message
+  (`继续。直接执行下一步，不要再描述计划或复述已经做过的事。`), merged back into
+  the same `response` (unique `call_id`, de-duplicated prose prefix, concatenated
+  reasoning, summed usage). The predicate is deliberately asymmetric — a false
+  "retry" costs one extra request, a false "finish" means the user never gets an
+  answer — so the completion side is loose (any completion wording in the tail or
+  the last sentence suppresses the retry) and the announcement side is strict
+  (an explicit announcement-plus-verb pattern in the last 220 characters). Gated
+  by `continuationRetry` (default on) with `WB_CONTINUATION_RETRY=0` as the
+  emergency override. Counts land in `pool.series.continuation`
+  (`cut`/`retried`/`rescued`); without `rescued/retried` there is no way to tell
+  whether the fix works.
+- **A cancel that lands during the retry round closes the second upstream
+  connection.** `resetRound()` initially left `readerDone` at `true`, so
+  `cancelReader()` returned early and the retry round's upstream request stayed
+  open until the total timeout (measured: still open after 4 s, versus 6 ms on
+  the single-round baseline). Covered by the cancel case in
+  `test/api/continuation-retry.test.mjs`.
+
 - **Per-account concurrency is configurable from the CLI and the dashboard.**
   `maxConcurrency` already existed in the schema and in the PATCH route, but
   there was no way to set it without hand-editing `pool.json`, and nothing to
@@ -46,6 +74,29 @@
 
 ### Fixed
 
+- **A truncated tool-call envelope no longer ends the turn silently.** When the model
+  writes a DSML envelope into the content channel and the stream stops mid-invoke,
+  `snapshot()` reported `finishReason: 'length'`. The continuation predicate only
+  accepts `'stop'` (a `length` turn is not "the model had more to say"), so this —
+  the most common way a turn gets cut — was the one cut that could never be
+  recovered: the client was told `incomplete`, handed control back, and the user
+  had to type "continue" by hand. The truncation is now reported to the predicate
+  as a separate `dsmlTruncated` fact, which permits exactly one retry, while the
+  outward `length`/`incomplete` contract is unchanged — a half-written argument is
+  still not an executable call. Every other guard (retry budget, `tool_choice:
+  "none"`, completion wording, existing tool calls) still applies. Covered by a
+  unit case and an HTTP case that both fail against the previous predicate.
+- **Orphan DSML closing tags no longer reach the visible channel.** Observed live in
+  a 2026-11-26 session: 12 assistant messages ended with three literal lines
+  (`</｜｜DSML｜｜ parameter>`, `… invoke>`, `… calls>`) rendered to the user as
+  output text. The scanner only watched for `CALLS_OPEN` while in text mode, so a
+  closing tag that arrived without its opening tag matched nothing and was appended
+  verbatim to `visibleText`. `stripOrphanMarkers()` now removes closers (and their
+  trailing newline, so the user does not get three blank lines instead of three
+  garbage lines) and truncated openers from the visible stream, while the text-mode
+  tail reservation covers every marker instead of just `CALLS_OPEN`, so a marker cut
+  across two chunks is still held back until it can be classified. Covered by three
+  cases in `test/api/dsml.test.mjs`; all three fail against the previous scanner.
 - **A model whose catalogue entry simply omits `reasoning` no longer loses the
   client's `reasoning_effort`.** `reasoningDeclaration` collapsed "the upstream
   says this model cannot reason" and "the upstream said nothing about reasoning"
@@ -228,9 +279,13 @@
   **explicitly** asks to disable thinking (`reasoning.effort: "none"` on
   Responses, `reasoning_effort: "none"` on Chat, `thinking.type: "disabled"` on
   Anthropic) the proxy suppresses that reasoning text on all three protocols and
-  emits one content-free server warning per request. A request that merely omits
-  the field is not an instruction to disable thinking, so its reasoning text is
-  still returned.
+  emits one content-free server warning per request. On Chat and Responses a
+  request that merely omits the field is not an instruction to disable thinking,
+  so its reasoning text is still returned. Anthropic is different: an omitted
+  `thinking` field and `thinking.type: "disabled"` are indistinguishable there
+  (`src/protocols/anthropic.js:203` only treats `"enabled"` as on), so an omitted
+  field suppresses reasoning text as well — matching the protocol default rather
+  than returning it.
 - Thinking signatures are empty because the upstream does not provide verifiable
   signatures. Strict clients that validate them fall back to plain text rather
   than failing.

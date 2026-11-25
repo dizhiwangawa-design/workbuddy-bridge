@@ -70,6 +70,7 @@ export function defaultConfig() {
       responsesPersistence: true,
       responsesNudge: false,
       continuationNudge: true,
+      continuationRetry: true,
       channelSanitize: true,
       requireApiKey: false,
       remoteRequireKey: true,
@@ -100,7 +101,8 @@ export function readJson(file, fallback) {
 export function writeJson(file, data, mode = 0o600) {
   ensureDir(path.dirname(file));
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode });
+  // 紧凑格式：这是配置文件，没人读它的缩进；每次合并落盘都是同步写，直接阻塞事件循环。
+  fs.writeFileSync(tmp, JSON.stringify(data), { mode });
   fs.renameSync(tmp, file);
   try {
     fs.chmodSync(file, mode);

@@ -8,6 +8,11 @@
 - 工作区未提交：CHANGELOG.md、README.md、src/install.js、test/live/codex-client-smoke.mjs、test/run.mjs，加未跟踪的 dsh 修复计划文档
 - 实测方法：21 个一次性探针脚本（已全部删除），覆盖「假上游精确断言」+「真实上游端到端」+「dsh 真实会话日志复算」
 
+> **回归数字说明（2026-11-26 补充）**：上面这些 xxx/xxx 是各阶段当时的历史实测值，
+> 保留作修复过程的记录。**当前基线请以实测为准**：
+> `node test/api/run.mjs` = 406 通过 / 0 失败；`node test/run.mjs` = 73 通过。
+> 两者已随后续提交增长（新增续跑、并发、安全等用例），因此旧数字不可复现属正常。
+
 ---
 
 ## 0. 总评

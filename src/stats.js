@@ -134,8 +134,49 @@ export function addBucket(target, src) {
   return target;
 }
 
+/**
+ * 「回合被截停」的累计计数（不是区间统计，跟着 series 一起落盘）。
+ *
+ *   cut      判定为截停的次数：正文在宣布下一步，但这一轮没有工具调用
+ *   retried  真的向上游又发了一轮续跑请求的次数
+ *   rescued  续跑之后当轮拿到了工具调用的次数
+ *
+ * 没有 rescued / retried 这个比值就无从判断这次修复是否有效，所以三个数都要记。
+ */
+export function emptyContinuation() {
+  return { cut: 0, retried: 0, rescued: 0 };
+}
+
 export function emptySeries() {
-  return { version: 1, seq: 0, hours: {}, days: {}, events: [] };
+  return {
+    version: 1,
+    seq: 0,
+    hours: {},
+    days: {},
+    events: [],
+    continuation: emptyContinuation(),
+  };
+}
+
+/**
+ * 累加截停计数。请求路径上直接调用它，避免为一次计数伪造一条 sample。
+ *
+ * @param {object} pool 号池对象
+ * @param {{cut?: number, retried?: number, rescued?: number}} delta
+ * @returns {object} 更新后的计数
+ */
+export function recordContinuation(pool, delta = {}) {
+  if (!pool.series) pool.series = emptySeries();
+  const s = pool.series;
+  s.continuation = {
+    ...emptyContinuation(),
+    ...(s.continuation && typeof s.continuation === 'object' ? s.continuation : {}),
+  };
+  for (const key of ['cut', 'retried', 'rescued']) {
+    const value = Number(delta[key]);
+    if (Number.isFinite(value) && value > 0) s.continuation[key] += value;
+  }
+  return s.continuation;
 }
 
 /** 兼容旧 pool.json：缺字段补齐，别让面板因为一个 undefined 整块空白。 */
@@ -148,6 +189,11 @@ export function normalizeSeries(raw) {
     hours: raw.hours && typeof raw.hours === 'object' ? raw.hours : {},
     days: raw.days && typeof raw.days === 'object' ? raw.days : {},
     events: Array.isArray(raw.events) ? raw.events.slice(0, MAX_EVENTS) : [],
+    // 旧 pool.json 没有这个字段：缺了就补齐，不能让面板因为一个 undefined 空白。
+    continuation: {
+      ...emptyContinuation(),
+      ...(raw.continuation && typeof raw.continuation === 'object' ? raw.continuation : {}),
+    },
     seq: Number(raw.seq || 0) || 0,
   };
 }
@@ -215,6 +261,12 @@ export function recordSample(pool, sample, now = Date.now()) {
     clientKeyName,
   });
   if (s.events.length > MAX_EVENTS) s.events.length = MAX_EVENTS;
+
+  // 截停计数是累计值，不进时间桶：它回答的是「这个修复到底救回了多少回合」，
+  // 与区间无关。请求路径直接调 recordContinuation，这里只兜住 sample 形态。
+  if (sample.continuation && typeof sample.continuation === 'object') {
+    recordContinuation(pool, sample.continuation);
+  }
 
   pruneSeries(pool, now);
   return s;
@@ -491,6 +543,13 @@ export function buildStats(pool, range = 'today', { now = Date.now() } = {}) {
       decodeThroughput: p.decodeMs ? p.decodeTokens / (p.decodeMs / 1000) : null,
     })),
     events,
+    // 累计值，不随 range 变化；面板据此显示「截停 → 已续跑 → 救回」。
+    continuation: {
+      ...emptyContinuation(),
+      ...(pool.series?.continuation && typeof pool.series.continuation === 'object'
+        ? pool.series.continuation
+        : {}),
+    },
     heatmap: buildHeatmap(pool, now),
     price: { ...price, configured: Boolean(price.pin || price.pout) },
     generatedAt: now,

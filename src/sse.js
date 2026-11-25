@@ -35,6 +35,8 @@ export function createSseParser({ maxBufferBytes = 2 * 1024 * 1024 } = {}) {
       if (raw.startsWith('{') || raw.startsWith('[')) {
         try {
           const parsed = JSON.parse(raw);
+          // 保留 toString：test/api/anthropic.test.mjs 直接 JSON.parse(events[0].data)，
+          // 依赖事件对象隐式转回原始 JSON 文本。去掉它会把该用例打红。
           if (parsed && typeof parsed === 'object') {
             Object.defineProperty(parsed, 'toString', {
               configurable: true,

@@ -13,6 +13,7 @@ import {
   dayKey,
   emptySeries,
   normalizeSeries,
+  recordContinuation,
   recordSample,
 } from './stats.js';
 
