@@ -5,7 +5,14 @@ import {
   readAccountCredentials,
   refreshAccountCredentials,
 } from './auth-store.js';
-import { beginTask, endTask, loadPool, pickAccount } from './pool.js';
+import {
+  beginTask,
+  endTask,
+  loadPool,
+  markPoolDirty,
+  pickAccount,
+} from './pool.js';
+import { recordContinuation } from './stats.js';
 import { createUpstreamClient } from './upstream-client.js';
 import { createSseParser } from './sse.js';
 import {
@@ -19,6 +26,15 @@ import {
   continuationNudgeMode,
   responsesHasToolLoop,
 } from './continuation-nudge.js';
+import {
+  CONTINUATION_RETRY_PROMPT,
+  continuationRetryEnabled,
+  mergeReasoning,
+  mergeToolCalls,
+  mergeUsage,
+  shouldContinueTurn,
+  stripRepeatedPreamble,
+} from './continuation-retry.js';
 import {
   baseResponse,
   completedResponseBody,
@@ -61,6 +77,23 @@ function createResponseTextCache({ hardBytes = HARD_WRITE_BYTES } = {}) {
   });
 }
 
+/**
+ * 拼接续跑正文：剥掉第二轮开头重复的说明，剩下的接在第一轮之后。
+ *
+ * 为什么必须去重：第一轮的「接下来我会补 Sync 路由。」已经流给客户端了，第二轮
+ * 又原样写一遍，终态里同一句话出现两次会让客户端以为进度重复了。剥重放在
+ * `stripRepeatedPreamble`（纯函数，有单测）。
+ */
+function joinContinuationText(first, second) {
+  const head = String(first ?? '');
+  const tail = stripRepeatedPreamble(head, second);
+  if (!tail) return head;
+  if (!head.trim()) return tail;
+  // 中文句子直接接；英文/已有句末标点之间补一个空格，避免粘成一个词。
+  const glue = /[。！？.!?;；:：\n]\s*$/.test(head) ? (head.trimEnd().endsWith('.') ? ' ' : '') : '';
+  return `${head}${glue}${tail}`;
+}
+
 function appendResponseText(cache, delta) {
   try {
     cache.append(delta);
@@ -98,6 +131,10 @@ function parseOptions(options) {
     tools: options.tools !== false,
     responsesPersistence: options.responsesPersistence !== false,
     responsesNudge: options.responsesNudge === true,
+    // 环境变量覆盖在判定点（continuationRetryEnabled）里做，这里只做类型归一。
+    continuationRetry: typeof options.continuationRetry === 'boolean'
+      ? options.continuationRetry
+      : true,
     requireApiKey: options.requireApiKey === true,
     remoteRequireKey: options.remoteRequireKey === true,
     trustProxy: options.trustProxy === true,
@@ -136,6 +173,23 @@ export function createResponsesRuntime(options = {}) {
   const store = options.store || options.cancelPersistence
     || createResponsesStore({ now });
   let retriedDeadLetters = false;
+
+  /**
+   * 记一次「回合被截停」的计数。
+   *
+   * 三个数缺一不可：cut（判定为截停）/ retried（真的又发了一轮）/ rescued
+   * （续跑后拿到了工具调用）。没有 rescued/retried 这个比值，就无从判断这次修复
+   * 到底有没有用——这正是上一轮误修三次都没发现的原因。
+   */
+  function countContinuation(delta) {
+    try {
+      recordContinuation(poolLoader(), delta);
+      markPoolDirty();
+    } catch (error) {
+      // 计数失败不能影响请求本身。
+      debug(`continuation counter failed: ${error.message}`);
+    }
+  }
 
   function applyReasoningEffort(prepared, account, credentials) {
     const declaration = reasoningCatalogue?.getDeclaration({
@@ -259,6 +313,9 @@ export function createResponsesRuntime(options = {}) {
     let downstreamStarted = false;
     let leaseReleased = false;
     let cancelPromise = null;
+    // 续跑丢弃的上一轮 reader：关闭动作是异步的，必须留引用等到 finally 再结算，
+    // 否则「发出关闭」和「请求返回」会赛跑，测试里看到的就是连接仍然开着。
+    const retiredReaders = [];
     let cancelKind = null;
     let canceling = false;
     let finished = false;
@@ -274,21 +331,75 @@ export function createResponsesRuntime(options = {}) {
     const markVisible = () => { if (!firstVisibleAt) firstVisibleAt = now(); };
     let parser = null;
     let liveEncoder = null;
-    const visibleText = createResponseTextCache({ hardBytes });
-    const reasoningText = createResponseTextCache({ hardBytes });
-    const structured = createStructuredToolAssembler({
+    const priorIds = new Set(prior.map((item) => item?.id));
+
+    // 一轮上游请求的累加器：正文/推理缓存、结构化调用装配器、DSML 扫描器。
+    // 截停续跑会把它们整组重建（见 resetRound），所以是 let 而不是 const。
+    let visibleText = createResponseTextCache({ hardBytes });
+    let reasoningText = createResponseTextCache({ hardBytes });
+    let structured = createStructuredToolAssembler({
       maxBytes: structuredToolArgumentLimit(config.dsmlMaxBufferBytes, hardBytes),
     });
-    const scanner = createDsmlScanner({
+    let scanner = createDsmlScanner({
       maxBufferBytes: config.dsmlMaxBufferBytes,
     });
     // 推理通道单独一把扫描器：模型常把工具调用写进思考里，那条通道以前不过扫描器，
     // 于是原始标记既泄漏给用户，又少执行一次本该发生的调用。
-    const reasoningScanner = createDsmlScanner({
+    let reasoningScanner = createDsmlScanner({
       maxBufferBytes: config.dsmlMaxBufferBytes,
     });
-    const dsmlCalls = [];
-    const priorIds = new Set(prior.map((item) => item?.id));
+    let dsmlCalls = [];
+
+    /**
+     * 重置成「一轮全新的上游请求」。
+     *
+     * 上面这些累加器原本按「一次请求」写死。截停续跑要再要一轮，而第二轮必须从零
+     * 累积（否则 `scanner.finish()` 已经被调用过、正文会被拼进第一轮的缓存里，
+     * 去重就无从下手）。第一轮在 `snapshot(true)` 里定格成 `firstResult` 之后调它。
+     */
+    function resetRound() {
+      // 丢弃旧 reader 之前必须真的把它关掉。consumeSse 在 [DONE] 处退出时**不设**
+      // readerDone，唯一的兜底是 finally 里的 `if (reader && !readerDone) cancelReader`，
+      // 而它只看**当前** reader。这里一旦把引用置空，第一轮的上游 socket 就再没有
+      // 任何代码能关，只能等内核回收。cancel 的 promise 单独收着，finally 里一并等待。
+      if (reader && !readerDone) {
+        const stale = reader;
+        retiredReaders.push(
+          Promise.resolve().then(() => stale.cancel('continuation round finished')).catch(() => {}),
+        );
+      }
+      continuationRound = true;
+      visibleText = createResponseTextCache({ hardBytes });
+      reasoningText = createResponseTextCache({ hardBytes });
+      structured = createStructuredToolAssembler({
+        maxBytes: structuredToolArgumentLimit(config.dsmlMaxBufferBytes, hardBytes),
+      });
+      scanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
+      reasoningScanner = createDsmlScanner({ maxBufferBytes: config.dsmlMaxBufferBytes });
+      dsmlCalls = [];
+      finishReason = null;
+      usage = null;
+      sawDone = false;
+      parser = null;
+      // 上一轮的 reader 已经读完；这一轮会新建一个，所以必须回到「未读完」，
+      // 否则 cancelReader 会因为 readerDone 提前返回，取消时上游请求悬挂不关。
+      reader = null;
+      readerCancellation = null;
+      readerDone = false;
+    }
+
+    // 已经续跑过的次数。上限 1：第二次仍是纯文字就必须收尾，否则就是死循环。
+    let continuationCount = 0;
+    /**
+     * 当前这一轮是不是「续跑轮」。
+     *
+     * 续跑轮里正文**不**发 live 增量：第一轮的正文已经逐字流给客户端了，第二轮
+     * 又要跟它去重合并（joinContinuationText），逐字再流一遍就是把同一句话发两遍，
+     * 而且 settleRound 随后会用「更长的 live」覆盖终态，把去重结果又冲掉。
+     * 所以续跑轮里终态是正文的唯一权威来源，由 cancelEvents 一次性补齐
+     * （finalDeltas:false 会按 live 已发长度裁剪，这里正好只剩去重后的增量）。
+     */
+    let continuationRound = false;
     const resumedRecord = config.responsesNudge && previousResponseId
       ? await store.get(previousResponseId).catch(() => null)
       : null;
@@ -311,12 +422,25 @@ export function createResponsesRuntime(options = {}) {
       end(account, withClientKeyAttribution(result, clientKey, 'openai_responses'));
     }
 
+    /**
+     * 清定时器**并把引用置空**。
+     *
+     * 置空不是洁癖：`applyDocument` 用 `!finishGraceTimer` 判断「这一轮还没武装过
+     * finishGrace」。只 clearTimeout 不置空，第二轮看到的是残留的 Timer 对象，
+     * 于是永远不再武装 grace —— 上游已经把 finish_reason 发完了，请求却要继续
+     * 挂到 idleTimeout 才收尾。凡是靠非空判据的定时器都必须在这里复位。
+     */
     function clearTimers() {
       clearTimeout(firstByteTimer);
       clearTimeout(idleTimer);
       clearTimeout(totalTimer);
       clearTimeout(finishGraceTimer);
       clearInterval(pingTimer);
+      firstByteTimer = null;
+      idleTimer = null;
+      totalTimer = null;
+      finishGraceTimer = null;
+      pingTimer = null;
     }
 
     function cancelReader(reason) {
@@ -474,7 +598,14 @@ export function createResponsesRuntime(options = {}) {
               ?? 0,
           ),
         },
+        // 信封被截断时仍报 length：半截参数不构成可执行调用，客户端必须看到
+        // incomplete 而不是「任务正常完成」——这是既有契约（见 responses.test.mjs
+        // 「Responses DSML 流只发送完整工具调用」）。
+        // 但 length 会被续跑判定挡在门外（它只认 stop），于是「模型把信封写进正文
+        // 却没写完」这条最常见的截停路径既不续跑、又让用户以为回合正常结束。
+        // 所以额外把截断这个事实传给判定层，由它决定要不要再要一轮。
         finishReason: truncation ? 'length' : finishReason,
+        dsmlTruncated: truncation,
       };
     }
 
@@ -846,12 +977,20 @@ export function createResponsesRuntime(options = {}) {
       firstByteTimer.unref?.();
     }
 
+    // 整个请求的总预算到期时刻。续跑复用它，**不是**给第二轮一份新预算：
+    // 一次客户端请求只有一个 totalTimeoutMs（handoff §4.2）。
+    let totalDeadline = 0;
+
     function armTotal() {
       if (!config.totalTimeoutMs) return;
+      clearTimeout(totalTimer);
+      totalTimer = null;
+      totalDeadline ||= now() + config.totalTimeoutMs;
+      const remaining = Math.max(0, totalDeadline - now());
       totalTimer = setTimeout(() => timeout(
         'total_timeout',
         runtimeError('upstream request exceeded its total timeout', 'UPSTREAM_TIMEOUT', { status: 504 }),
-      ), config.totalTimeoutMs);
+      ), remaining);
       totalTimer.unref?.();
     }
 
@@ -1217,7 +1356,13 @@ export function createResponsesRuntime(options = {}) {
       if (prepared.reasoningSuppressed || !scannedReasoning.visibleText) return;
       markVisible();
       appendResponseText(reasoningText, scannedReasoning.visibleText);
-      publishLive(liveEncoder?.reasoningDelta(scannedReasoning.visibleText));
+      // 与正文同口径：续跑轮不发 live 增量，终态是唯一权威来源。
+      // 不这样做的话，两轮的推理被 live 首尾相接发出去，而终态是「第一轮\n\n第二轮」，
+      // cancelEvents 按 live 长度裁剪终态增量，拼起来就是「…乙。乙。」——增量与终态
+      // 对不上，而且 mergeReasoning 那一侧还要再拼一次分隔符。
+      if (!continuationRound) {
+        publishLive(liveEncoder?.reasoningDelta(scannedReasoning.visibleText));
+      }
     }
 
     function applyDocument(rawDocument) {
@@ -1268,7 +1413,11 @@ export function createResponsesRuntime(options = {}) {
         if (scanned.visibleText) {
           markVisible();
           appendResponseText(visibleText, scanned.visibleText);
-          if (liveEncoder) publishLive(liveEncoder.textDelta(scanned.visibleText));
+          // 续跑轮次不发正文 live 增量：第二轮与第一轮的正文要去重合并，逐字流出
+          // 会重复，而且会让 settleRound 用更长的 live 覆盖掉去重后的终态。
+          if (liveEncoder && !continuationRound) {
+            publishLive(liveEncoder.textDelta(scanned.visibleText));
+          }
         }
       }
       if (finishReason && !finishGraceTimer) {
@@ -1295,74 +1444,155 @@ export function createResponsesRuntime(options = {}) {
         );
         if (credentials.needsRefresh) credentials = await refresh(account, credentials);
         applyReasoningEffort(prepared, account, credentials);
-        armFirstByte();
         armTotal();
-        let upstream = await upstreamClient.chat({
-          accountId: account,
-          credentials,
-          model: prepared.model,
-          body: prepared.body,
-          sanitize: config.channelSanitize,
-          signal: controller.signal,
-        });
-        if (upstream.status === 401 && credentials.refreshToken) {
-          credentials = await refresh(account, credentials);
-          // 换号后目录可能完全不同，档位必须按新账号的模型声明重解析。
-          applyReasoningEffort(prepared, account, credentials);
-          upstream = await upstreamClient.chat({
+
+        /**
+         * 发一轮上游请求并把它读完。
+         *
+         * 续跑复用这里：**同一账号、同一租约**，绝不重新 pick（那会让号池算错账）。
+         * 总预算每一轮都重新武装，但**截止时刻固定**（totalDeadline 只取一次），
+         * 所以续跑花的是同一个 totalTimeoutMs 里剩下的时间，而不是一份新预算。
+         */
+        async function requestRound(body) {
+          armFirstByte();
+          armTotal();
+          let upstream = await upstreamClient.chat({
             accountId: account,
             credentials,
             model: prepared.model,
-            body: prepared.body,
+            body,
             sanitize: config.channelSanitize,
             signal: controller.signal,
           });
-        }
-        if (!upstream.ok) {
-          const detail = await upstreamDetail(upstream);
-          throw runtimeError(
-            detail || `WorkBuddy upstream HTTP ${upstream.status}`,
-            upstream.status === 429 ? 'RATE_LIMITED' : 'UPSTREAM_ERROR',
-            {
-              status: upstream.status === 429 ? 429 : 502,
-              type: upstream.status === 429 ? 'rate_limit_error' : 'api_error',
-              retryable: upstream.status === 429 || upstream.status >= 500,
-            },
-          );
-        }
-        upstreamAccepted = true;
-        // A streaming HTTP response becomes visible only after the upstream
-        // accepted the request, preserving pre-header failover semantics.
-        start();
-        if (String(upstream.headers.get('content-type') || '').includes('text/event-stream')) {
-          await consumeSse(upstream);
-        } else {
-          clearTimeout(firstByteTimer);
-          let document;
-          try {
-            document = await upstream.json();
-          } catch {
-            throw runtimeError('upstream returned invalid completion JSON', 'UPSTREAM_PROTOCOL_ERROR');
+          if (upstream.status === 401 && credentials.refreshToken) {
+            credentials = await refresh(account, credentials);
+            // 换号后目录可能完全不同，档位必须按新账号的模型声明重解析。
+            applyReasoningEffort(prepared, account, credentials);
+            upstream = await upstreamClient.chat({
+              accountId: account,
+              credentials,
+              model: prepared.model,
+              body,
+              sanitize: config.channelSanitize,
+              signal: controller.signal,
+            });
           }
-          applyDocument(document);
+          if (!upstream.ok) {
+            const detail = await upstreamDetail(upstream);
+            throw runtimeError(
+              detail || `WorkBuddy upstream HTTP ${upstream.status}`,
+              upstream.status === 429 ? 'RATE_LIMITED' : 'UPSTREAM_ERROR',
+              {
+                status: upstream.status === 429 ? 429 : 502,
+                type: upstream.status === 429 ? 'rate_limit_error' : 'api_error',
+                retryable: upstream.status === 429 || upstream.status >= 500,
+              },
+            );
+          }
+          upstreamAccepted = true;
+          // A streaming HTTP response becomes visible only after the upstream
+          // accepted the request, preserving pre-header failover semantics.
+          start();
+          if (String(upstream.headers.get('content-type') || '').includes('text/event-stream')) {
+            await consumeSse(upstream);
+          } else {
+            clearTimeout(firstByteTimer);
+            let document;
+            try {
+              document = await upstream.json();
+            } catch {
+              throw runtimeError(
+                'upstream returned invalid completion JSON',
+                'UPSTREAM_PROTOCOL_ERROR',
+              );
+            }
+            applyDocument(document);
+          }
+          if (cancelKind) return 'canceled';
+          if (!finishReason && !sawDone) {
+            throw runtimeError('upstream ended without a finish reason', 'UPSTREAM_TRUNCATED');
+          }
+          return 'ok';
         }
-        if (cancelKind) return await cancelPromise;
-        if (!finishReason && !sawDone) {
-          throw runtimeError('upstream ended without a finish reason', 'UPSTREAM_TRUNCATED');
-        }
+
+        if (await requestRound(prepared.body) === 'canceled') return await cancelPromise;
         clearTimers();
-        const result = snapshot(true);
-        // live 只是「已经流出去的那部分」；scanner.finish() 之后的终态可能更长
-        // （缓冲区里还有可见尾巴），用它覆盖会把尾巴吞掉，所以只在 live 更长时取 live。
-        const liveSnapshot = liveEncoder?.snapshot();
-        if (liveSnapshot?.content && liveSnapshot.content.length > result.content.length) {
-          result.content = liveSnapshot.content;
+        /**
+         * 定稿一轮：scanner.finish() 收尾，取 live 里更长的正文，
+         * 再按 parallel_tool_calls 截断。
+         */
+        function settleRound() {
+          const value = snapshot(true);
+          // live 只是「已经流出去的那部分」；scanner.finish() 之后的终态可能更长
+          // （缓冲区里还有可见尾巴），用它覆盖会把尾巴吞掉，所以只在 live 更长时取 live。
+          //
+          // 续跑轮次必须跳过正文这一步：liveEncoder 不随轮次重置，它手里的正文是
+          // **第一轮**的累积。用它覆盖第二轮，得到的就是第一轮的原文，
+          // joinContinuationText 的去重结果被原地冲掉（这正是「流式重复一遍、
+          // 非流式不重复」的成因）。
+          //
+          // 推理通道同理，且**只改终态取值、不改外发的 live 增量**：live 里的推理是
+          // 第一轮 + 第二轮首尾相接的累积，拿它盖第二轮的推理，mergeReasoning 拼接时
+          // 第一轮那段就会出现两次。
+          const live = liveEncoder?.snapshot();
+          if (live?.content && !continuationRound && live.content.length > value.content.length) {
+            value.content = live.content;
+          }
+          if (live?.reasoning && !continuationRound && live.reasoning.length > value.reasoning.length) {
+            value.reasoning = live.reasoning;
+          }
+          if (value.calls.length > 1 && prepared.parallelToolCalls === false) {
+            value.calls = value.calls.slice(0, 1);
+          }
+          return value;
         }
-        if (liveSnapshot?.reasoning && liveSnapshot.reasoning.length > result.reasoning.length) {
-          result.reasoning = liveSnapshot.reasoning;
-        }
-        if (result.calls.length > 1 && prepared.parallelToolCalls === false) {
-          result.calls = result.calls.slice(0, 1);
+
+        let result = settleRound();
+
+        // ---------------------------------------------------------------- 截停续跑
+        //
+        // 到这里 finish_reason/正文/工具调用都齐了。如果模型只宣布了下一步却没有发
+        // 工具调用，客户端会当作任务结束；判定层级能做的补救就是**再要一轮**。
+        // 判定刻意保守（见 continuation-retry.js）：宁可少续一次，也不误续——误续
+        // 会让用户永远收不到最终答复。
+        const continuation = shouldContinueTurn({
+          enabled: continuationRetryEnabled(config),
+          finishReason: result.finishReason,
+          toolsDeclared: prepared.toolsDeclared,
+          toolChoice: prepared.toolChoice,
+          callCount: result.calls.length,
+          content: result.content,
+          retries: continuationCount,
+          maxRetries: 1,
+          dsmlTruncated: result.dsmlTruncated === true,
+        });
+        if (continuation.retry) {
+          continuationCount += 1;
+          countContinuation({ cut: 1 });
+          debug(`Responses ${responseId} turn cut after "${result.content.slice(-80)}"; retrying`);
+          const first = result;
+          // 第二轮从零累积，第一轮的产物先收进 first。
+          resetRound();
+          prepared.body.messages ??= [];
+          prepared.body.messages.push({
+            role: 'user',
+            content: CONTINUATION_RETRY_PROMPT,
+          });
+          countContinuation({ retried: 1 });
+          const outcome = await requestRound(prepared.body);
+          if (outcome === 'canceled') return await cancelPromise;
+          clearTimers();
+          const second = settleRound();
+          // 两轮拼成一份终态：正文去重、推理接续、调用合并、token 累加。
+          result = {
+            content: joinContinuationText(first.content, second.content),
+            reasoning: mergeReasoning(first.reasoning, second.reasoning),
+            calls: mergeToolCalls(first.calls, second.calls, { requestId: responseId }),
+            callsComplete: first.callsComplete && second.callsComplete,
+            usage: mergeUsage(first.usage, second.usage),
+            finishReason: second.finishReason,
+          };
+          if (second.calls.length) countContinuation({ rescued: 1 });
         }
         const finalBody = completedResponseBody({
           id: responseId,
@@ -1494,7 +1724,15 @@ export function createResponsesRuntime(options = {}) {
             request: prepared,
           });
           failed.status = 'failed';
-          emit(protocolEvents(failed).slice(2));
+          // 这里必须走 cancelEvents 而不是裸的 protocolEvents：live 增量早就把
+          // output_item.added / content_part.added 发出去了，整段重放会让同一个
+          // output_index 出现两次 added（Responses SSE 的不变量要求每个 index 只有
+          // 一次），严格客户端会挂两个 item 或直接报协议错。cancelEvents 已有
+          // 对 live 已发帧的去重与 output_index 对齐，错误收尾复用同一套。
+          emit(cancelEvents(failed, {
+            finalDeltas: !liveEncoder?.snapshot().content,
+            finalReasoningDeltas: !liveEncoder?.snapshot().reasoning,
+          }));
         }
         if (transport === 'ws') {
           const failed = completedResponseBody({
@@ -1529,6 +1767,12 @@ export function createResponsesRuntime(options = {}) {
         interruptSignal?.removeEventListener?.('abort', onAbort);
         if (reader && !readerDone) cancelReader(controller.signal.reason || 'request finished');
         await withTimeout(readerCancellation, 1000, 'upstream reader close timed out').catch(() => {});
+        // 续跑丢掉的旧 reader 也要结算，否则第一轮的上游连接会活过这次请求。
+        await withTimeout(
+          Promise.all(retiredReaders),
+          1000,
+          'retired upstream reader close timed out',
+        ).catch(() => {});
         if (!leaseReleased) release({
           ok: false,
           code: 'ABORTED',

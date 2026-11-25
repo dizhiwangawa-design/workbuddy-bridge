@@ -240,6 +240,63 @@ codex 和 dsh 这类客户端把「这一轮没有发出工具调用」当作任
 即结束」的判定逻辑。真实客户端验证见 `test/live/codex-client-smoke.mjs` 与
 `test/live/dsh-client-smoke.mjs`。
 
+### 回合截停续跑（判定层）
+
+上面那条 system 约束是**提示层**的：它降低提前收尾的概率，但管不住客户端「本轮没有
+工具调用 = 任务结束」的判定规则。实测三次改提示词（约束挪到末尾、挪回最后一条 user
+之后、重写规则 2）全部无效；把可验证指令放在首个 / 中途 / 末尾 system 或拼进末尾
+user，四种位置 4/4 都被遵守——**约束确实送到了，问题在判定层级**。
+
+因此桥接在判定层加了一道补救：看到「宣布下一步但不发工具调用」时，**自己再要一轮**。
+
+**触发条件（全部满足才续，宁可不续）**：
+
+| 条件 | 理由 |
+| --- | --- |
+| `finish_reason === 'stop'` | `tool_calls` / `length` 走原有逻辑 |
+| 本次请求声明了工具 | 无工具的纯问答不该续 |
+| `tool_choice !== 'none'` | 客户端明确禁用工具时不能硬顶 |
+| 本轮工具调用数为 0 | 有工具调用就是正常回合 |
+| 未被判定为「完成型收尾」 | 误续会让用户永远收不到答复 |
+| 正文**末尾**命中宣布型措辞 | 只判末尾若干字符，正文中段提到「接下来」不算 |
+| 本轮尚未续跑过 | 上限 1 次；第二次仍是纯文字必须收尾 |
+
+判定刻意不对称：误判「该续」只多发一轮，终态照样给用户；误判「不该续」用户永远收不
+到答复。所以「已完成」一侧宽进（末句或尾部出现完成措辞就不续），「宣布」一侧窄出
+（必须是明确的「宣布词 + 动作」句型）。`任务全部完成，测试通过。`、`All steps are
+complete; tests pass.`、`修好了，共改动 3 个文件，没有遗留问题。`、`完成。` 都不触发。
+
+**续跑怎么做**：同一账号、**同一租约**（不重新 pick，否则号池算错账），追加一条
+`继续。直接执行下一步，不要再描述计划或复述已经做过的事。` 后再请求一次。续跑计入
+原有 `totalTimeoutMs`，不是独立预算；用户中断时立刻放弃，不留悬挂的上游请求。
+
+**两轮怎么合并**：续跑产出接在**同一份 `response`** 里——工具调用合并进 `output`
+且 `call_id` 保持唯一，正文若以重复的说明开头则剥掉（只剥前缀），推理接续，token
+累加。`output_index` 与终态下标仍由 `alignLiveOutputIds` 对齐。流式与非流式都支持。
+
+**范围**：目前只做 Responses（`/v1/responses`，codex 与 dsh 都走这条）。Chat /
+Anthropic 用同一个 helper（`src/continuation-retry.js`）跟进。
+
+**可观测性**：`pool.series.continuation` 记三个累计值，`buildStats` 把它透出到
+`stats.continuation`——
+
+| 字段 | 含义 |
+| --- | --- |
+| `cut` | 判定为截停的次数 |
+| `retried` | 真的又发了一轮续跑请求的次数 |
+| `rescued` | 续跑后当轮拿到了工具调用的次数 |
+
+没有 `rescued / retried` 这个比值，就无从判断修复是否有效。
+
+**关闭方式（当前二选一）**：`PATCH /api/api-compat` 传
+`{"continuationRetry": false}`、或环境变量 `WB_CONTINUATION_RETRY=0`。环境变量作为
+应急开关优先于磁盘配置。默认开启。管理页目前只有「回合续跑约束」（提示层的
+`continuationNudge`）开关，判定层的 `continuationRetry` 还没有对应的界面开关，
+`stats.continuation` 也还没有在面板上展示。
+
+回归测试：`test/api/continuation-retry.test.mjs`（HTTP 全链路）与
+`test/api/continuation-retry-unit.test.mjs`（判定谓词单测）。
+
 ### Anthropic thinking
 
 `thinking.type` 为必填字段，只接受 `enabled` 或 `disabled`。缺失 `thinking` 或

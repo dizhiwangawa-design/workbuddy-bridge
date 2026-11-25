@@ -227,3 +227,44 @@ test('按原始 UTF-8 字节任意切分仍保持 Unicode、可见文本和参�
     assert.deepEqual(got.calls, [expectedCall], `byte-cut=${cut}`);
   }
 });
+
+
+test('正文里没有信封的孤儿 DSML 闭合标签不得流给客户端', () => {
+  // 真实现场（2026-11-26 会话）：模型把信封的闭合标签写进正文，开标签没出现，
+  // scanner 停在 text 模式只找 CALLS_OPEN，于是三个闭合标签原样进了可见文本，
+  // 用户在回复末尾看到三行 </｜｜DSML｜｜ parameter> 之类的乱码。
+  const orphans = [
+    `</${BAR}DSML${BAR} parameter>`,
+    `</${BAR}DSML${BAR} invoke>`,
+    `</${BAR}DSML${BAR} calls>`,
+  ].join('\n');
+  const got = scanParts([`已定位到本会话 ID。\n${orphans}`]);
+  assert.equal(got.error, null);
+  assert.equal(got.visible, '已定位到本会话 ID。\n', '标记必须被剥掉，正文一个字都不能少');
+  assert.deepEqual(got.calls, []);
+});
+
+test('孤儿标记跨分片到达时同样不得泄漏，且不切断正常正文', () => {
+  const closer = `</${BAR}DSML${BAR} calls>`;
+  const full = `前面的话${closer}后面的话`;
+  const cases = [
+    [full],
+    [full.slice(0, 5), full.slice(5)],
+    [full.slice(0, 3), full.slice(3, 6), full.slice(6)],
+    [...full].map((ch) => ch),
+  ];
+  for (const parts of cases) {
+    const got = scanParts(parts);
+    assert.equal(got.error, null, `parts=${JSON.stringify(parts)}`);
+    assert.equal(got.visible, '前面的话后面的话', `parts=${JSON.stringify(parts)}`);
+    assert.deepEqual(got.calls, []);
+  }
+});
+
+test('残缺的 DSML 开标签不得把标记本身流给客户端', () => {
+  const got = scanParts([`继续处理。\n<${BAR}DSML${BAR} parameter name="path" string="true">`]);
+  assert.equal(got.error, null);
+  assert.equal(got.visible, '继续处理。\n');
+  assert.deepEqual(got.calls, []);
+});
+

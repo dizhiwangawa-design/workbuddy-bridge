@@ -105,7 +105,7 @@ export function adminPage({ home = '', token = '' } = {}) {
   /* ------------------------------------------------------------ 面板 */
   .panels{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);gap:12px;margin-bottom:12px}
   .panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
-         box-shadow:var(--shadow);min-width:0;display:flex;flex-direction:column}
+         box-shadow:var(--shadow);min-width:0;display:flex;flex-direction:column;position:relative}
   .panel-head{display:flex;align-items:flex-start;gap:10px;padding:13px 15px 10px;flex-wrap:wrap}
   .panel-title{font-size:12.5px;font-weight:640;letter-spacing:.01em}
   .panel-sub{font-size:10.5px;color:var(--muted);margin-top:1px;font-variant-numeric:tabular-nums}
@@ -115,16 +115,53 @@ export function adminPage({ home = '', token = '' } = {}) {
   .tabs button.on{background:var(--card);color:var(--fg);font-weight:600;box-shadow:0 1px 2px rgba(20,20,40,.08)}
   @media (prefers-color-scheme:dark){.tabs{background:#20202a}.tabs button.on{background:#2f2f3c}}
 
-  .chart-scroll{position:relative;padding:0 8px 6px;overflow-x:auto}
+  .chart-scroll{position:relative;padding:2px 10px 0;overflow-x:auto}
   .chart-scroll svg{display:block;width:100%;height:auto;min-width:560px}
-  .legend{display:flex;align-items:center;gap:14px;padding:2px 16px 14px;font-size:10.5px;color:var(--sub)}
-  .legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;vertical-align:0}
-  .legend i.ln{height:2px;width:12px;border-radius:1px}
-  .tip{position:absolute;z-index:6;background:var(--fg);color:var(--card);border-radius:8px;padding:7px 9px;
-       font-size:11px;line-height:1.55;pointer-events:none;opacity:0;transition:opacity .12s;white-space:nowrap;
-       box-shadow:0 8px 24px -10px rgba(0,0,0,.5)}
-  .tip.on{opacity:1}
-  .tip b{font-variant-numeric:tabular-nums}
+  .chart-empty{display:grid;place-content:center;gap:4px;height:216px;text-align:center;
+               color:var(--muted);font-size:11.5px;line-height:1.6}
+  .chart-empty b{display:block;font-size:13px;color:var(--sub);font-weight:600}
+
+  .legend{display:flex;align-items:center;gap:14px;padding:9px 16px 14px;margin-top:6px;
+          border-top:1px solid var(--line);font-size:10.5px;color:var(--sub);flex-wrap:wrap}
+  .legend .lg{display:inline-flex;align-items:center;gap:5px}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:3px;flex:none}
+  .legend i.ln{height:2px;width:14px;border-radius:2px;background:var(--brand-deep);opacity:.5}
+  .legend .lg-peak{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .legend .lg-peak b{color:var(--sub);font-weight:600}
+
+  .tip{position:absolute;z-index:8;pointer-events:none;white-space:nowrap;
+       background:color-mix(in srgb,var(--card) 94%,transparent);
+       -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+       border:1px solid var(--line2);border-radius:10px;padding:8px 10px 9px;min-width:126px;
+       box-shadow:0 2px 5px rgba(20,20,40,.05),0 18px 40px -18px rgba(20,20,40,.45);
+       font-size:10.5px;line-height:1.5;color:var(--sub);
+       opacity:0;transform:translateY(3px) scale(.985);
+       transition:opacity .13s ease,transform .13s ease,left .09s linear,top .09s linear}
+  .tip.on{opacity:1;transform:none}
+  .tip-h{display:flex;align-items:baseline;gap:5px;font-size:11px;font-weight:650;color:var(--fg);
+         padding-bottom:6px;margin-bottom:6px;border-bottom:1px dashed var(--line)}
+  .tip-h em{font-style:normal;font-weight:500;font-size:9.5px;color:var(--muted)}
+  .tip-r{display:flex;align-items:baseline;justify-content:space-between;gap:14px}
+  .tip-r+.tip-r{margin-top:1px}
+  .tip-r span{color:var(--sub)}
+  .tip-r b{color:var(--fg);font-weight:620;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+  .tip-r b small{font-weight:500;font-size:9.5px;color:var(--muted);margin-left:2px}
+  .tip-r.lead span{color:var(--muted)}
+  .tip-r.lead b{color:var(--brand-deep)}
+  @media (prefers-color-scheme:dark){
+    .tip{background:color-mix(in srgb,#1d1d28 94%,transparent);border-color:#2d2d3a}
+    .tip-r.lead b{color:#c0b2ff}
+  }
+
+  /* 图表动画：绘制描边 + 面积淡入，仅在数据切片变化时播放一次 */
+  .wb-chart.play .wb-area{animation:wb-fade .5s ease-out both}
+  .wb-chart.play .wb-curve{animation:wb-draw .78s cubic-bezier(.4,0,.2,1) both}
+  .wb-chart.play .wb-node{animation:wb-fade .6s ease-out both}
+  @keyframes wb-fade{from{opacity:0}to{opacity:1}}
+  @keyframes wb-draw{from{stroke-dashoffset:1}to{stroke-dashoffset:0}}
+  @media (prefers-reduced-motion:reduce){
+    .wb-chart.play .wb-area,.wb-chart.play .wb-curve,.wb-chart.play .wb-node{animation:none}
+  }
 
   .feed{flex:1;overflow:auto;padding:0 12px 8px;max-height:324px;min-height:200px}
   .feed.more{-webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 22px),transparent);mask-image:linear-gradient(to bottom,#000 calc(100% - 22px),transparent)}
@@ -414,10 +451,10 @@ export function adminPage({ home = '', token = '' } = {}) {
         </div>
       </div>
       <div class="chart-scroll">
-        <div id="chart"></div>
-        <div class="tip" id="tip"></div>
+        <div id="chart" tabindex="0" role="group" aria-label="用量时序，可用左右方向键切换日期"></div>
       </div>
       <div class="legend" id="legend"></div>
+      <div class="tip" id="tip" role="status" aria-live="polite"></div>
     </div>
 
     <div class="panel">
@@ -561,6 +598,10 @@ export function adminPage({ home = '', token = '' } = {}) {
           <div><b>回合续跑约束</b><small>对编码 Agent（codex / dsh）在消息末尾追加「未完成必须继续调用工具」的 system 约束</small></div>
           <button class="switch" id="api-continuation-nudge-switch" role="switch" aria-checked="false" data-act="api-continuation-nudge-toggle" title="启用/停用回合续跑约束"></button>
         </div>
+        <div class="api-option">
+          <div><b>截停续跑（判定层）</b><small>模型只宣布下一步却不发工具调用时，桥接自己再要一轮（仅 /v1/responses，最多 1 次）</small></div>
+          <button class="switch" id="api-continuation-retry-switch" role="switch" aria-checked="false" data-act="api-continuation-retry-toggle" title="启用/停用截停续跑"></button>
+        </div>
       </div>
     </div>
   </section>
@@ -621,7 +662,7 @@ var TOKEN=${JSON.stringify(token || '')};
   }catch(e){}
 })();
 var $=function(id){return document.getElementById(id)};
-var state={pool:null,stats:null,api:null,range:'today',metric:'tokens',hover:false};
+var state={pool:null,stats:null,api:null,range:'today',metric:'tokens',hover:false,chartSel:null,chartPin:false};
 var timer=null,loginPoll=null,lastEventSeq=0,firstPaint=true;
 
 function api(path,opts){
@@ -673,6 +714,10 @@ function mmdd(ts){
   var d=new Date(ts), p=function(n){return String(n).padStart(2,'0')};
   return p(d.getMonth()+1)+'-'+p(d.getDate());
 }
+function fullDate(ts){
+  var d=new Date(ts), p=function(n){return String(n).padStart(2,'0')};
+  return (d.getMonth()+1)+' 月 '+d.getDate()+' 日';
+}
 function ago(ts){
   if(!ts) return '';
   var d=Date.now()-ts;
@@ -698,20 +743,28 @@ function deltaHtml(v){
 }
 
 /* ------------------------------------------------------------ 迷你图 */
+var sparkSeq=0;
 function sparkline(points,key,color){
   var vals=(points||[]).map(function(p){return Number(p[key])||0});
-  if(vals.length<2) vals=vals.concat([0,0]);
+  if(!vals.length) vals=[0,0];
+  if(vals.length===1) vals=vals.concat(vals[0]);
   var w=120,h=26,pad=2;
   var max=Math.max.apply(null,vals.concat([1]));
   var step=vals.length>1?w/(vals.length-1):w;
-  var pts=vals.map(function(v,i){
-    return (i*step).toFixed(1)+','+(h-pad-(v/max)*(h-pad*2)).toFixed(1);
+  var node=vals.map(function(v,i){
+    return {x:i*step, y:h-pad-(v/max)*(h-pad*2)};
   });
-  var line=pts.join(' ');
-  var area='0,'+h+' '+line+' '+w+','+h;
+  // 与大图同一套单调插值，卡片缩略图不会画成折线锯齿
+  var line=smoothPath(node);
+  var area=line+'L'+w+','+h+'L0,'+h+'Z';
+  var gid='wb-sp'+(++sparkSeq);
   return '<svg viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none" aria-hidden="true">'+
-    '<polygon points="'+area+'" fill="'+color+'" opacity=".10"/>'+
-    '<polyline points="'+line+'" fill="none" stroke="'+color+'" stroke-width="1.6" '+
+    '<defs><linearGradient id="'+gid+'" x1="0" y1="0" x2="0" y2="1">'+
+      '<stop offset="0%" stop-color="'+color+'" stop-opacity=".26"/>'+
+      '<stop offset="100%" stop-color="'+color+'" stop-opacity="0"/>'+
+    '</linearGradient></defs>'+
+    '<path d="'+area+'" fill="url(#'+gid+')"/>'+
+    '<path d="'+line+'" fill="none" stroke="'+color+'" stroke-width="1.6" '+
     'stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>'+
   '</svg>';
 }
@@ -804,7 +857,7 @@ function niceStep(v){
   if(!v||v<=0) return 1;
   var exp=Math.pow(10,Math.floor(Math.log10(v)));
   var f=v/exp;
-  var nf=f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10;
+  var nf=f<=1?1:f<=1.5?1.5:f<=2?2:f<=2.5?2.5:f<=3?3.5:f<=5?5:10;
   return nf*exp;
 }
 function niceMax(v){
@@ -812,69 +865,205 @@ function niceMax(v){
   return niceStep(v/4)*4;
 }
 
+/* 平滑曲线：Fritsch–Carlson 单调三次插值。
+   Catmull-Rom 会在尖峰两侧冲过头，把曲线拉到 0 以下；单调插值只在相邻两点之间过渡，
+   不会凭空造出负值或假高点，形状更稳，也更诚实地反映数据。 */
+function smoothPath(p){
+  var n=p.length;
+  if(!n) return '';
+  var i;
+  if(n===1) return 'M'+p[0].x.toFixed(2)+','+p[0].y.toFixed(2);
+  if(n===2) return 'M'+p[0].x.toFixed(2)+','+p[0].y.toFixed(2)+'L'+p[1].x.toFixed(2)+','+p[1].y.toFixed(2);
+  var s=[],t=[];
+  for(i=0;i<n-1;i++){
+    var dx=p[i+1].x-p[i].x;
+    s.push(dx?((p[i+1].y-p[i].y)/dx):0);
+  }
+  t[0]=s[0]; t[n-1]=s[n-2];
+  for(i=1;i<n-1;i++){
+    var a=s[i-1],b=s[i];
+    if(a*b<=0){ t[i]=0; continue }
+    var w1=2*(p[i+1].x-p[i].x)+(p[i].x-p[i-1].x);
+    var w2=(p[i+1].x-p[i].x)+2*(p[i].x-p[i-1].x);
+    t[i]=(w1+w2)/(w1/a+w2/b);
+  }
+  var d='M'+p[0].x.toFixed(2)+','+p[0].y.toFixed(2);
+  for(i=0;i<n-1;i++){
+    var h3=(p[i+1].x-p[i].x)/3;
+    d+='C'+(p[i].x+h3).toFixed(2)+','+(p[i].y+t[i]*h3).toFixed(2)+' '+
+       (p[i+1].x-h3).toFixed(2)+','+(p[i+1].y-t[i+1]*h3).toFixed(2)+' '+
+       p[i+1].x.toFixed(2)+','+p[i+1].y.toFixed(2);
+  }
+  return d;
+}
+
+function chartVal(p,metric){
+  if(!p) return 0;
+  return Number(metric==='tokens'?p.tokens:metric==='req'?p.req:p.throughput)||0;
+}
+function chartUnit(metric){
+  return metric==='tokens'?'tok':metric==='req'?'次':'tok/s';
+}
+/* 轴刻度：计数类指标取整，吞吐量保留一位小数，避免出现 0.8、0.3 这种半截刻度 */
+function chartTick(v,metric){
+  var a=Math.abs(v);
+  if(a<1e-9) return '0';
+  if(metric==='throughput') return a>=1000?num(v):(a<10?v.toFixed(1):String(Math.round(v)));
+  if(a<10) return a<1?v.toFixed(2):String(Math.round(v*10)/10);
+  return num(v);
+}
+function chartName(metric){
+  return metric==='tokens'?'Token 总量':metric==='req'?'请求数':'吞吐量';
+}
+function chartSeriesName(metric){
+  return metric==='tokens'?'总消耗':metric==='req'?'请求数':'吞吐';
+}
+
+var chartGeom=null, chartSig='';
+
 function renderChart(){
-  var s=state.stats, pts=s.series, metric=state.metric;
-  var W=760,H=246,L=52,R=12,T=12,B=26;
+  var s=state.stats, pts=s.series||[], metric=state.metric;
+  var host=$('chart');
+
+  if(!pts.length){
+    chartGeom=null; chartSig=''; state.chartSel=null; state.chartPin=false;
+    host.innerHTML='<div class="chart-empty"><b>这个区间还没有数据</b>把任务交给 WorkBuddy 后曲线会出现在这里</div>';
+    $('legend').innerHTML='';
+    $('chart-sub').textContent='';
+    hideTip();
+    return;
+  }
+
+  var W=760,H=252,L=54,R=16,T=16,B=30;
   var iw=W-L-R, ih=H-T-B;
-  var n=Math.max(pts.length,1);
-  var vals=pts.map(function(p){ return metric==='tokens'?p.tokens:metric==='req'?p.req:p.throughput });
+  var n=pts.length;
+  var base=T+ih;
+  var vals=pts.map(function(p){ return chartVal(p,metric) });
   var max=niceMax(Math.max.apply(null,vals.concat([1])));
-  var stepX=iw/n;
-  var bw=Math.max(1,Math.min(30,stepX*0.54));
+  var stepX=n>1?iw/(n-1):iw;
+  var px=function(i){ return n>1?L+i*stepX:L+iw/2 };
+  var py=function(v){ return base-Math.min(1,Math.max(0,v/max))*ih };
 
-  var grid='',labels='';
+  var node=[],i;
+  for(i=0;i<n;i++) node.push({x:px(i),y:py(vals[i])});
+
+  /* 网格：只留横向细线，纵轴在左，尽量少一点「表格感」 */
+  var grid='',ylab='';
   for(var g=0;g<=4;g++){
-    var y=T+ih-(ih*g/4);
-    var v=max*g/4;
-    grid+='<line x1="'+L+'" y1="'+y.toFixed(1)+'" x2="'+(W-R)+'" y2="'+y.toFixed(1)+'" stroke="var(--line)" stroke-width="1"/>';
-    labels+='<text x="'+(L-7)+'" y="'+(y+3.5).toFixed(1)+'" text-anchor="end" font-size="9.5" fill="var(--muted)">'+num(v)+'</text>';
+    var gy=base-(ih*g/4);
+    grid+='<line x1="'+L+'" y1="'+gy.toFixed(1)+'" x2="'+(W-R)+'" y2="'+gy.toFixed(1)+'" '+
+          'stroke="var(--line)" stroke-width="1"'+(g?' stroke-dasharray="3 5"':'')+'/>';
+    ylab+='<text x="'+(L-10)+'" y="'+(gy+3.5).toFixed(1)+'" text-anchor="end" font-size="9.5" '+
+          'fill="var(--muted)">'+chartTick(max*g/4,metric)+'</text>';
   }
 
-  var bars='',hits='';
-  for(var i=0;i<pts.length;i++){
-    var p=pts[i];
-    var val=metric==='tokens'?p.tokens:metric==='req'?p.req:p.throughput;
-    var h=(val/max)*ih;
-    var x=L+i*stepX+(stepX-bw)/2;
-    var y=T+ih-h;
-    if(h>0){
-      bars+='<rect x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+h.toFixed(1)+'" '+
-            'rx="1.6" fill="var(--brand2)" opacity="'+(p.fail&&p.req&&p.fail>=p.ok?0.55:0.85)+'"/>';
-    }
-    hits+='<rect class="hit" data-i="'+i+'" x="'+(L+i*stepX).toFixed(1)+'" y="'+T+'" width="'+stepX.toFixed(1)+'" height="'+ih+'" fill="transparent"/>';
+  var line=smoothPath(node);
+  var area=line+'L'+node[n-1].x.toFixed(2)+','+base+'L'+node[0].x.toFixed(2)+','+base+'Z';
+
+  /* 只有一个数据点（例如刚过零点的「今日」）画不出曲线，改画一个带竖线的锚点，
+     否则切片只有 M 指令，画面上什么都没有。 */
+  var solo='';
+  if(n===1){
+    var sx=node[0].x.toFixed(2), sy=node[0].y.toFixed(2);
+    solo='<line x1="'+sx+'" y1="'+sy+'" x2="'+sx+'" y2="'+base+'" stroke="var(--brand)" '+
+           'stroke-width="1" stroke-dasharray="2 4" opacity=".45"/>'+
+         '<circle cx="'+sx+'" cy="'+sy+'" r="10" fill="var(--brand)" opacity=".13"/>'+
+         '<circle cx="'+sx+'" cy="'+sy+'" r="4.2" fill="var(--brand-deep)" '+
+           'stroke="var(--card)" stroke-width="2"/>';
   }
 
-  // Token 视图叠一条请求数折线：量级不同，各自归一化，只看形状
-  var line='';
-  if(metric==='tokens'){
-    var rmax=niceMax(Math.max.apply(null,pts.map(function(p){return p.req}).concat([1])));
-    var lp=pts.map(function(p,i){
-      var yy=T+ih-((p.req||0)/rmax)*ih;
-      return (L+i*stepX+stepX/2).toFixed(1)+','+yy.toFixed(1);
-    }).join(' ');
-    line='<polyline points="'+lp+'" fill="none" stroke="var(--brand-deep)" stroke-width="1.5" '+
-         'stroke-linejoin="round" stroke-linecap="round" opacity=".85"/>';
+  /* Token 视图叠一条请求数曲线：量级不同，各自归一化，只看形状 */
+  var second='';
+  if(metric==='tokens'&&n>1){
+    var rmax=niceMax(Math.max.apply(null,pts.map(function(p){return Number(p.req)||0}).concat([1])));
+    var rnode=pts.map(function(p,k){
+      return {x:node[k].x, y:base-Math.min(1,(Number(p.req)||0)/rmax)*ih};
+    });
+    second='<path d="'+smoothPath(rnode)+'" fill="none" stroke="var(--brand-deep)" stroke-width="1.5" '+
+           'stroke-linecap="round" stroke-linejoin="round" opacity=".42"/>';
   }
 
-  // x 轴标签按点数抽稀，避免挤成一团
-  var every=Math.max(1,Math.ceil(n/8));
-  var xlabels='';
-  for(var j=0;j<pts.length;j+=every){
-    var tx=L+j*stepX+stepX/2;
-    var lab=s.granularity==='hour'?hhmm(pts[j].ts):mmdd(pts[j].ts);
-    xlabels+='<text x="'+tx.toFixed(1)+'" y="'+(H-8)+'" text-anchor="middle" font-size="9.5" fill="var(--muted)">'+lab+'</text>';
+  /* x 轴标签抽稀，并且总是带上最后一天 */
+  var every=Math.max(1,Math.ceil(n/7));
+  var idx=[];
+  for(i=0;i<n;i+=every) idx.push(i);
+  if(idx[idx.length-1]!==n-1){
+    if(n-1-idx[idx.length-1]<every*0.62) idx.pop();
+    if(!idx.length) idx.push(0);
+    idx.push(n-1);
+  }
+  var xlab='';
+  idx.forEach(function(k){
+    var lab=s.granularity==='hour'?hhmm(pts[k].ts):mmdd(pts[k].ts);
+    xlab+='<text x="'+node[k].x.toFixed(1)+'" y="'+(H-9)+'" text-anchor="middle" font-size="9.5" '+
+          'fill="var(--muted)">'+lab+'</text>';
+  });
+
+  /* 悬浮层：竖直准线 + 节点外环。指针移动时只改属性，不重绘整张图 */
+  var focus='<g class="wb-focus" opacity="0">'+
+      '<line class="wb-guide" x1="0" y1="'+T+'" x2="0" y2="'+base+'" stroke="var(--brand)" '+
+        'stroke-width="1" stroke-dasharray="3 4" opacity=".42"/>'+
+      '<circle class="wb-halo" cx="0" cy="0" r="9.5" fill="var(--brand)" opacity=".16"/>'+
+      '<circle class="wb-dot" cx="0" cy="0" r="3.6" fill="var(--brand-deep)" '+
+        'stroke="var(--card)" stroke-width="1.8"/>'+
+    '</g>';
+
+  /* 命中共 4 列：每列覆盖半个步长，首尾各补半格，指针永远落在某个点上 */
+  var hitW=n>1?stepX:iw, hits='';
+  for(i=0;i<n;i++){
+    var hx=n>1?node[i].x-hitW/2:L;
+    hits+='<rect class="hit" data-i="'+i+'" x="'+hx.toFixed(1)+'" y="'+T+'" '+
+          'width="'+hitW.toFixed(1)+'" height="'+ih+'" fill="transparent"/>';
   }
 
-  $('chart').innerHTML='<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="用量时序">'+grid+bars+line+hits+xlabels+labels+'</svg>';
-  $('chart').setAttribute('data-n',String(pts.length));
+  host.innerHTML='<svg class="wb-chart" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="xMidYMid meet" '+
+    'role="img" aria-label="用量时序">'+
+    '<defs>'+
+      '<linearGradient id="wb-area" x1="0" y1="0" x2="0" y2="1">'+
+        '<stop offset="0%" stop-color="var(--brand)" stop-opacity=".62"/>'+
+        '<stop offset="54%" stop-color="var(--brand)" stop-opacity=".22"/>'+
+        '<stop offset="100%" stop-color="var(--brand)" stop-opacity=".015"/>'+
+      '</linearGradient>'+
+      '<clipPath id="wb-clip"><rect x="'+(L-1)+'" y="'+(T-8)+'" width="'+(iw+2)+'" height="'+(ih+9)+'"/></clipPath>'+
+    '</defs>'+
+    '<g class="wb-grid">'+grid+'</g>'+ylab+xlab+
+    '<g clip-path="url(#wb-clip)">'+
+      (n===1?'':
+        '<path class="wb-area" d="'+area+'" fill="url(#wb-area)"/>'+
+        second+
+        '<path class="wb-curve" d="'+line+'" fill="none" stroke="var(--brand-deep)" stroke-width="2.2" '+
+          'stroke-linecap="round" stroke-linejoin="round" pathLength="1" stroke-dasharray="1"/>')+
+      solo+
+    '</g>'+
+    focus+
+    '<g class="wb-hit">'+hits+'</g>'+
+  '</svg>';
 
-  var unitText=metric==='tokens'?'Token 总量':metric==='req'?'请求数':'tok/s';
-  $('legend').innerHTML='<span><i style="background:var(--brand2)"></i>'+unitText+'</span>'+
-    (metric==='tokens'?'<span><i class="ln" style="background:var(--brand-deep)"></i>请求数</span>':'');
+  chartGeom={W:W,H:H,L:L,R:R,T:T,ih:ih,base:base,n:n,node:node,vals:vals,pts:pts,metric:metric,stepX:stepX};
+  var sig=state.range+'|'+metric+'|'+n+'|'+pts[0].ts+'|'+pts[n-1].ts;
+  if(sig!==chartSig){
+    chartSig=sig;
+    var svgEl=host.firstElementChild;
+    svgEl.classList.add('play');
+    setTimeout(function(){ if(svgEl.parentNode) svgEl.classList.remove('play') },900);
+  }
 
-  var from=pts.length?pts[0].ts:s.from, to=pts.length?pts[pts.length-1].ts:s.to;
+  /* 图例：主序列渐变块 + 副序列细线，右侧补一个峰值，省掉一次目测 */
+  var peak=0,peakIdx=0;
+  for(i=0;i<n;i++) if(vals[i]>peak){ peak=vals[i]; peakIdx=i }
+  var peakLabel=s.granularity==='hour'?mmdd(pts[peakIdx].ts)+' '+hhmm(pts[peakIdx].ts):mmdd(pts[peakIdx].ts);
+  $('legend').innerHTML=
+    '<span class="lg"><i style="background:linear-gradient(150deg,var(--brand),var(--brand2))"></i>'+
+      chartName(metric)+'</span>'+
+    (metric==='tokens'?'<span class="lg"><i class="ln"></i>请求数</span>':'')+
+    '<span class="lg-peak">峰值 <b>'+num(peak)+' '+chartUnit(metric)+'</b> · '+peakLabel+'</span>';
+
+  var from=pts[0].ts, to=pts[n-1].ts;
   $('chart-sub').textContent=mmdd(from)+' '+hhmm(from)+' — '+mmdd(to)+' '+hhmm(to)+
     ' · '+(s.granularity==='hour'?'小时':'每天')+'粒度 · 总 '+num(s.totals.tokens)+' tok / '+int(s.totals.req)+' 请求';
+
+  hideTip();
+  if(state.chartSel!==null&&state.chartSel!==undefined&&state.chartSel<chartGeom.n) chartFocus(state.chartSel);
 }
 
 /* ------------------------------------------------------------ 请求流 */
@@ -1093,6 +1282,10 @@ function renderApi(){
   var continuationNudgeOn=!!(s.enabled&&s.continuationNudge);
   $('api-continuation-nudge-switch').setAttribute('aria-checked',continuationNudgeOn?'true':'false');
   $('api-continuation-nudge-switch').disabled=!s.enabled;
+  // 判定层续跑默认开启：缺字段时按 true 显示，与 paths.js 的 defaultConfig 对齐。
+  var continuationRetryOn=!!(s.enabled&&s.continuationRetry!==false);
+  $('api-continuation-retry-switch').setAttribute('aria-checked',continuationRetryOn?'true':'false');
+  $('api-continuation-retry-switch').disabled=!s.enabled;
   var authMode=s.requireApiKey?'所有连接强制 Key':
     !s.remoteRequireKey?'不强制 Key':
     s.trustProxy?'可信代理强制 Key':'回环免 Key · 远程强制 Key';
@@ -1295,6 +1488,13 @@ document.addEventListener('click',function(ev){
         .then(function(){toast(!continuationOn?'回合续跑约束已启用':'回合续跑约束已关闭')});
     });
   }
+  if(a==='api-continuation-retry-toggle'){
+    var retryOn=el.getAttribute('aria-checked')==='true';
+    return act(function(){
+      return api('/api/api-compat',{method:'PATCH',body:JSON.stringify({continuationRetry:!retryOn})})
+        .then(function(){toast(!retryOn?'截停续跑已启用':'截停续跑已关闭')});
+    });
+  }
   if(a==='api-key-create'){
     return openCreateApiKey();
   }
@@ -1360,29 +1560,126 @@ $('strategy').addEventListener('change',function(ev){
 $('btn-refresh').addEventListener('click',load);
 $('btn-add').addEventListener('click',openAdd);
 
-/* 图表悬浮提示 */
-function hideTip(){ $('tip').className='tip' }
-$('chart').addEventListener('mousemove',function(e){
-  var hit=e.target.closest('rect.hit');
-  if(!hit) return hideTip();
-  var i=Number(hit.getAttribute('data-i'));
-  var p=state.stats.series[i];
-  if(!p) return hideTip();
-  var tip=$('tip');
-  var label=state.stats.granularity==='hour'?mmdd(p.ts)+' '+hhmm(p.ts):p.ts.slice(5);
-  tip.innerHTML='<b>'+label+'</b><br/>'+
-    num(p.tokens)+' tokens · '+int(p.req)+' 次<br/>'+
-    '成功 '+int(p.ok)+' · 失败 '+int(p.fail)+'<br/>'+
-    '吞吐 '+(p.throughput||0).toFixed(1)+' tok/s';
+/* ------------------------------------------------------------ 图表悬浮 / 选中 */
+function hideTip(){
+  $('tip').className='tip';
+}
+function tipHtml(p){
+  var g=state.stats.granularity, metric=state.metric;
+  var date=g==='hour'?mmdd(p.ts)+' '+hhmm(p.ts):fullDate(p.ts);
+  var sub=g==='hour'?'小时切片':'当天';
+  var row=function(k,v,lead){
+    return '<div class="tip-r'+(lead?' lead':'')+'"><span>'+k+'</span><b>'+v+'</b></div>';
+  };
+  var rate=p.req?((p.ok||0)/p.req):null;
+  // 首行跟随当前页签，避免看着「请求数」曲线却先读到 Token
+  var lead=metric==='tokens'?row('Token',num(p.tokens)+'<small>tok</small>',true)
+    :metric==='req'?row('请求',int(p.req)+'<small>次</small>',true)
+    :row('吞吐',(p.throughput||0).toFixed(1)+'<small>tok/s</small>',true);
+  var rest=metric==='tokens'?row('请求',int(p.req)+' 次')
+    :metric==='req'?row('Token',num(p.tokens)+'<small>tok</small>')
+    :row('请求',int(p.req)+' 次');
+  return '<div class="tip-h">'+date+'<em>'+sub+'</em></div>'+
+    lead+rest+
+    row('成功 / 失败',int(p.ok)+' · '+int(p.fail))+
+    (rate===null?'':row('成功率',pct(rate)))+
+    (metric==='throughput'?'':row('吞吐',(p.throughput||0).toFixed(1)+'<small>tok/s</small>'));
+}
+
+/**
+ * 把某一天推到高亮位置：准线、节点环和悬浮窗跟着走。
+ * 只改已有节点的属性，不重建 SVG，所以指针滑动时不会闪。
+ */
+function chartFocus(i){
+  var g=chartGeom, tip=$('tip'), wrap=$('chart');
+  if(!g||!g.pts[i]) return;
+  state.chartSel=i;
+  var p=g.pts[i], node=g.node[i];
+  var svg=wrap.querySelector('svg.wb-chart');
+  if(!svg) return;
+  var focus=svg.querySelector('.wb-focus');
+  var guide=focus.querySelector('.wb-guide');
+  var halo=focus.querySelector('.wb-halo');
+  var dot=focus.querySelector('.wb-dot');
+  guide.setAttribute('x1',node.x.toFixed(2));
+  guide.setAttribute('x2',node.x.toFixed(2));
+  halo.setAttribute('cx',node.x.toFixed(2)); halo.setAttribute('cy',node.y.toFixed(2));
+  dot.setAttribute('cx',node.x.toFixed(2));  dot.setAttribute('cy',node.y.toFixed(2));
+  focus.setAttribute('opacity','1');
+
+  tip.innerHTML=tipHtml(p);
   tip.className='tip on';
-  var box=$('chart').getBoundingClientRect();
-  var x=e.clientX-box.left, y=e.clientY-box.top;
-  tip.style.left=Math.max(6,Math.min(box.width-150,x-70))+'px';
-  tip.style.top=Math.max(6,y-86)+'px';
+
+  /* viewBox 坐标 → 面板坐标。SVG 等比缩放，一个比例就够 */
+  var box=svg.getBoundingClientRect();
+  var host=(tip.offsetParent||wrap).getBoundingClientRect();
+  var k=box.width/g.W, w=tip.offsetWidth, h=tip.offsetHeight;
+  var cx=box.left-host.left+node.x*k;
+  var cy=box.top -host.top +node.y*k;
+
+  var left=Math.max(6,Math.min(host.width-w-6,cx-w/2));
+  var top=cy-h-14;
+  if(top<6) top=cy+16;
+  tip.style.left=left+'px';
+  tip.style.top=top+'px';
+}
+
+function chartBlur(){
+  state.chartSel=null; state.chartPin=false;
+  hideTip();
+  var svg=$('chart').querySelector('svg.wb-chart');
+  if(svg){
+    var focus=svg.querySelector('.wb-focus');
+    if(focus) focus.setAttribute('opacity','0');
+  }
+}
+
+function hitIndex(target){
+  var hit=target&&target.closest?target.closest('rect.hit'):null;
+  return hit?Number(hit.getAttribute('data-i')):-1;
+}
+
+$('chart').addEventListener('mousemove',function(e){
+  if(state.chartPin) return;            // 已钉住的节点不被悬浮抢走
+  var i=hitIndex(e.target);
+  if(i<0){ chartBlur(); return }
+  if(!chartGeom||!chartGeom.pts[i]) return;
+  if(i===state.chartSel) return;        // 同一列不重复重绘悬浮窗
+  chartFocus(i);
 });
-$('chart').addEventListener('mouseleave',hideTip);
-$('chart').addEventListener('mouseover',function(){state.hover=true});
-$('chart').addEventListener('mouseout',function(){state.hover=false});
+/* 移出图表：钉住的保持，纯悬浮的收起，不留悬空小窗 */
+$('chart').addEventListener('mouseleave',function(){
+  if(state.chartPin) return;
+  chartBlur();
+});
+$('chart').addEventListener('mouseover',function(){ state.hover=true });
+$('chart').addEventListener('mouseout',function(){ state.hover=false });
+/* 点击钉住：再点同一节点取消，点空白处或 Esc 也退出 */
+$('chart').addEventListener('click',function(e){
+  var i=hitIndex(e.target);
+  if(i<0){ if(state.chartPin) chartBlur(); return }
+  if(state.chartPin&&state.chartSel===i){ chartBlur(); return }
+  chartFocus(i);
+  state.chartPin=true;
+});
+$('chart').addEventListener('keydown',function(e){
+  if(!chartGeom) return;
+  var step=e.key==='ArrowRight'?1:e.key==='ArrowLeft'?-1:0;
+  if(!step) return;
+  e.preventDefault();
+  var i=state.chartSel===null?0:state.chartSel+step;
+  i=Math.max(0,Math.min(chartGeom.n-1,i));
+  chartFocus(i);
+  state.chartPin=true;
+});
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'&&state.chartSel!==null) chartBlur();
+});
+document.addEventListener('click',function(e){
+  if(!state.chartPin) return;
+  if(e.target.closest&&e.target.closest('#chart')) return;
+  chartBlur();
+});
 
 /* ------------------------------------------------------------ 弹窗 */
 function closeModal(){

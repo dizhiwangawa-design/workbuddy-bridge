@@ -366,7 +366,9 @@ export function createAnthropicRuntime({
     interruptSignal = null,
   }) {
     const requestId = `msg_${randomUUID()}`;
-    const inputEstimate = estimateAnthropicInputTokens(body);
+    // body 是 normalizeBody 的返回值，同时挂着 outbound body 与 requestBody 两份请求体；
+    // 整个信封序列化会把同一份请求体算两遍，估算值虚高。只估真正发出去的那一份。
+    const inputEstimate = estimateAnthropicInputTokens(body.body);
     const controller = new AbortController();
     let reader = null;
     let readerDone = false;
@@ -1722,20 +1724,11 @@ export function createOpenAIRuntime({
       if (typeof payload.refusal === 'string') {
         appendRuntimeText(refusalText, payload.refusal);
       }
+      // 上游这条路径是「一次性返回完整 JSON 文档」，工具调用没有增量可言：
+      // 统一交给装配器收下，由 finalize 按仲裁结果发一次。
+      // 在这里再 emit 一次 toolDelta 会让同一条调用拿到两个 index（toolIndex 自增），
+      // 客户端会执行两次；顺带也避免了在此裸 JSON.parse（参数被截断时抛错泄给客户端）。
       if (Array.isArray(payload.tool_calls)) pushStructured(payload.tool_calls);
-      if (
-        body.stream
-        && Array.isArray(choice.message?.tool_calls)
-      ) {
-        ensureStreamStarted();
-        if (!encoder || cancelKind) return;
-        emit(encoder.toolDelta(choice.message.tool_calls.map((call, index) => ({
-          id: call.id,
-          name: call.function?.name,
-          input: JSON.parse(call.function?.arguments || '{}'),
-          index,
-        }))));
-      }
       if (payload.content !== undefined) {
         ensureStreamStarted();
         if (body.stream && (!encoder || cancelKind)) return;
